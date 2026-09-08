@@ -1,4 +1,4 @@
-use crate::{dashboard, router, state::{AppState, Client}};
+use crate::{router, state::{AppState, Client}};
 use anyhow::Context;
 use axum::{
     extract::{
@@ -25,12 +25,6 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
     let app = app
         .route(&session_route, get(brew_session_endpoint))
         .route("/healthz", get(|| async { "ok\n" }))
-        .route("/", get(dashboard::index))
-        .route("/api/status", get(dashboard::snapshot))
-        .route("/api/live", get(dashboard::live))
-        .route("/api/telemetry", get(dashboard::telemetry_snapshot))
-        .route("/api/control", get(dashboard::control_list))
-        .route("/api/control/{id}", axum::routing::post(dashboard::control_command))
         .with_state(state.clone());
 
     if state.config.tls.enabled {

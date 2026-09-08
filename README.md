@@ -4,6 +4,15 @@ Experimental Rust Brew core for linking two or more MidnightBlue BlueStation or 
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 0.5 adds:
+
+- The monitoring dashboard now runs on its **own listener/port** (`[dashboard]`,
+  default `:9003`), separate from the Brew protocol API. The Brew listener
+  (`:9000`) serves only `/brew` and `/healthz`.
+- Optional HTTP **Basic** authentication for the dashboard (`[dashboard.users]`).
+- Optional native **TLS/HTTPS** for the dashboard (`[dashboard.tls]`), so it can
+  be reached over `https://` / `wss://` independently of the Brew `[tls]` block.
+
 Version 0.4 adds:
 
 - Optional FlowStation Telemetry ingestion channel (registrations, calls with
@@ -74,9 +83,24 @@ session_ttl_seconds = 300
 [auth.users]
 "100000001" = "change-me-bs1"
 "100000002" = "change-me-bs2"
+
+[dashboard]
+enabled = true
+listen = "0.0.0.0:9003"
+realm = "brew-server-dashboard"
+
+[dashboard.users]
+"admin" = "change-me-dashboard"
+
+[dashboard.tls]
+enabled = true
+cert_path = "tls/dashboard-cert.pem"
+key_path = "tls/dashboard-key.pem"
 ```
 
-Use a different username/password for each BlueStation. The username is only an HTTP Digest identity; it does not have to equal a radio ISSI, although using a numeric site identity is convenient.
+The `[dashboard]` block controls the monitoring UI on its own port, separate
+from the Brew API above — see "Web monitoring dashboard" below for auth and TLS
+details. Use a different username/password for each BlueStation. The username is only an HTTP Digest identity; it does not have to equal a radio ISSI, although using a numeric site identity is convenient.
 
 ## TLS
 
@@ -156,6 +180,8 @@ Because current upstream BlueStation does not yet expose a complete private-call
 ## Scope and security
 
 This is a lab/experimental core, not a production TETRA SwMI. Digest authentication protects credentials from being sent directly but MD5 Digest is legacy authentication; enable the built-in `[tls]` support (or deploy behind a TLS-terminating proxy) or run on a trusted private network. The server currently has no persistent subscriber database, ACL policy, rate limiting, or HA state replication.
+
+The dashboard is a separate listener with its own auth (`[dashboard.users]`, HTTP Basic) and TLS (`[dashboard.tls]`). Basic auth transmits credentials as reversible base64, so only enable `[dashboard.users]` together with `[dashboard.tls]` (or behind a trusted network) — never run dashboard auth over plain HTTP. Note the dashboard's Control panel can kick subscribers and restart/stop a FlowStation BTS, so treat dashboard access as privileged. With no users configured the dashboard is open to anyone who can reach the port.
 
 ## BlueStation connected/registered but no inter-BS calls
 
@@ -240,18 +266,76 @@ does not encode SDS-TL PDUs for you.
 Like Telemetry, this is reverse-engineered from FlowStation v0.4.0 source;
 re-verify against your deployed version.
 
-## Web monitoring dashboard (v1)
+## Web monitoring dashboard
 
-This build includes a zero-setup live dashboard on the same HTTP listener as Brew.
+This build includes a zero-setup live dashboard. It now runs on its **own
+listener/port**, separate from the Brew API, configured in `[dashboard]`
+(default `0.0.0.0:9003`, enabled by default):
 
-- Dashboard: `http://<server>:9000/`
+```toml
+[dashboard]
+enabled = true
+listen = "0.0.0.0:9003"
+realm = "brew-server-dashboard"
+
+[dashboard.users]
+# "admin" = "change-me-dashboard"
+
+[dashboard.tls]
+enabled = false
+```
+
+- Dashboard: `http://<server>:9003/`
 - JSON snapshot: `/api/status`
 - Live event WebSocket: `/api/live`
 - FlowStation telemetry snapshot: `/api/telemetry` (empty unless the `[telemetry]`
   listener is enabled)
 - FlowStation control: `/api/control` (connected station IDs) and
   `/api/control/{id}` (POST a command; empty/404 unless `[control]` is enabled)
-- Existing Brew endpoint remains unchanged (normally `/brew`).
+
+All dashboard routes sit behind optional HTTP **Basic** auth: add entries to
+`[dashboard.users]` to require a username/password (an empty table leaves it
+open). Set `[dashboard.tls]` to serve the dashboard over HTTPS/WSS. The Brew API
+listener (`listen`, normally `:9000`) now serves only `/brew` and `/healthz` —
+the dashboard is no longer mounted there.
+
+### Dashboard authentication and HTTPS
+
+The shipped `brew-server.toml` enables both. Set a real password and point the
+TLS block at a certificate/key pair:
+
+```toml
+[dashboard]
+enabled = true
+listen = "0.0.0.0:9003"
+realm = "brew-server-dashboard"
+
+[dashboard.users]
+"admin" = "change-me-dashboard"
+
+[dashboard.tls]
+enabled = true
+cert_path = "tls/dashboard-cert.pem"
+key_path = "tls/dashboard-key.pem"
+```
+
+Generate a self-signed cert for lab use (browsers will warn on the self-signed
+CA; use a real cert in production):
+
+```bash
+mkdir -p tls
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout tls/dashboard-key.pem -out tls/dashboard-cert.pem \
+  -subj "/CN=brew-server-dashboard" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+```
+
+With TLS on, reach the dashboard at `https://<server>:9003/` and the live
+socket over `wss://`. Because Basic auth transmits credentials as reversible
+base64, only enable `[dashboard.users]` together with TLS (or behind a trusted
+network); do not run auth over plain HTTP in production. `cert_path` is a PEM
+chain (leaf first) and `key_path` the matching PKCS#8/RSA key, same format as
+the Brew `[tls]` block.
 
 The dashboard shows connected BlueStations, registered subscribers, groups, active and
 recent group/private calls, call durations/voice-frame counts, and recent SDS traffic.

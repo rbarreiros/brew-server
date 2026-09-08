@@ -1,9 +1,9 @@
 listen = "0.0.0.0:9000"
-websocket_path = "/brew"
+websocket_path = "/brew/"
 websocket_subprotocol = "brew"
-route_without_affiliations = false
+route_without_affiliations = true
 fallback_broadcast_when_no_affiliations = true
-allow_multiple_calls_per_group = false
+allow_multiple_calls_per_group = true
 higher_priority_number_wins = true
 preempt_cause = 1
 
@@ -45,3 +45,19 @@ listen = "0.0.0.0:9002"
 
 [control.tls]
 enabled = false
+
+# Monitoring dashboard. Now on its OWN listener/port, separate from the Brew
+# API. Enabled by default. Set [dashboard.users] to require HTTP Basic auth
+# (empty = open). See README.md "Web monitoring dashboard".
+[dashboard]
+enabled = true
+listen = "0.0.0.0:9003"
+realm = "brew-server-dashboard"
+
+[dashboard.users]
+"admin" = "change-me-dashboard"
+
+[dashboard.tls]
+enabled = true
+cert_path = "tls/dashboard-cert.pem"
+key_path = "tls/dashboard-key.pem"

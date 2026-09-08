@@ -3,14 +3,91 @@ use crate::{
     state::AppState,
     telemetry::TelemetryBts,
 };
+use anyhow::Context;
 use axum::{
     extract::{Path, State, ws::{Message, WebSocket, WebSocketUpgrade}},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    Json,
+    routing::get,
+    Json, Router,
 };
-use futures_util::SinkExt;
-use std::sync::Arc;
+use axum::extract::Request;
+use base64::Engine;
+use std::{collections::HashMap, sync::Arc};
+
+/// Runs the monitoring dashboard on its own listener (separate from the Brew
+/// API). Gated behind optional HTTP Basic auth and optional TLS via the
+/// `[dashboard]` config section. Returns immediately if disabled.
+pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
+    let cfg = &state.config.dashboard;
+    if !cfg.enabled {
+        return Ok(());
+    }
+
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/api/status", get(snapshot))
+        .route("/api/live", get(live))
+        .route("/api/telemetry", get(telemetry_snapshot))
+        .route("/api/control", get(control_list))
+        .route("/api/control/{id}", axum::routing::post(control_command))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_basic))
+        .with_state(state.clone());
+
+    if cfg.tls.enabled {
+        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            &cfg.tls.cert_path,
+            &cfg.tls.key_path,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "loading dashboard TLS cert {} and key {}",
+                cfg.tls.cert_path.display(),
+                cfg.tls.key_path.display()
+            )
+        })?;
+        tracing::info!(listen=%cfg.listen, auth=!cfg.users.is_empty(), tls=true, "dashboard listening (TLS)");
+        axum_server::bind_rustls(cfg.listen, rustls_config)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
+        tracing::info!(listen=%cfg.listen, auth=!cfg.users.is_empty(), tls=false, "dashboard listening");
+        axum::serve(listener, app).await?;
+    }
+    Ok(())
+}
+
+/// HTTP Basic auth guard for every dashboard route (including the `/api/live`
+/// WebSocket upgrade, which browsers authenticate with a normal Authorization
+/// header on the handshake). No configured users means auth is disabled.
+async fn require_basic(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
+    let users = &state.config.dashboard.users;
+    if users.is_empty() || basic_ok(users, request.headers()) {
+        return next.run(request).await;
+    }
+    basic_challenge(&state.config.dashboard.realm)
+}
+
+fn basic_ok(users: &HashMap<String, String>, headers: &HeaderMap) -> bool {
+    let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else { return false };
+    let Some(b64) = value.strip_prefix("Basic ") else { return false };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64) else { return false };
+    let Ok(text) = String::from_utf8(decoded) else { return false };
+    let Some((user, pass)) = text.split_once(':') else { return false };
+    users.get(user).map(|p| p == pass).unwrap_or(false)
+}
+
+fn basic_challenge(realm: &str) -> Response {
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_str(&format!("Basic realm=\"{realm}\"")).unwrap(),
+    );
+    response
+}
 
 pub async fn index() -> Html<&'static str> { Html(HTML) }
 pub async fn snapshot(State(state): State<Arc<AppState>>) -> Json<crate::monitor::Snapshot> { let i=state.inner.read().await; let counts=(i.clients.len(),i.subscribers.len(),i.group_clients.len()); drop(i); Json(state.monitor.snapshot(counts.0,counts.1,counts.2).await) }

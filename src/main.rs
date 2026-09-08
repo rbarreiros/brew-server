@@ -28,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
         server::run(state.clone()),
         telemetry::run(state.clone()),
         control::run(state.clone()),
+        dashboard::run(state.clone()),
     )?;
     Ok(())
 }
