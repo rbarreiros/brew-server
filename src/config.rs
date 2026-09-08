@@ -17,6 +17,7 @@ pub struct Config {
     pub tls: TlsConfig,
     pub telemetry: TelemetryConfig,
     pub control: ControlConfig,
+    pub dashboard: DashboardConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,6 +100,29 @@ impl Default for ControlConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DashboardConfig {
+    pub enabled: bool,
+    pub listen: SocketAddr,
+    /// HTTP Basic Auth username -> password. Empty means no auth required.
+    pub users: HashMap<String, String>,
+    pub realm: String,
+    pub tls: TlsConfig,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen: "0.0.0.0:9003".parse().unwrap(),
+            users: HashMap::new(),
+            realm: "brew-server-dashboard".into(),
+            tls: TlsConfig::default(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -114,6 +138,7 @@ impl Default for Config {
             tls: TlsConfig::default(),
             telemetry: TelemetryConfig::default(),
             control: ControlConfig::default(),
+            dashboard: DashboardConfig::default(),
         }
     }
 }
