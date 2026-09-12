@@ -198,6 +198,10 @@ pub struct TelemetryBts {
     #[serde(skip)]
     pub registrations: HashSet<u32>,
     pub registration_count: usize,
+    /// Sorted list of registered subscriber ISSIs, derived from `registrations`.
+    /// Exposed to the dashboard so it can show who is registered on this station
+    /// (the `registrations` HashSet itself is skipped for stable JSON ordering).
+    pub registrations_list: Vec<u32>,
     pub active_calls: HashMap<u16, TelemetryCall>,
     pub emergencies: HashSet<u32>,
     pub last_tx_quality: Option<TxQuality>,
@@ -218,6 +222,7 @@ impl TelemetryBts {
             backhaul_connected: None,
             registrations: HashSet::new(),
             registration_count: 0,
+            registrations_list: Vec::new(),
             active_calls: HashMap::new(),
             emergencies: HashSet::new(),
             last_tx_quality: None,
@@ -234,6 +239,15 @@ impl TelemetryBts {
             self.recent_sds.pop_back();
         }
         self.recent_sds_out = self.recent_sds.iter().cloned().collect();
+    }
+
+    /// Recomputes the serialized registration view (count + sorted ISSI list)
+    /// after the `registrations` set changes.
+    fn sync_registrations(&mut self) {
+        self.registration_count = self.registrations.len();
+        let mut list: Vec<u32> = self.registrations.iter().copied().collect();
+        list.sort_unstable();
+        self.registrations_list = list;
     }
 }
 
@@ -312,9 +326,9 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
         | TelemetryEvent::MsRssi { .. } | TelemetryEvent::TsVoiceActivity { .. });
 
     match event {
-        TelemetryEvent::MsRegistration { issi } => { bts.registrations.insert(issi); bts.registration_count = bts.registrations.len(); }
+        TelemetryEvent::MsRegistration { issi } => { bts.registrations.insert(issi); bts.sync_registrations(); }
         TelemetryEvent::MsDeregistration { issi } | TelemetryEvent::MsTimeoutDrop { issi } => {
-            bts.registrations.remove(&issi); bts.registration_count = bts.registrations.len();
+            bts.registrations.remove(&issi); bts.sync_registrations();
         }
         TelemetryEvent::GroupCallStarted { call_id, gssi, caller_issi, carrier_num, ts, priority } => {
             bts.active_calls.insert(call_id, TelemetryCall {
@@ -345,5 +359,44 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
     drop(t);
     if notify {
         state.monitor.emit("telemetry", serde_json::json!({"id": id}));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_registrations_sorts_and_counts() {
+        let mut bts = TelemetryBts::new("bts-1".to_string());
+        bts.registrations.insert(300);
+        bts.registrations.insert(100);
+        bts.registrations.insert(200);
+        bts.sync_registrations();
+        assert_eq!(bts.registration_count, 3);
+        assert_eq!(bts.registrations_list, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn sync_registrations_after_removal() {
+        let mut bts = TelemetryBts::new("bts-1".to_string());
+        for issi in [10u32, 20, 30] { bts.registrations.insert(issi); }
+        bts.sync_registrations();
+        bts.registrations.remove(&20);
+        bts.sync_registrations();
+        assert_eq!(bts.registration_count, 2);
+        assert_eq!(bts.registrations_list, vec![10, 30]);
+    }
+
+    #[test]
+    fn registrations_list_serialized_in_snapshot() {
+        let mut bts = TelemetryBts::new("bts-1".to_string());
+        bts.registrations.insert(4242);
+        bts.sync_registrations();
+        let json = serde_json::to_string(&bts).unwrap();
+        assert!(json.contains("registrations_list"), "list must be serialized");
+        assert!(json.contains("4242"));
+        // the raw HashSet field stays skipped
+        assert!(!json.contains("\"registrations\":"), "raw set must be skipped");
     }
 }
