@@ -1,4 +1,5 @@
-use crate::{router, state::{AppState, Client}};
+use crate::{router, state::{AppState, Client, ClientMode}};
+use crate::protocol::ConnVersion;
 use anyhow::Context;
 use axum::{
     extract::{
@@ -59,16 +60,67 @@ fn normalized_path(path: &str) -> String {
     p
 }
 
+/// HTTP header carrying the Brew protocol version, per the specification.
+const X_BREW_VERSION: &str = "X-Brew-Version";
+/// HTTP header carrying the Brew client mode (Terminal | Basestation).
+const X_BREW_MODE: &str = "X-Brew-Mode";
+
+fn brew_mode(headers: &HeaderMap) -> ClientMode {
+    ClientMode::from_header(headers.get(X_BREW_MODE).and_then(|v| v.to_str().ok()))
+}
+
+/// Validates the client's advertised `X-Brew-Version` header against the version
+/// this server implements and returns the connection's seed version. A missing
+/// header is accepted for backward compatibility and seeds `V0` (the version is
+/// then resolved lazily from message content, exactly as real clients do). A
+/// present but unsupported version yields `426 Upgrade Required` (as listed in
+/// the spec's supported response codes).
+fn check_brew_version(headers: &HeaderMap) -> Result<ConnVersion, Response> {
+    let Some(raw) = headers.get(X_BREW_VERSION) else {
+        debug!("no X-Brew-Version header; seeding V0 and detecting lazily");
+        return Ok(ConnVersion::V0);
+    };
+    let requested = raw.to_str().ok().and_then(|s| s.trim().parse::<u8>().ok());
+    match requested {
+        // Any version from 1 up to the version we implement is accepted; we seed
+        // the highest layout we mutually support.
+        Some(v) if v >= 1 && v <= crate::protocol::BREW_PROTOCOL_VERSION => {
+            Ok(ConnVersion::from_header_value(Some(v)))
+        }
+        Some(0) => Ok(ConnVersion::V0),
+        other => {
+            warn!(requested=?other, supported=crate::protocol::BREW_PROTOCOL_VERSION, "unsupported X-Brew-Version");
+            let mut resp = (
+                StatusCode::UPGRADE_REQUIRED,
+                [(header::CONTENT_TYPE, "text/plain")],
+                format!("Unsupported Brew version; this server implements version {}\n", crate::protocol::BREW_PROTOCOL_VERSION),
+            ).into_response();
+            if let Ok(v) = HeaderValue::from_str(&crate::protocol::BREW_PROTOCOL_VERSION.to_string()) {
+                resp.headers_mut().insert(X_BREW_VERSION, v);
+            }
+            Err(resp)
+        }
+    }
+}
+
 async fn brew_discovery(State(state): State<Arc<AppState>>, request: Request<axum::body::Body>) -> Response {
     state.purge_ephemeral().await;
     let (mut parts, _body) = request.into_parts();
     let request_uri = parts.uri.path().to_string();
+
+    let seed_version = match check_brew_version(&parts.headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let mode = brew_mode(&parts.headers);
+
     let is_upgrade = parts.headers.get(header::UPGRADE).and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("websocket")).unwrap_or(false);
 
     // Direct WS mode remains available only when Digest is disabled.
     if is_upgrade && !state.config.auth.enabled {
-        return upgrade_from_parts(state, &mut parts).await;
+        return upgrade_from_parts(state, &mut parts, mode, seed_version).await;
     }
 
     if state.config.auth.enabled {
@@ -76,12 +128,35 @@ async fn brew_discovery(State(state): State<Arc<AppState>>, request: Request<axu
             return digest_challenge(&state).await;
         }
         let token = Uuid::new_v4().simple().to_string();
-        state.inner.write().await.auth_sessions.insert(token.clone(), Instant::now());
+        state.inner.write().await.auth_sessions.insert(token.clone(), (Instant::now(), mode, seed_version));
         let path = format!("{}/session/{}", normalized_path(&state.config.websocket_path), token);
-        return (StatusCode::OK, [(header::CONTENT_TYPE, "text/plain")], path).into_response();
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/plain"),
+                (header::HeaderName::from_static("x-brew-version"), version_header_value()),
+            ],
+            path,
+        ).into_response();
     }
 
-    (StatusCode::OK, [(header::CONTENT_TYPE, "text/plain")], normalized_path(&state.config.websocket_path)).into_response()
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/plain"),
+            (header::HeaderName::from_static("x-brew-version"), version_header_value()),
+        ],
+        normalized_path(&state.config.websocket_path),
+    ).into_response()
+}
+
+fn version_header_value() -> &'static str {
+    // BREW_PROTOCOL_VERSION is a small constant; map it to a static string so it
+    // can be used directly in the header array without allocation.
+    match crate::protocol::BREW_PROTOCOL_VERSION {
+        1 => "1",
+        _ => "1",
+    }
 }
 
 async fn brew_session_endpoint(
@@ -99,18 +174,23 @@ async fn brew_session_endpoint(
         .map(|v| v.eq_ignore_ascii_case("websocket")).unwrap_or(false);
     if !is_upgrade { return StatusCode::BAD_REQUEST.into_response(); }
 
-    // Session URLs are single-use. The established WebSocket is the authenticated session.
-    state.inner.write().await.auth_sessions.remove(&token);
-    upgrade_from_parts(state, &mut parts).await
+    // Session URLs are single-use. The established WebSocket is the authenticated
+    // session. Recover the mode and seed version captured during the
+    // authenticated discovery GET; the WebSocket handshake itself carries
+    // neither the X-Brew-Mode nor X-Brew-Version header.
+    let (mode, seed_version) = state.inner.write().await.auth_sessions.remove(&token)
+        .map(|(_, mode, ver)| (mode, ver))
+        .unwrap_or_default();
+    upgrade_from_parts(state, &mut parts, mode, seed_version).await
 }
 
-async fn upgrade_from_parts(state: Arc<AppState>, parts: &mut axum::http::request::Parts) -> Response {
+async fn upgrade_from_parts(state: Arc<AppState>, parts: &mut axum::http::request::Parts, mode: ClientMode, seed_version: ConnVersion) -> Response {
     match WebSocketUpgrade::from_request_parts(parts, &state).await {
         Ok(ws) => {
             let requested = parts.headers.get(header::SEC_WEBSOCKET_PROTOCOL).and_then(|v| v.to_str().ok()).unwrap_or_default();
-            debug!(requested_subprotocol=requested, "WebSocket upgrade request");
+            debug!(requested_subprotocol=requested, mode=mode.as_str(), seed_version=seed_version.as_u8(), "WebSocket upgrade request");
             let protocol = state.config.websocket_subprotocol.clone();
-            ws.protocols([protocol]).on_upgrade(move |socket| client_session(state, socket)).into_response()
+            ws.protocols([protocol]).on_upgrade(move |socket| client_session(state, socket, mode, seed_version)).into_response()
         }
         Err(rejection) => rejection.into_response(),
     }
@@ -168,12 +248,12 @@ async fn verify_digest(state: &Arc<AppState>, headers: &HeaderMap, method: &str,
     ok
 }
 
-async fn client_session(state: Arc<AppState>, socket: WebSocket) {
+async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMode, seed_version: ConnVersion) {
     let id = Uuid::new_v4();
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    state.inner.write().await.clients.insert(id, Client { tx });
-    info!(%id, "BlueStation connected");
+    state.inner.write().await.clients.insert(id, Client { tx, mode, version: seed_version });
+    info!(%id, mode=mode.as_str(), version=seed_version.as_u8(), "BlueStation connected");
 
     let writer = tokio::spawn(async move {
         while let Some(packet) = rx.recv().await {

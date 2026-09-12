@@ -4,6 +4,29 @@ Experimental Rust Brew core for linking two or more MidnightBlue BlueStation or 
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 0.6 adds:
+
+- **Brew protocol version 1 support.** The server advertises and negotiates the
+  protocol version via the `X-Brew-Version` header on the discovery GET
+  (responding `426 Upgrade Required` for versions it does not implement). Because
+  real clients (e.g. FlowStation) send no version header on the WebSocket
+  handshake, the version is tracked **per connection** and resolved *lazily from
+  message content*, defaulting to v0 and promoting to v1 once a v1-shaped
+  call-control message is seen. The v1 SS-TPI `mnemonic[34]` talking-party name
+  is parsed on `GROUP_TX`/`SETUP_REQUEST` (ETSI EN 300 392-9), and the
+  `X-Brew-Mode` header (`Terminal`/`Basestation`) is tracked per client.
+- **Dashboard control-panel fix.** The FlowStation Control panel no longer wipes
+  operator input: it reconciles station cards incrementally instead of rebuilding
+  the DOM on every refresh, and reconnects its WebSocket in the background rather
+  than reloading the page.
+- **Paginated logs.** Recent calls, Recent SDS and the Telemetry SDS Log are
+  paginated (10, 10 and 5 rows per page respectively) and have moved off the main
+  dashboard onto their own linked pages: `/calls`, `/sds`, and `/telemetry-sds`.
+- **Timeslot occupancy graphic.** Each FlowStation telemetry card shows a small
+  per-carrier TS1-TS4 grid indicating which timeslots are busy vs. available.
+- **Registered-subscribers frame.** A dashboard panel lists which subscriber
+  ISSIs are registered on each connected FlowStation.
+
 Version 0.5 adds:
 
 - The monitoring dashboard now runs on its **own listener/port** (`[dashboard]`,
@@ -37,7 +60,7 @@ Version 0.2 adds:
 
 ## Important compatibility note
 
-The current BlueStation source defines private/simplex state constants, but its Brew parser keeps most of those payloads as raw bytes and its worker currently exposes group voice/SDS commands rather than private-call commands. This server therefore treats private `SETUP_REQUEST` payloads conservatively: the first two little-endian `u32` values are interpreted as source ISSI and destination ISSI, and subsequent control/traffic packets are routed by UUID. Validate this against captures/specification before production use.
+The current BlueStation source defines private/simplex state constants, but its Brew parser keeps most of those payloads as raw bytes and its worker currently exposes group voice/SDS commands rather than private-call commands. As of v0.6 this server parses private `SETUP_REQUEST`/`CONNECT_REQUEST` payloads into a structured `BrewCircularCall` (source ISSI, destination ISSI, dialled number, priority, and the v1 `mnemonic`), and routes subsequent control/traffic packets by UUID. For any peer whose payload cannot be fully structured it falls back to the earlier conservative behaviour: the first two little-endian `u32` values are interpreted as source and destination ISSI. Validate this against captures/specification before production use.
 
 ## Build and run
 
@@ -135,6 +158,31 @@ Configure each BlueStation's Brew transport to point at the server host/port, us
 4. Server returns a one-time path such as `/brew/session/<token>`.
 5. BlueStation upgrades that path to WebSocket with subprotocol `brew`.
 
+## Protocol version negotiation
+
+The server implements **Brew protocol version 1**. Clients may advertise the
+version they speak with an `X-Brew-Version` header on the discovery `GET`:
+
+- A matching (or lower, still-supported) version is accepted; the server echoes
+  `X-Brew-Version` on the `200` response.
+- An unsupported version gets `426 Upgrade Required`.
+- A **missing** header is accepted for backward compatibility, and the version is
+  then determined per connection from the message stream.
+
+Because the WebSocket handshake itself carries no version header, the version is
+a **per-connection** property that starts at v0 and is *promoted lazily* to v1
+the first time a v1-shaped call-control message (one carrying the `mnemonic[34]`
+tail) is observed. This mirrors how FlowStation resolves the version and is
+logged once per connection (`Brew connection version promoted from message
+content`). If a FlowStation reports it stays on v0, that is a client-side choice;
+the server interoperates correctly at both v0 and v1.
+
+The v1 additions this server understands are the SS-TPI talking-party
+`mnemonic[34]` on `GROUP_TX` and `SETUP_REQUEST` (decoded per ETSI EN 300 392-9,
+8-bit and 7-bit packed alphabets), and the `X-Brew-Mode` header
+(`Terminal`/`Basestation`), tracked per client so terminals can be excluded from
+registration pushes.
+
 ## SDS routing
 
 BlueStation sends SDS as two Brew packets with the same UUID:
@@ -173,7 +221,7 @@ The following Brew call states are recognized and routed by call UUID:
 - 12 SIMPLEX_GRANTED
 - 13 SIMPLEX_IDLE
 
-`SETUP_REQUEST` establishes the route from the first 8 payload bytes (`source_issi:u32 LE`, `destination_issi:u32 LE`). The destination must currently be registered on another BlueStation. Thereafter control messages and traffic-channel frames may flow in either direction between the two participating cells until `CALL_RELEASE`.
+`SETUP_REQUEST` establishes the route from the structured `BrewCircularCall` payload (source ISSI, destination ISSI, dialled number, priority, and — on v1 — the talking-party `mnemonic`); for payloads that cannot be fully structured it falls back to the first 8 bytes (`source_issi:u32 LE`, `destination_issi:u32 LE`). The destination must currently be registered on another BlueStation. Thereafter control messages and traffic-channel frames may flow in either direction between the two participating cells until `CALL_RELEASE`.
 
 Because current upstream BlueStation does not yet expose a complete private-call Brew command path, this feature should be considered server-ready/experimental rather than end-to-end validated.
 
@@ -286,6 +334,8 @@ enabled = false
 ```
 
 - Dashboard: `http://<server>:9003/`
+- Log pages (linked from the dashboard): `/calls` (recent calls, 10/page),
+  `/sds` (recent SDS, 10/page), `/telemetry-sds` (telemetry SDS log, 5/page)
 - JSON snapshot: `/api/status`
 - Live event WebSocket: `/api/live`
 - FlowStation telemetry snapshot: `/api/telemetry` (empty unless the `[telemetry]`
@@ -337,12 +387,17 @@ network); do not run auth over plain HTTP in production. `cert_path` is a PEM
 chain (leaf first) and `key_path` the matching PKCS#8/RSA key, same format as
 the Brew `[tls]` block.
 
-The dashboard shows connected BlueStations, registered subscribers, groups, active and
-recent group/private calls, call durations/voice-frame counts, and recent SDS traffic.
-When the FlowStation Telemetry channel is enabled, it also shows per-station health,
-active calls with **carrier + timeslot**, RF quality, telemetry-sourced SDS traffic, and
-an emergency-alarm banner — see "FlowStation Telemetry" above, which is where that
-RF TS1-TS4 / carrier-timeslot data now comes from. When Control is enabled, each
-connected station gets a command panel (Kick MS, DGNA, live SDS, clear emergency,
-restart/shutdown) — see "FlowStation Control" above. Counters/history are currently
-in-memory and reset when the server (or the BTS's telemetry/control connection) restarts.
+The dashboard shows connected BlueStations, registered subscribers, groups, and
+active/live group and private calls with durations and voice-frame counts.
+Recent calls, recent SDS, and the telemetry SDS log have moved to their own
+paginated pages, linked from the "Logs" panel (`/calls`, `/sds`,
+`/telemetry-sds`). When the FlowStation Telemetry channel is enabled, it also
+shows per-station health, active calls with **carrier + timeslot**, a small
+per-carrier **TS1-TS4 timeslot occupancy grid** (busy vs. available), RF
+quality, and a **Registered Subscribers** panel listing which ISSIs are
+registered on each station; active emergency alarms appear as a banner — see
+"FlowStation Telemetry" above, which is where the carrier-timeslot data comes
+from. When Control is enabled, each connected station gets a command panel (Kick
+MS, DGNA, live SDS, clear emergency, restart/shutdown) — see "FlowStation
+Control" above. Counters/history are currently in-memory and reset when the
+server (or the BTS's telemetry/control connection) restarts.

@@ -13,13 +13,20 @@ use tracing::{debug, info, warn};
 
 pub async fn handle_packet(state: Arc<AppState>, source: ClientId, raw: Vec<u8>) {
     state.purge_ephemeral().await;
-    let parsed = match protocol::parse(&raw) {
+    let version = state.client_version(source).await;
+    let (parsed, detected) = match protocol::parse_with_version(&raw, version) {
         Ok(v) => v,
         Err(e) => {
             warn!(%source, error = %e, bytes = raw.len(), "dropping malformed Brew packet");
             return;
         }
     };
+    // Lazily resolve the connection version from message content, mirroring the
+    // client side. Log the promotion once so operators can see when a peer is
+    // confirmed to speak v1 despite sending no X-Brew-Version handshake header.
+    if detected.as_u8() > version.as_u8() && state.promote_client_version(source, detected).await {
+        info!(%source, from = version.as_u8(), to = detected.as_u8(), "Brew connection version promoted from message content");
+    }
 
     match parsed {
         BrewMessage::Subscriber(msg) => handle_subscriber(&state, source, msg).await,
@@ -178,11 +185,18 @@ async fn handle_sds_report(state: &Arc<AppState>, source: ClientId, id: uuid::Uu
 }
 
 async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, payload: CallPayload, raw: Vec<u8>) {
-    // Current BlueStation exposes private/simplex state constants but leaves their payload raw.
-    // We conservatively interpret the first two LE u32 values as source ISSI and destination ISSI.
-    let Some((source_issi, destination)) = protocol::raw_peer_pair(&payload) else {
-        warn!(%source, uuid=%id, "private SETUP_REQUEST has no routable source/destination pair");
-        return;
+    // Prefer the structured CircularCall payload (parsed per Brew v1). Fall back
+    // to the conservative raw source/destination pair for any peer that sends a
+    // payload we could not fully structure.
+    let (source_issi, destination, mnemonic) = match &payload {
+        CallPayload::CircularCall(c) => (c.source, c.destination, c.mnemonic.clone()),
+        other => match protocol::raw_peer_pair(other) {
+            Some((s, d)) => (s, d, None),
+            None => {
+                warn!(%source, uuid=%id, "private SETUP_REQUEST has no routable source/destination pair");
+                return;
+            }
+        },
     };
     let mut inner = state.inner.write().await;
     let Some(target_client) = inner.subscribers.get(&destination).map(|s| s.client_id) else {
@@ -196,7 +210,7 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
     drop(inner);
     if let Some(tx) = tx { let _ = tx.send(raw); }
     state.monitor.call_started(id, "private", source_issi, destination, 0).await;
-    info!(%source, uuid=%id, source_issi, destination, "routed private SETUP_REQUEST (experimental)");
+    info!(%source, uuid=%id, source_issi, destination, mnemonic=?mnemonic, "routed private SETUP_REQUEST");
 }
 
 async fn route_private_control(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: Vec<u8>) {
