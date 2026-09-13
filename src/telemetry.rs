@@ -191,6 +191,9 @@ pub struct SdsLogEntry {
 #[derive(Debug, Clone, Serialize)]
 pub struct TelemetryBts {
     pub id: String,
+    /// Remote IP address of the FlowStation's telemetry connection, e.g.
+    /// "10.19.144.201". `None` if the peer address could not be determined.
+    pub ip: Option<String>,
     pub connected_at_ms: u64,
     pub last_event_at_ms: u64,
     pub health: Option<HealthSnapshot>,
@@ -226,6 +229,12 @@ pub struct TelemetryBts {
     pub undecoded_beacons: HashMap<u32, UndecodedBeacon>,
     /// Serialized view of `undecoded_beacons`, newest first.
     pub undecoded_beacons_out: Vec<UndecodedBeacon>,
+    /// Latest transmit EVM (error vector magnitude, %) from TxQuality. Lower is
+    /// better; shown as an SNR-adjacent quality indicator (not a true SNR).
+    pub evm_pct: Option<f32>,
+    /// Latest received signal strength (dBFS) reported for an MS via MsRssi.
+    /// This is RSSI, not SNR.
+    pub rssi_dbfs: Option<f32>,
 }
 
 /// A position beacon that was observed but not decodable to coordinates.
@@ -251,9 +260,10 @@ pub struct MsPosition {
 }
 
 impl TelemetryBts {
-    fn new(id: String) -> Self {
+    fn new(id: String, ip: Option<String>) -> Self {
         Self {
             id,
+            ip,
             connected_at_ms: now_ms(),
             last_event_at_ms: now_ms(),
             health: None,
@@ -272,6 +282,8 @@ impl TelemetryBts {
             positions_out: Vec::new(),
             undecoded_beacons: HashMap::new(),
             undecoded_beacons_out: Vec::new(),
+            evm_pct: None,
+            rssi_dbfs: None,
         }
     }
 
@@ -414,20 +426,21 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         users: state.config.telemetry.users.clone(),
         tls: state.config.telemetry.tls.clone(),
     };
-    fsnet::serve(cfg, move |socket, identity| {
+    fsnet::serve(cfg, move |socket, identity, peer| {
         let state = state.clone();
-        async move { session(state, socket, identity).await }
+        async move { session(state, socket, identity, peer).await }
     })
     .await
 }
 
-async fn session(state: Arc<AppState>, socket: WebSocket, identity: Option<String>) {
+async fn session(state: Arc<AppState>, socket: WebSocket, identity: Option<String>, peer: Option<std::net::SocketAddr>) {
     let id = identity.unwrap_or_else(|| format!("telemetry-{}", uuid::Uuid::new_v4().simple()));
+    let ip = peer.map(|p| p.ip().to_string());
     {
         let mut t = state.telemetry.write().await;
-        t.stations.insert(id.clone(), TelemetryBts::new(id.clone()));
+        t.stations.insert(id.clone(), TelemetryBts::new(id.clone(), ip.clone()));
     }
-    info!(bts = %id, "FlowStation telemetry connected");
+    info!(bts = %id, ip = ip.as_deref().unwrap_or("unknown"), "FlowStation telemetry connected");
 
     let (_tx, mut ws_rx) = socket.split();
     while let Some(item) = ws_rx.next().await {
@@ -491,13 +504,14 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
                 "SDS ({direction})");
             bts.push_sds(SdsLogEntry { at_ms: now_ms(), direction, source_issi, dest_issi, is_group, protocol_id, text });
         }
-        TelemetryEvent::TxQuality(q) => bts.last_tx_quality = Some(q),
+        TelemetryEvent::TxQuality(q) => { bts.evm_pct = Some(q.evm_pct); bts.last_tx_quality = Some(q); }
         TelemetryEvent::SdrHealth(h) => bts.last_sdr_health = Some(h),
         TelemetryEvent::SysHealth(h) => bts.last_sys_health = Some(h),
         TelemetryEvent::HealthSnapshot(h) => bts.health = Some(h),
         TelemetryEvent::EmergencyAlarm { source_issi, .. } => { bts.emergencies.insert(source_issi); }
         TelemetryEvent::EmergencyCancel { source_issi } => { bts.emergencies.remove(&source_issi); }
         TelemetryEvent::BrewConnected { connected, .. } => bts.backhaul_connected = Some(connected),
+        TelemetryEvent::MsRssi { rssi_dbfs, .. } => bts.rssi_dbfs = Some(rssi_dbfs),
         _ => {}
     }
     drop(t);
@@ -524,7 +538,7 @@ mod tests {
 
     #[test]
     fn textual_position_beacon_is_stored() {
-        let mut bts = TelemetryBts::new("bts-1".to_string());
+        let mut bts = TelemetryBts::new("bts-1".to_string(), None);
         bts.push_sds(sds(1001, 3, "44.4353, 26.1092", 100));
         assert_eq!(bts.positions.len(), 1);
         let p = &bts.positions[&1001];
@@ -534,7 +548,7 @@ mod tests {
 
     #[test]
     fn empty_lip_beacon_stores_no_position() {
-        let mut bts = TelemetryBts::new("bts-1".to_string());
+        let mut bts = TelemetryBts::new("bts-1".to_string(), None);
         // PID 10 with empty text (the binary-LIP case) yields no coordinates.
         bts.push_sds(sds(1001, 10, "", 100));
         assert!(bts.positions.is_empty());
@@ -543,7 +557,7 @@ mod tests {
 
     #[test]
     fn latest_position_replaces_older_for_same_issi() {
-        let mut bts = TelemetryBts::new("bts-1".to_string());
+        let mut bts = TelemetryBts::new("bts-1".to_string(), None);
         bts.push_sds(sds(1001, 3, "44.00, 26.00", 100));
         bts.push_sds(sds(1001, 3, "45.00, 27.00", 200));
         assert_eq!(bts.positions.len(), 1);
@@ -555,9 +569,9 @@ mod tests {
     #[test]
     fn positions_across_stations_are_aggregated_and_tagged() {
         let mut state = TelemetryState::default();
-        let mut a = TelemetryBts::new("BTS-A".to_string());
+        let mut a = TelemetryBts::new("BTS-A".to_string(), None);
         a.push_sds(sds(1, 3, "44.0, 26.0", 100));
-        let mut b = TelemetryBts::new("BTS-B".to_string());
+        let mut b = TelemetryBts::new("BTS-B".to_string(), None);
         b.push_sds(sds(2, 3, "45.0, 27.0", 200));
         state.stations.insert("BTS-A".to_string(), a);
         state.stations.insert("BTS-B".to_string(), b);
@@ -571,7 +585,7 @@ mod tests {
 
     #[test]
     fn sync_registrations_sorts_and_counts() {
-        let mut bts = TelemetryBts::new("bts-1".to_string());
+        let mut bts = TelemetryBts::new("bts-1".to_string(), None);
         bts.registrations.insert(300);
         bts.registrations.insert(100);
         bts.registrations.insert(200);
@@ -582,7 +596,7 @@ mod tests {
 
     #[test]
     fn sync_registrations_after_removal() {
-        let mut bts = TelemetryBts::new("bts-1".to_string());
+        let mut bts = TelemetryBts::new("bts-1".to_string(), None);
         for issi in [10u32, 20, 30] { bts.registrations.insert(issi); }
         bts.sync_registrations();
         bts.registrations.remove(&20);
@@ -593,7 +607,7 @@ mod tests {
 
     #[test]
     fn registrations_list_serialized_in_snapshot() {
-        let mut bts = TelemetryBts::new("bts-1".to_string());
+        let mut bts = TelemetryBts::new("bts-1".to_string(), None);
         bts.registrations.insert(4242);
         bts.sync_registrations();
         let json = serde_json::to_string(&bts).unwrap();
@@ -601,5 +615,28 @@ mod tests {
         assert!(json.contains("4242"));
         // the raw HashSet field stays skipped
         assert!(!json.contains("\"registrations\":"), "raw set must be skipped");
+    }
+}
+
+#[cfg(test)]
+mod ip_snr_tests {
+    use super::*;
+
+    #[test]
+    fn bts_serializes_ip_evm_rssi() {
+        let mut bts = TelemetryBts::new("100000002".to_string(), Some("10.19.144.201".to_string()));
+        bts.evm_pct = Some(1.25);
+        bts.rssi_dbfs = Some(-3.3);
+        let json = serde_json::to_string(&bts).unwrap();
+        assert!(json.contains("10.19.144.201"), "ip serialized");
+        assert!(json.contains("\"evm_pct\":1.25"), "evm serialized");
+        assert!(json.contains("\"rssi_dbfs\":-3.3"), "rssi serialized");
+    }
+
+    #[test]
+    fn bts_ip_optional() {
+        let bts = TelemetryBts::new("bts-x".to_string(), None);
+        let json = serde_json::to_string(&bts).unwrap();
+        assert!(json.contains("\"ip\":null"));
     }
 }

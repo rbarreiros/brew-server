@@ -320,10 +320,14 @@ function renderTelemetry(stations){
     const calls=Object.values(s.active_calls||{});
     const backhaul=s.backhaul_connected===true?'up':s.backhaul_connected===false?'down':'unknown';
     const q=s.last_tx_quality,sdr=s.last_sdr_health;
+    const ipLabel=s.ip?` <span class=muted style="font-weight:400">- ${esc(s.ip)}</span>`:'';
+    const evm=(s.evm_pct!=null)?`EVM ${s.evm_pct.toFixed(2)}%`:(q?`EVM ${q.evm_pct.toFixed(2)}%`:'');
+    const rssi=(s.rssi_dbfs!=null)?`RSSI ${s.rssi_dbfs.toFixed(1)} dBFS`:'';
+    const sig=[evm,rssi].filter(Boolean).join(' &middot; ');
     return `<div class=bts-card>
-      <div style="display:flex;justify-content:space-between;align-items:center"><h3>${esc(s.id)}</h3>${healthPill(s.health&&s.health.overall)}</div>
+      <div style="display:flex;justify-content:space-between;align-items:center"><h3>${esc(s.id)}${ipLabel}</h3>${healthPill(s.health&&s.health.overall)}</div>
       <div class="bts-meta muted">Backhaul ${backhaul} &middot; ${s.registration_count} registered &middot; ${calls.length} active call(s)</div>
-      ${q?`<div class="bts-meta muted">EVM ${q.evm_pct.toFixed(2)}% &middot; PAPR ${q.papr_db.toFixed(1)}dB${sdr&&sdr.temperature_c!=null?` &middot; SDR ${sdr.temperature_c.toFixed(1)}&deg;C`:''}</div>`:''}
+      ${sig?`<div class="bts-meta muted" title="EVM is transmit error-vector magnitude (SNR proxy); RSSI is received signal strength — neither is a true SNR">${sig}${q?` &middot; PAPR ${q.papr_db.toFixed(1)}dB`:''}${sdr&&sdr.temperature_c!=null?` &middot; SDR ${sdr.temperature_c.toFixed(1)}&deg;C`:''}</div>`:''}
       ${calls.length?`<table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Carrier/TS</th><th>Pri</th></tr></thead><tbody>${calls.map(c=>`<tr><td>${c.is_group?'Group':'Private'}</td><td>${c.source_issi}</td><td>${c.gssi_or_called}</td><td>${c.carrier_num}/${c.ts}</td><td>${c.priority}</td></tr>`).join('')}</tbody></table>`:''}
       ${tsGrid(calls)}
     </div>`;

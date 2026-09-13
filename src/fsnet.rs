@@ -7,7 +7,7 @@ use anyhow::Context;
 use axum::{
     extract::{
         ws::{WebSocket, WebSocketUpgrade},
-        FromRequestParts, State,
+        ConnectInfo, FromRequestParts, State,
     },
     http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     response::{IntoResponse, Response},
@@ -38,7 +38,7 @@ struct HandlerState<H: Clone> {
 
 pub async fn serve<H, Fut>(cfg: ListenerConfig, handler: H) -> anyhow::Result<()>
 where
-    H: Fn(WebSocket, Identity) -> Fut + Clone + Send + Sync + 'static,
+    H: Fn(WebSocket, Identity, Option<SocketAddr>) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let cfg = Arc::new(cfg);
@@ -63,24 +63,26 @@ where
         })?;
         tracing::info!(listen=%cfg.listen, name=cfg.name, tls=true, "FlowStation listener started");
         axum_server::bind_rustls(cfg.listen, rustls_config)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
         tracing::info!(listen=%cfg.listen, name=cfg.name, tls=false, "FlowStation listener started");
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     }
     Ok(())
 }
 
 async fn upgrade_handler<H, Fut>(
     State(state): State<HandlerState<H>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request<axum::body::Body>,
 ) -> Response
 where
-    H: Fn(WebSocket, Identity) -> Fut + Clone + Send + Sync + 'static,
+    H: Fn(WebSocket, Identity, Option<SocketAddr>) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
+    let peer = Some(peer);
     let (mut parts, _body) = request.into_parts();
 
     let identity = match verify_basic(&state.cfg.users, &parts.headers) {
@@ -103,7 +105,7 @@ where
             let handler = state.handler.clone();
             let subprotocol = state.cfg.subprotocol;
             ws.protocols([subprotocol])
-                .on_upgrade(move |socket| handler(socket, identity))
+                .on_upgrade(move |socket| handler(socket, identity, peer))
                 .into_response()
         }
         Err(rejection) => rejection.into_response(),
