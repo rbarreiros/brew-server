@@ -18,8 +18,8 @@ realm = "brew-server"
 session_ttl_seconds = 300
 
 [auth.users]
-"100000001" = "change-me-bs1"
-"100000002" = "change-me-bs2"
+"1000001" = "change-me-bs1"
+"1000002" = "change-me-bs2"
 
 # Optional: FlowStation's outbound Telemetry channel (BTS -> this server).
 # Off by default. See README.md "FlowStation Telemetry" for details.

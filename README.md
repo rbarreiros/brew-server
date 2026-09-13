@@ -104,8 +104,8 @@ realm = "brew-server"
 session_ttl_seconds = 300
 
 [auth.users]
-"100000001" = "change-me-bs1"
-"100000002" = "change-me-bs2"
+"1000001" = "change-me-bs1"
+"1000002" = "change-me-bs2"
 
 [dashboard]
 enabled = true
@@ -123,7 +123,7 @@ key_path = "tls/dashboard-key.pem"
 
 The `[dashboard]` block controls the monitoring UI on its own port, separate
 from the Brew API above — see "Web monitoring dashboard" below for auth and TLS
-details. Use a different username/password for each BlueStation. The username is only an HTTP Digest identity; it does not have to equal a radio ISSI, although using a numeric site identity is convenient.
+details. Use a different username/password for each BlueStation. The Brew username is an HTTP Digest identity that must be **numeric and at most 7 digits** (a connection presenting a longer or non-numeric username is refused); for BSs it does not have to equal a radio ISSI, though a numeric site identity is convenient.
 
 ## TLS
 

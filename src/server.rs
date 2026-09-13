@@ -220,11 +220,23 @@ fn parse_digest(header_value: &str) -> HashMap<String, String> {
     out
 }
 
+const MAX_BREW_USERNAME_DIGITS: usize = 7;
+
+fn is_valid_brew_username(username: &str) -> bool {
+    !username.is_empty()
+        && username.len() <= MAX_BREW_USERNAME_DIGITS
+        && username.bytes().all(|b| b.is_ascii_digit())
+}
+
 async fn verify_digest(state: &Arc<AppState>, headers: &HeaderMap, method: &str, expected_uri: &str) -> bool {
     let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else { return false; };
     if !value.starts_with("Digest ") { return false; }
     let p = parse_digest(value);
     let Some(username) = p.get("username") else { return false; };
+    if !is_valid_brew_username(username) {
+        warn!(username = %username, "rejecting Brew auth: username must be 1-7 digits");
+        return false;
+    }
     let Some(password) = state.config.auth.users.get(username) else { return false; };
     let Some(nonce) = p.get("nonce") else { return false; };
     if !state.inner.read().await.digest_nonces.contains_key(nonce) { return false; }
