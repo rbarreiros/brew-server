@@ -10,7 +10,9 @@ Version 0.7 adds:
   binary log (`bincode`-framed, crash-safe on read) and replayed on startup, so
   call/SDS history and counters survive restarts. Configured under `[storage]`
   (`enabled`, `path`); it keeps everything with no rotation. A torn trailing
-  record from a hard crash is detected and skipped.
+  record from a hard crash is detected and skipped. Read the log with the
+  bundled `brew-history` tool: `brew-history brew-history.bin` for readable text,
+  or `brew-history brew-history.bin --json` to pipe into `jq`.
 
 - **Position mapping.** SDS position beacons are decoded to latitude/longitude,
   tracked per subscriber ISSI, and plotted on a new `/map` page (Leaflet +
