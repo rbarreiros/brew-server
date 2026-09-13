@@ -4,6 +4,17 @@ Experimental Rust Brew core for linking two or more MidnightBlue BlueStation or 
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 0.7 adds:
+
+- **Position mapping.** SDS position beacons are decoded to latitude/longitude,
+  tracked per subscriber ISSI, and plotted on a new `/map` page (Leaflet +
+  OpenStreetMap); a `/api/positions` endpoint exposes the latest fixes. Two
+  sources are supported: **binary TETRA LIP** short location reports (ETSI TS
+  100 392-18), decoded from the raw SDS relayed over the Brew channel, and
+  **textual** beacons (APRS, decimal degrees, Maidenhead). No FlowStation change
+  is required — the LIP payload is decoded in `handle_sds_transfer` from the SDS
+  that the Brew channel already relays. See "Position mapping" below.
+
 Version 0.6 adds:
 
 - **Brew protocol version 1 support.** The server advertises and negotiates the
@@ -104,6 +115,7 @@ realm = "brew-server"
 session_ttl_seconds = 300
 
 [auth.users]
+# Brew usernames must be numeric, max 7 digits.
 "1000001" = "change-me-bs1"
 "1000002" = "change-me-bs2"
 
@@ -123,7 +135,7 @@ key_path = "tls/dashboard-key.pem"
 
 The `[dashboard]` block controls the monitoring UI on its own port, separate
 from the Brew API above — see "Web monitoring dashboard" below for auth and TLS
-details. Use a different username/password for each BlueStation. The Brew username is an HTTP Digest identity that must be **numeric and at most 7 digits** (a connection presenting a longer or non-numeric username is refused); for BSs it does not have to equal a radio ISSI, though a numeric site identity is convenient.
+details. Use a different username/password for each BlueStation. The Brew username is an HTTP Digest identity that must be **numeric and at most 7 digits** (a connection presenting a longer or non-numeric username is refused); it does not have to equal a radio ISSI, though a numeric site identity is convenient.
 
 ## TLS
 
@@ -334,6 +346,8 @@ enabled = false
 ```
 
 - Dashboard: `http://<server>:9003/`
+- MS map (linked from the dashboard): `/map` — plots decoded MS positions;
+  JSON at `/api/positions`
 - Log pages (linked from the dashboard): `/calls` (recent calls, 10/page),
   `/sds` (recent SDS, 10/page), `/telemetry-sds` (telemetry SDS log, 5/page)
 - JSON snapshot: `/api/status`
@@ -348,6 +362,32 @@ All dashboard routes sit behind optional HTTP **Basic** auth: add entries to
 open). Set `[dashboard.tls]` to serve the dashboard over HTTPS/WSS. The Brew API
 listener (`listen`, normally `:9000`) now serves only `/brew` and `/healthz` —
 the dashboard is no longer mounted there.
+
+### Position mapping
+
+The `/map` page plots the latest known position of each mobile station, from two
+sources, both decoded on the Brew SDS channel (`handle_sds_transfer`) — the SDS
+that FlowStation relays for delivery, not the lossy telemetry `SdsLog`:
+
+- **Binary TETRA LIP** (ETSI TS 100 392-18) short location reports, SDS protocol
+  id `0x0A`. The frame is scanned for the `0x0A` PID and the bit-packed PDU is
+  decoded: 2-bit PDU type (0 = short report), 2-bit time-elapsed, 25-bit signed
+  longitude (`raw * 360 / 2^25`), 24-bit signed latitude (`raw * 180 / 2^24`).
+  Verified against a live beacon `0a 01 0e 62 39 b0 43 9a ff e0 20` → 37.9920 N,
+  23.7642 E.
+- **Textual beacons** — an APRS string (`4426.12N/02606.55E`), decimal degrees
+  (`44.4353, 26.1092`), or a Maidenhead locator (`KN34bk`) — parsed from any
+  ASCII in the SDS body.
+
+The decoded fix is stored per subscriber ISSI (attributed via the SDS route's
+source ISSI) and served at `/api/positions`. **No FlowStation change is
+required.** Position-beacon SDS rows are also labelled in the Telemetry SDS Log.
+
+Note: this depends on the SDS (with its LIP payload) being relayed over the Brew
+channel to a registered destination. A temporary `debug`-level log
+(`SDS_TRANSFER raw frame`) dumps each frame's hex to confirm the payload offset
+against live traffic; enable it with `RUST_LOG=brew_server=debug` and remove the
+line once positions are confirmed on the map.
 
 ### Dashboard authentication and HTTPS
 

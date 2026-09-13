@@ -220,8 +220,13 @@ fn parse_digest(header_value: &str) -> HashMap<String, String> {
     out
 }
 
+/// Maximum number of digits allowed in a Brew (BlueStation) username. TETRA
+/// subscriber identities used as Brew usernames are constrained to at most 7
+/// decimal digits.
 const MAX_BREW_USERNAME_DIGITS: usize = 7;
 
+/// A Brew username must be non-empty, all decimal digits, and at most
+/// `MAX_BREW_USERNAME_DIGITS` long.
 fn is_valid_brew_username(username: &str) -> bool {
     !username.is_empty()
         && username.len() <= MAX_BREW_USERNAME_DIGITS
@@ -287,4 +292,31 @@ async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMod
     writer.abort();
     state.cleanup_client(id).await;
     info!(%id, "BlueStation disconnected");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_brew_username;
+
+    #[test]
+    fn accepts_1_to_7_digits() {
+        assert!(is_valid_brew_username("1"));
+        assert!(is_valid_brew_username("1234567"));
+        assert!(is_valid_brew_username("90"));
+    }
+
+    #[test]
+    fn rejects_more_than_7_digits() {
+        assert!(!is_valid_brew_username("12345678"));   // 8 digits
+        assert!(!is_valid_brew_username("100000001"));  // old 9-digit example
+    }
+
+    #[test]
+    fn rejects_empty_and_non_digits() {
+        assert!(!is_valid_brew_username(""));
+        assert!(!is_valid_brew_username("12a4567"));
+        assert!(!is_valid_brew_username("bs1"));
+        assert!(!is_valid_brew_username(" 123456"));
+        assert!(!is_valid_brew_username("123-456"));
+    }
 }

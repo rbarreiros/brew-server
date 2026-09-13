@@ -30,9 +30,11 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/calls", get(calls_page))
         .route("/sds", get(sds_page))
         .route("/telemetry-sds", get(telemetry_sds_page))
+        .route("/map", get(map_page))
         .route("/api/status", get(snapshot))
         .route("/api/live", get(live))
         .route("/api/telemetry", get(telemetry_snapshot))
+        .route("/api/positions", get(positions_snapshot))
         .route("/api/control", get(control_list))
         .route("/api/control/{id}", axum::routing::post(control_command))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_basic))
@@ -158,9 +160,66 @@ static SDS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| log_p
 static TELEMETRY_SDS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| log_page(
     "Telemetry SDS Log", "/api/telemetry",
     "d.flatMap(s=>(s.recent_sds_out||[]).map(x=>({...x,bts:s.id}))).sort((a,b)=>b.at_ms-a.at_ms).slice(0,50)",
-    "`<tr><td>${dt(x.at_ms)}</td><td>${esc(x.bts)}</td><td>${esc(x.direction)}</td><td>${x.source_issi}</td><td>${x.dest_issi}${x.is_group?' (grp)':''}</td><td>${esc(x.text)}</td></tr>`",
-    &["Time", "BTS", "Dir", "From", "To", "Text"], 5, "No telemetry SDS yet",
+    "`<tr><td>${dt(x.at_ms)}</td><td>${esc(x.bts)}</td><td>${esc(x.direction)}</td><td>${x.source_issi}</td><td>${x.dest_issi}${x.is_group?' (grp)':''}</td><td>${x.protocol_id===10?'<span class=\"badge badge-pos\">\\uD83D\\uDCCD Position</span>':`<span class=\"badge badge-sds\">SDS<\\/span> <span class=muted>pid ${x.protocol_id}<\\/span>`}</td><td>${x.protocol_id===10&&!(x.text||'').trim()?'<span class=pos-undec>binary LIP (undecoded)<\\/span>':esc(x.text)}</td></tr>`",
+    &["Time", "BTS", "Dir", "From", "To", "Type", "Text"], 5, "No telemetry SDS yet",
 ));
+
+/// Standalone map page. Plots the latest decoded MS positions on an
+/// OpenStreetMap base layer using Leaflet (loaded from unpkg CDN). Positions
+/// come only from *textual* beacons; the page explains that binary LIP is not
+/// yet decoded so an empty map is not mistaken for a bug.
+static MAP_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>MS Map - TETRA Network</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+{style}
+<style>#map{{height:70vh;border:1px solid #203047;border-radius:12px}}.map-note{{font-size:12px;color:#8fa2b8;margin-top:10px}}.leaflet-popup-content{{color:#0d1826}}</style>
+</head><body><header><h1>MS MAP</h1><div><span class=live></span><span id=status>Live</span></div></header><main class=wrap>
+<p><a class=backlink href="/">&larr; Back to dashboard</a></p>
+<section class=panel><h2>Mobile station positions</h2><div id=map></div>
+<div class=map-note id=note>Loading positions&hellip;</div>
+<div class=map-note>Positions come from decoded LIP (binary short &amp; long reports) and textual beacons over the Brew channel. Radios that beacon but can't be plotted (no GPS fix, or coordinates not relayed to this server) are listed below.</div>
+</section>
+<section class=panel><h2>Beaconing but not plottable</h2><div id=undecoded class=reg-list><span class=muted>None</span></div>
+<div class=map-note>These subscribers sent a position beacon that carried no usable coordinates &mdash; typically no GPS fix yet, or a locally-delivered beacon whose bytes never reach this server.</div>
+</section>
+</main>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c]));
+const map=L.map('map').setView([44.43,26.10],5);
+L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{maxZoom:19,attribution:'&copy; OpenStreetMap'}}).addTo(map);
+let markers={{}};let fitted=false;
+async function load(){{
+  try{{
+    const fixes=await(await fetch('/api/positions')).json();
+    $('status').textContent='Live';
+    const seen=new Set();
+    fixes.forEach(f=>{{
+      seen.add(f.issi);
+      const when=new Date(f.at_ms).toLocaleString();
+      const html=`<b>ISSI ${{f.issi}}</b><br>${{f.lat.toFixed(5)}}, ${{f.lon.toFixed(5)}}<br>Station: ${{f.bts}}<br>${{when}}<br><span style="color:#555">${{(f.source_text||'').replace(/[<>&]/g,'')}}</span>`;
+      if(markers[f.issi]){{markers[f.issi].setLatLng([f.lat,f.lon]).setPopupContent(html);}}
+      else{{markers[f.issi]=L.marker([f.lat,f.lon]).addTo(map).bindPopup(html);}}
+    }});
+    Object.keys(markers).forEach(k=>{{if(!seen.has(Number(k))){{map.removeLayer(markers[k]);delete markers[k];}}}});
+    $('note').textContent=fixes.length?`${{fixes.length}} station(s) positioned.`:'No decodable position beacons received yet.';
+    if(!fitted&&fixes.length){{fitted=true;map.fitBounds(fixes.map(f=>[f.lat,f.lon]),{{padding:[40,40],maxZoom:13}});}}
+  }}catch(e){{$('status').textContent='Disconnected';}}
+  // Undecodable beacons (beaconing but not plottable), from telemetry.
+  try{{
+    const stations=await(await fetch('/api/telemetry')).json();
+    const byIssi={{}};
+    stations.forEach(s=>(s.undecoded_beacons_out||[]).forEach(u=>{{
+      const prev=byIssi[u.issi];
+      if(!prev||u.at_ms>prev.at_ms)byIssi[u.issi]=u;
+    }}));
+    const plotted=new Set(Object.keys(markers).map(Number));
+    const list=Object.values(byIssi).filter(u=>!plotted.has(u.issi)).sort((a,b)=>b.at_ms-a.at_ms);
+    $('undecoded').innerHTML=list.length?list.map(u=>`<span class=reg-issi title="${{esc(u.reason)}} \u2014 ${{u.count}} beacon(s)">${{u.issi}} <span class=muted>${{new Date(u.at_ms).toLocaleTimeString()}}</span></span>`).join(''):'<span class=muted>None</span>';
+  }}catch(e){{}}
+}}
+load();setInterval(load,3000);
+</script></body></html>"#, style = STYLE));
 
 pub async fn calls_page() -> Html<&'static str> { Html(CALLS_HTML.as_str()) }
 pub async fn sds_page() -> Html<&'static str> { Html(SDS_HTML.as_str()) }
@@ -172,6 +231,12 @@ async fn live_socket(state: Arc<AppState>, mut socket: WebSocket) { let mut rx=s
 pub async fn telemetry_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<TelemetryBts>> {
     Json(state.telemetry.read().await.snapshot())
 }
+
+pub async fn positions_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<crate::telemetry::PositionFix>> {
+    Json(state.telemetry.read().await.positions())
+}
+
+pub async fn map_page() -> Html<&'static str> { Html(MAP_HTML.as_str()) }
 
 pub async fn control_list(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
     Json(state.control.read().await.connected_ids())
@@ -202,11 +267,12 @@ const STYLE: &str = r#"<style>
 .reg-list{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}.reg-issi{background:#0d1826;border:1px solid #203047;border-radius:5px;padding:3px 7px;font-size:12px;font-family:ui-monospace,monospace;color:#cfe0f2}.reg-count{font-size:12px;color:#8fa2b8}
 .navlinks{display:flex;gap:12px;flex-wrap:wrap}.navlink{display:block;background:#0d1826;border:1px solid #203047;border-radius:10px;padding:14px 18px;color:#cfe0f2;text-decoration:none;font-size:14px;font-weight:600;transition:background .1s}.navlink:hover{background:#16273c;border-color:#2c405c}.navlink .sub{display:block;font-size:12px;font-weight:400;color:#8fa2b8;margin-top:4px}
 .backlink{color:#8fa2b8;text-decoration:none;font-size:13px}.backlink:hover{color:#cfe0f2}
+.badge{display:inline-block;padding:2px 7px;border-radius:99px;font-size:11px;font-weight:600}.badge-pos{background:#123047;color:#5cc0f2;border:1px solid #1d4a66}.badge-sds{background:#203047;color:#8fa2b8}.pos-undec{color:#8fa2b8;font-style:italic}
 </style>"#;
 
 const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><header><h1>TETRA NETWORK MONITOR</h1><div><span class=live></span><span id=status>Live</span></div></header><main class=wrap>
 <div class=banner id=emergency-banner></div>
-<section class=cards><div class=card><div class=muted>BlueStations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Logs</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-FlowStation SDS stream</span></a></div></section>
+<section class=cards><div class=card><div class=muted>BlueStations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Logs</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-FlowStation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a></div></section>
 <section class=panel><h2>FlowStation Telemetry</h2><div class=bts-grid id=telemetry-stations></div></section>
 <section class=panel><h2>Registered Subscribers</h2><div class=bts-grid id=registrations></div></section>
 <section class=panel><h2>FlowStation Control</h2><div class=bts-grid id=control-stations></div></section>
@@ -376,4 +442,23 @@ mod tests {
             std::fs::write(format!("/tmp/subpage_{name}.js"), script).unwrap();
         }
     }
+
+    #[test]
+    fn map_page_builds() {
+        let h = MAP_HTML.as_str();
+        assert!(!h.contains("__STYLE__"), "style substituted");
+        assert!(h.contains("/api/positions"), "map polls positions api");
+        assert!(h.contains("leaflet"), "leaflet loaded");
+        assert!(h.contains("Back to dashboard"), "back link present");
+        // OSM tile template must survive the format! escaping as literal braces
+        assert!(h.contains("{s}.tile.openstreetmap.org/{z}/{x}/{y}"), "tile template intact");
+        let script = h.rsplit("<script>").next().unwrap().split("</script>").next().unwrap();
+        std::fs::write("/tmp/map_page.js", script).unwrap();
+    }
+
+    #[test]
+    fn index_links_to_map() {
+        assert!(INDEX_HTML.as_str().contains("href=\"/map\""), "dashboard links to /map");
+    }
 }
+

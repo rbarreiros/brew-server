@@ -3,6 +3,7 @@ mod control;
 mod dashboard;
 mod fsnet;
 mod monitor;
+mod position;
 mod protocol;
 mod router;
 mod server;

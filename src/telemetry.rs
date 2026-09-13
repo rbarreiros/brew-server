@@ -12,7 +12,7 @@ use std::{
 };
 use tracing::{debug, info, warn};
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
@@ -210,6 +210,44 @@ pub struct TelemetryBts {
     #[serde(skip)]
     pub recent_sds: VecDeque<SdsLogEntry>,
     pub recent_sds_out: Vec<SdsLogEntry>,
+    /// Latest decoded position per subscriber ISSI, from textual position
+    /// beacons seen in the SDS stream on this station. Binary LIP beacons carry
+    /// no recoverable coordinates (see the `position` module), so this only
+    /// contains subscribers that beacon a textual position.
+    #[serde(skip)]
+    pub positions: HashMap<u32, MsPosition>,
+    /// Serialized view of `positions` for the dashboard/map, newest first.
+    pub positions_out: Vec<MsPosition>,
+    /// Position beacons that were seen but could NOT be turned into coordinates,
+    /// keyed by ISSI: binary LIP with no payload on the telemetry channel, or
+    /// no-fix (all-zero) reports. Lets the dashboard show "beaconing but not
+    /// plottable" instead of the radio appearing silent.
+    #[serde(skip)]
+    pub undecoded_beacons: HashMap<u32, UndecodedBeacon>,
+    /// Serialized view of `undecoded_beacons`, newest first.
+    pub undecoded_beacons_out: Vec<UndecodedBeacon>,
+}
+
+/// A position beacon that was observed but not decodable to coordinates.
+#[derive(Debug, Clone, Serialize)]
+pub struct UndecodedBeacon {
+    pub issi: u32,
+    pub at_ms: u64,
+    pub count: u32,
+    /// Why it could not be plotted (e.g. "binary LIP, no coordinates on
+    /// telemetry channel").
+    pub reason: String,
+}
+
+/// A decoded mobile-station position for the map.
+#[derive(Debug, Clone, Serialize)]
+pub struct MsPosition {
+    pub issi: u32,
+    pub lat: f64,
+    pub lon: f64,
+    pub at_ms: u64,
+    /// The raw SDS text the coordinates were parsed from (for the popup).
+    pub source_text: String,
 }
 
 impl TelemetryBts {
@@ -230,15 +268,65 @@ impl TelemetryBts {
             last_sys_health: None,
             recent_sds: VecDeque::new(),
             recent_sds_out: Vec::new(),
+            positions: HashMap::new(),
+            positions_out: Vec::new(),
+            undecoded_beacons: HashMap::new(),
+            undecoded_beacons_out: Vec::new(),
         }
     }
 
     fn push_sds(&mut self, entry: SdsLogEntry) {
+        // If the SDS body carries a textual position (APRS/decimal/Maidenhead),
+        // record the latest coordinates for the sending subscriber so the map
+        // can plot it. Binary LIP beacons (empty text) yield nothing here.
+        if let Some(ll) = crate::position::parse_position(&entry.text) {
+            self.positions.insert(entry.source_issi, MsPosition {
+                issi: entry.source_issi,
+                lat: ll.lat,
+                lon: ll.lon,
+                at_ms: entry.at_ms,
+                source_text: entry.text.clone(),
+            });
+            self.undecoded_beacons.remove(&entry.source_issi);
+            self.sync_positions();
+            self.sync_undecoded();
+        } else if entry.protocol_id == 10 {
+            // A LIP position beacon arrived via telemetry, but with no decodable
+            // coordinates (binary LIP payloads are stripped to empty text on the
+            // telemetry channel; no-fix reports have no position). Track it so the
+            // dashboard can show the radio is beaconing-but-not-plottable rather
+            // than silent. If the same ISSI is already plotted from the Brew
+            // channel, don't overwrite that — just note the beacon.
+            let e = self.undecoded_beacons.entry(entry.source_issi).or_insert(UndecodedBeacon {
+                issi: entry.source_issi,
+                at_ms: entry.at_ms,
+                count: 0,
+                reason: "binary LIP / no coordinates on telemetry channel".to_string(),
+            });
+            e.at_ms = entry.at_ms;
+            e.count = e.count.saturating_add(1);
+            self.sync_undecoded();
+        }
         self.recent_sds.push_front(entry);
         while self.recent_sds.len() > 50 {
             self.recent_sds.pop_back();
         }
         self.recent_sds_out = self.recent_sds.iter().cloned().collect();
+    }
+
+    /// Recomputes the serialized undecoded-beacon list (newest first).
+    fn sync_undecoded(&mut self) {
+        let mut list: Vec<UndecodedBeacon> = self.undecoded_beacons.values().cloned().collect();
+        list.sort_unstable_by(|a, b| b.at_ms.cmp(&a.at_ms));
+        self.undecoded_beacons_out = list;
+    }
+
+    /// Recomputes the serialized position list (newest first) after `positions`
+    /// changes.
+    fn sync_positions(&mut self) {
+        let mut list: Vec<MsPosition> = self.positions.values().cloned().collect();
+        list.sort_unstable_by(|a, b| b.at_ms.cmp(&a.at_ms));
+        self.positions_out = list;
     }
 
     /// Recomputes the serialized registration view (count + sorted ISSI list)
@@ -254,12 +342,65 @@ impl TelemetryBts {
 #[derive(Default)]
 pub struct TelemetryState {
     pub stations: HashMap<String, TelemetryBts>,
+    /// Positions decoded from the Brew SDS channel (LIP binary or text), keyed by
+    /// subscriber ISSI. This is the primary source when FlowStation cannot be
+    /// modified: the raw SDS (incl. LIP payloads) is relayed over the Brew
+    /// protocol and decoded here, independent of the lossy telemetry SdsLog.
+    pub sds_positions: HashMap<u32, PositionFix>,
 }
 
 impl TelemetryState {
     pub fn snapshot(&self) -> Vec<TelemetryBts> {
         self.stations.values().cloned().collect()
     }
+
+    /// Flat list of the latest decoded MS positions across all stations, each
+    /// tagged with the station that reported it, newest first. Only subscribers
+    /// that beacon a *textual* position appear (see the `position` module).
+    pub fn positions(&self) -> Vec<PositionFix> {
+        // Merge Brew-channel SDS positions (primary) with any per-station
+        // textual positions. On ISSI collision the newer fix wins.
+        let mut by_issi: HashMap<u32, PositionFix> = self.sds_positions.clone();
+        for s in self.stations.values() {
+            for p in s.positions.values() {
+                let fix = PositionFix {
+                    issi: p.issi, lat: p.lat, lon: p.lon, at_ms: p.at_ms,
+                    bts: s.id.clone(), source_text: p.source_text.clone(),
+                };
+                by_issi.entry(p.issi)
+                    .and_modify(|e| if fix.at_ms >= e.at_ms { *e = fix.clone(); })
+                    .or_insert(fix);
+            }
+        }
+        let mut out: Vec<PositionFix> = by_issi.into_values().collect();
+        out.sort_unstable_by(|a, b| b.at_ms.cmp(&a.at_ms));
+        out
+    }
+
+    /// Records a position decoded from the Brew SDS channel for `issi`.
+    pub fn record_sds_position(&mut self, issi: u32, lat: f64, lon: f64, at_ms: u64, source_text: String) {
+        self.sds_positions.insert(issi, PositionFix {
+            issi, lat, lon, at_ms, bts: "brew-sds".to_string(), source_text,
+        });
+        // This ISSI now has a real fix, so clear any "beaconing but not
+        // plottable" markers for it across all stations.
+        for s in self.stations.values_mut() {
+            if s.undecoded_beacons.remove(&issi).is_some() {
+                s.sync_undecoded();
+            }
+        }
+    }
+}
+
+/// A position fix as served to the map, including which station reported it.
+#[derive(Debug, Clone, Serialize)]
+pub struct PositionFix {
+    pub issi: u32,
+    pub lat: f64,
+    pub lon: f64,
+    pub at_ms: u64,
+    pub bts: String,
+    pub source_text: String,
 }
 
 pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
@@ -345,6 +486,9 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
         }
         TelemetryEvent::IndividualCallEnded { call_id } => { bts.active_calls.remove(&call_id); }
         TelemetryEvent::SdsLog { direction, source_issi, dest_issi, is_group, protocol_id, text } => {
+            info!(bts = %id, channel = "telemetry", source_issi, dest_issi, is_group, protocol_id,
+                lip = (protocol_id == 10), has_text = !text.trim().is_empty(),
+                "SDS ({direction})");
             bts.push_sds(SdsLogEntry { at_ms: now_ms(), direction, source_issi, dest_issi, is_group, protocol_id, text });
         }
         TelemetryEvent::TxQuality(q) => bts.last_tx_quality = Some(q),
@@ -365,6 +509,65 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sds(source_issi: u32, protocol_id: u8, text: &str, at_ms: u64) -> SdsLogEntry {
+        SdsLogEntry {
+            at_ms,
+            direction: "rx".to_string(),
+            source_issi,
+            dest_issi: 0,
+            is_group: false,
+            protocol_id,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn textual_position_beacon_is_stored() {
+        let mut bts = TelemetryBts::new("bts-1".to_string());
+        bts.push_sds(sds(1001, 3, "44.4353, 26.1092", 100));
+        assert_eq!(bts.positions.len(), 1);
+        let p = &bts.positions[&1001];
+        assert!((p.lat - 44.4353).abs() < 0.01 && (p.lon - 26.1092).abs() < 0.01);
+        assert_eq!(bts.positions_out.len(), 1);
+    }
+
+    #[test]
+    fn empty_lip_beacon_stores_no_position() {
+        let mut bts = TelemetryBts::new("bts-1".to_string());
+        // PID 10 with empty text (the binary-LIP case) yields no coordinates.
+        bts.push_sds(sds(1001, 10, "", 100));
+        assert!(bts.positions.is_empty());
+        assert!(bts.positions_out.is_empty());
+    }
+
+    #[test]
+    fn latest_position_replaces_older_for_same_issi() {
+        let mut bts = TelemetryBts::new("bts-1".to_string());
+        bts.push_sds(sds(1001, 3, "44.00, 26.00", 100));
+        bts.push_sds(sds(1001, 3, "45.00, 27.00", 200));
+        assert_eq!(bts.positions.len(), 1);
+        let p = &bts.positions[&1001];
+        assert!((p.lat - 45.0).abs() < 0.01, "should keep newest");
+        assert_eq!(p.at_ms, 200);
+    }
+
+    #[test]
+    fn positions_across_stations_are_aggregated_and_tagged() {
+        let mut state = TelemetryState::default();
+        let mut a = TelemetryBts::new("BTS-A".to_string());
+        a.push_sds(sds(1, 3, "44.0, 26.0", 100));
+        let mut b = TelemetryBts::new("BTS-B".to_string());
+        b.push_sds(sds(2, 3, "45.0, 27.0", 200));
+        state.stations.insert("BTS-A".to_string(), a);
+        state.stations.insert("BTS-B".to_string(), b);
+        let fixes = state.positions();
+        assert_eq!(fixes.len(), 2);
+        // newest first
+        assert_eq!(fixes[0].issi, 2);
+        assert_eq!(fixes[0].bts, "BTS-B");
+        assert!(fixes.iter().any(|f| f.issi == 1 && f.bts == "BTS-A"));
+    }
 
     #[test]
     fn sync_registrations_sorts_and_counts() {

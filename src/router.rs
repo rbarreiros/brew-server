@@ -13,6 +13,26 @@ use tracing::{debug, info, warn};
 
 pub async fn handle_packet(state: Arc<AppState>, source: ClientId, raw: Vec<u8>) {
     state.purge_ephemeral().await;
+    // TEMPORARY (position debugging): log inbound Brew packets, but skip the
+    // high-volume voice traffic frames (class 0xf2 / type 0x00) unless they
+    // actually contain the LIP protocol id (0x0A). This keeps a PTT from burying
+    // the SDS/position beacons we're looking for.
+    {
+        let class = raw.first().copied().unwrap_or(0);
+        let subtype = raw.get(1).copied().unwrap_or(0);
+        let is_voice = class == crate::protocol::CLASS_FRAME && subtype == crate::protocol::FRAME_TRAFFIC_CHANNEL;
+        // Only flag a genuine LIP candidate: an SDS-bearing frame/message whose
+        // SDS payload begins with the 0x0A LIP protocol id. Scanning voice
+        // traffic for a stray 0x0A byte gave false positives (ACELP payloads are
+        // high-entropy), so restrict to SDS frame types and check the SDS data
+        // start, not "contains 0x0A anywhere".
+        let is_sds = (class == crate::protocol::CLASS_FRAME && (subtype == crate::protocol::FRAME_SDS_TRANSFER || subtype == crate::protocol::FRAME_SDS_REPORT))
+            || (class == crate::protocol::CLASS_CALL_CONTROL && subtype == crate::protocol::CALL_SHORT_TRANSFER);
+        let has_lip = is_sds && raw.get(20..).map(|b| b.contains(&0x0A)).unwrap_or(false);
+        if !is_voice || has_lip {
+            info!(%source, class = format!("0x{class:02x}"), subtype = format!("0x{subtype:02x}"), bytes = raw.len(), lip = has_lip, hex = %hex_dump(&raw), "RX Brew packet");
+        }
+    }
     let version = state.client_version(source).await;
     let (parsed, detected) = match protocol::parse_with_version(&raw, version) {
         Ok(v) => v,
@@ -145,30 +165,116 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
 
 async fn handle_sds_header(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, payload: CallPayload, raw: Vec<u8>) {
     let CallPayload::ShortTransfer { source: source_issi, destination } = payload else { return };
+    // TEMPORARY (position debugging): SHORT_TRANSFER sometimes carries the SDS
+    // user-data inline. Dump it and try a position decode here too, so a beacon
+    // that never produces a separate SDS_TRANSFER frame is still caught.
+    info!(uuid=%id, source_issi, destination, hex=%hex_dump(&raw), "SDS header (SHORT_TRANSFER) raw");
+    if let Some((lat, lon, note)) = extract_sds_position(&raw) {
+        let now = crate::telemetry::now_ms();
+        state.telemetry.write().await.record_sds_position(source_issi, lat, lon, now, note);
+        info!(uuid=%id, source_issi, lat, lon, "decoded MS position from SDS header");
+    }
     let mut inner = state.inner.write().await;
     let mut targets = HashSet::new();
     if let Some(sub) = inner.subscribers.get(&destination) { targets.insert(sub.client_id); }
     if let Some(group_targets) = inner.group_clients.get(&destination) { targets.extend(group_targets.iter().copied()); }
     targets.remove(&source);
+    // Always remember the UUID -> source ISSI mapping so a following
+    // SDS_TRANSFER can be attributed (and its position decoded) even when the
+    // destination is not a registered Brew subscriber — position beacons are
+    // often addressed to an external app/gateway ISSI that never registers.
+    inner.sds_routes.insert(id, SdsRoute { source_client: source, targets: targets.clone(), source_issi, destination, created_at: Instant::now() });
     if targets.is_empty() {
-        warn!(%source, uuid=%id, source_issi, destination, "SDS has no registered destination");
+        drop(inner);
+        warn!(%source, uuid=%id, channel="brew", source_issi, destination, lip=sds_is_lip(&raw), "SDS has no registered destination (position still tracked)");
         return;
     }
-    inner.sds_routes.insert(id, SdsRoute { source_client: source, targets: targets.clone(), source_issi, destination, created_at: Instant::now() });
     let txs = targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| c.tx.clone())).collect::<Vec<_>>();
     drop(inner);
     for tx in txs { let _ = tx.send(raw.clone()); }
     state.monitor.sds(id, source_issi, destination).await;
-    info!(%source, uuid=%id, source_issi, destination, target_count=targets.len(), "routed SDS header");
+    info!(%source, uuid=%id, channel="brew", source_issi, destination, lip=sds_is_lip(&raw), target_count=targets.len(), "routed SDS header");
 }
 
 async fn handle_sds_transfer(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: Vec<u8>) {
-    let inner = state.inner.read().await;
-    let Some(route) = inner.sds_routes.get(&id) else { warn!(uuid=%id, "SDS_TRANSFER without SHORT_TRANSFER"); return; };
-    if route.source_client != source { warn!(%source, uuid=%id, "SDS_TRANSFER from non-originating client"); return; }
-    let txs = route.targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| c.tx.clone())).collect::<Vec<_>>();
-    drop(inner);
-    for tx in txs { let _ = tx.send(raw.clone()); }
+    // Look up the route (stored by the SHORT_TRANSFER header, even when the SDS
+    // was undeliverable) to recover the source ISSI and any delivery targets.
+    let (source_issi, txs) = {
+        let inner = state.inner.read().await;
+        match inner.sds_routes.get(&id) {
+            Some(route) if route.source_client == source => {
+                let txs = route.targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| c.tx.clone())).collect::<Vec<_>>();
+                (route.source_issi, txs)
+            }
+            Some(_) => { warn!(%source, uuid=%id, "SDS_TRANSFER from non-originating client"); return; }
+            None => { warn!(uuid=%id, "SDS_TRANSFER without SHORT_TRANSFER (position may still decode)"); (0u32, Vec::new()) }
+        }
+    };
+    for tx in &txs { let _ = tx.send(raw.clone()); }
+
+    // TEMPORARY (position debugging): dump the raw SDS_TRANSFER frame so the LIP
+    // payload offset can be confirmed against live traffic. Remove once binary
+    // LIP positions are confirmed decoding on the map.
+    info!(uuid=%id, source_issi, bytes=%raw.len(), hex=%hex_dump(&raw), "SDS_TRANSFER raw frame");
+
+    // Position extraction from the relayed SDS. FlowStation cannot be modified,
+    // but it relays the full SDS (including binary LIP payloads) over the Brew
+    // channel, so we decode positions here regardless of deliverability.
+    if let Some((lat, lon, note)) = extract_sds_position(&raw) {
+        let now = crate::telemetry::now_ms();
+        state.telemetry.write().await.record_sds_position(source_issi, lat, lon, now, note);
+        info!(uuid=%id, source_issi, lat, lon, "decoded MS position from SDS");
+    }
+}
+
+/// Renders bytes as a compact hex string for debug logging (capped so a large
+/// frame does not flood the log).
+fn hex_dump(bytes: &[u8]) -> String {
+    const MAX: usize = 64;
+    let shown = &bytes[..bytes.len().min(MAX)];
+    let mut s = shown.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+    if bytes.len() > MAX {
+        s.push_str(&format!(" … (+{} more)", bytes.len() - MAX));
+    }
+    s
+}
+
+/// Quick check whether a raw SDS_TRANSFER/SHORT_TRANSFER frame carries a LIP
+/// position payload: either the short-report PID 0x0A or the MTH-style long
+/// report marker 0x83, in the SDS data region (after the 20-byte frame header).
+/// Used only for log annotation, so it is deliberately lenient.
+fn sds_is_lip(raw: &[u8]) -> bool {
+    let body = if raw.len() > 20 { &raw[20..] } else { raw };
+    body.iter().any(|&b| b == 0x0A || b == 0x83)
+}
+
+/// Attempts to pull a geographic position out of a raw SDS_TRANSFER frame:
+/// first a binary LIP short location report (scanning for the 0x0A PID), then a
+/// textual beacon in any embedded ASCII. Returns (lat, lon, source_note).
+fn extract_sds_position(raw: &[u8]) -> Option<(f64, f64, String)> {
+    // The frame carries a 20-byte Brew frame header (class, type, uuid, len)
+    // before the SDS content; scan the whole buffer defensively for the LIP PID.
+    let body = if raw.len() > 20 { &raw[20..] } else { raw };
+    // Motorola MTH-series "long location report": SDS data begins 0x83. Try this
+    // first since its 0x0A appears mid-PDU (not as the leading PID).
+    for i in 0..body.len() {
+        if body[i] == 0x83 {
+            if let Some(ll) = crate::position::decode_lip_long(&body[i..]) {
+                return Some((ll.lat, ll.lon, "LIP long location report".to_string()));
+            }
+        }
+    }
+    // Standard LIP short location report: scan for the 0x0A PID.
+    for i in 0..body.len() {
+        if body[i] == 0x0A {
+            if let Some(ll) = crate::position::decode_lip(&body[i..]) {
+                return Some((ll.lat, ll.lon, "LIP short location report".to_string()));
+            }
+        }
+    }
+    // Fall back to textual coordinates in any ASCII run of the body.
+    let text: String = body.iter().map(|&b| if (0x20..=0x7e).contains(&b) { b as char } else { ' ' }).collect();
+    crate::position::parse_position(&text).map(|ll| (ll.lat, ll.lon, text.trim().to_string()))
 }
 
 async fn handle_sds_report(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: Vec<u8>) {
@@ -304,5 +410,65 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
             }
         }
         _ => debug!(%source, msg_type=msg.msg_type, "unknown subscriber message"),
+    }
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::extract_sds_position;
+
+    // Real LIP beacon captured from FlowStation (ISSI 90), Athens.
+    const LIP: [u8; 11] = [0x0a, 0x01, 0x0e, 0x62, 0x39, 0xb0, 0x43, 0x9a, 0xff, 0xe0, 0x20];
+
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        // 20-byte Brew frame header (contents irrelevant to the scan) + SDS body.
+        let mut v = vec![0u8; 20];
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn decodes_mth850_long_report_from_framed_sds() {
+        // Real captured SDS_TRANSFER: 20-byte frame header, then c8 00, then the
+        // 0x83 LIP long report. extract_sds_position must find and decode it.
+        let hex = "f2 01 2f 5a 58 59 e4 8e 4a 45 bf 8a b6 3c 8a be 54 b6 c8 00 83 00 11 80 13 13 23 2f 34 1f 5c 77 6d ea 66 36 08 68 e3 10 e6 16 c1 56 60";
+        let raw: Vec<u8> = hex.split_whitespace()
+            .map(|b| u8::from_str_radix(b, 16).unwrap()).collect();
+        let (lat, lon, note) = super::extract_sds_position(&raw).expect("should decode long report");
+        assert!((lat - 37.9917).abs() < 0.01, "lat={lat}");
+        assert!((lon - 23.7640).abs() < 0.01, "lon={lon}");
+        assert!(note.contains("long"));
+    }
+
+    #[test]
+    fn decodes_lip_from_framed_sds() {
+        let raw = framed(&LIP);
+        let (lat, lon, note) = extract_sds_position(&raw).expect("should decode");
+        assert!((lat - 37.9920).abs() < 0.01, "lat={lat}");
+        assert!((lon - 23.7642).abs() < 0.01, "lon={lon}");
+        assert!(note.contains("LIP"));
+    }
+
+    #[test]
+    fn decodes_lip_with_sds_tl_header_prefix() {
+        // Some stacks prepend an SDS-TL header before the 0x0A PID; the scan must
+        // still find it.
+        let mut payload = vec![0x82, 0x00, 0x00, 0x00];
+        payload.extend_from_slice(&LIP);
+        let raw = framed(&payload);
+        assert!(extract_sds_position(&raw).is_some());
+    }
+
+    #[test]
+    fn ignores_non_position_sds() {
+        let raw = framed(b"\x01hello there");
+        assert!(extract_sds_position(&raw).is_none());
+    }
+
+    #[test]
+    fn decodes_textual_beacon() {
+        let raw = framed(b"\x0144.4353, 26.1092");
+        let (lat, lon, _) = extract_sds_position(&raw).expect("text decode");
+        assert!((lat - 44.4353).abs() < 0.01 && (lon - 26.1092).abs() < 0.01);
     }
 }
