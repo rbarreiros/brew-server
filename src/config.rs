@@ -154,3 +154,14 @@ impl Config {
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_loads_when_file_missing() {
+        let cfg = Config::load("/nonexistent/path/brew-server.toml").unwrap();
+        assert_eq!(cfg.websocket_subprotocol, Config::default().websocket_subprotocol);
+    }
+}

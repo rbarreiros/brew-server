@@ -95,6 +95,16 @@ curl http://127.0.0.1:9000/healthz
 
 `brew-server.toml`:
 
+The configuration file is **watched while the server runs**: when it changes,
+the server validates the new file and, if it parses, **restarts the whole
+process** (re-executing itself with the same arguments) so the new configuration
+takes effect from a clean state — all listeners rebind and in-memory state is
+rebuilt. Changes are detected within a couple of seconds. A malformed edit is
+logged and ignored (no restart), so a bad edit can't drop the server into a
+crash loop. Because the reload is a full process restart, run under a supervisor
+(systemd, Docker `restart:` policy, etc.) as normal; active connections are
+dropped and clients reconnect.
+
 ```toml
 listen = "0.0.0.0:9000"
 websocket_path = "/brew/"
