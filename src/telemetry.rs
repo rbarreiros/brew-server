@@ -233,8 +233,14 @@ pub struct TelemetryBts {
     /// better; shown as an SNR-adjacent quality indicator (not a true SNR).
     pub evm_pct: Option<f32>,
     /// Latest received signal strength (dBFS) reported for an MS via MsRssi.
-    /// This is RSSI, not SNR.
+    /// This is RSSI, not SNR. Retained as the station's most-recent reading.
     pub rssi_dbfs: Option<f32>,
+    /// Latest RSSI (dBFS) per subscriber ISSI, so a specific call's mobile
+    /// station can be shown with its own received-signal reading.
+    #[serde(skip)]
+    pub ms_rssi: HashMap<u32, f32>,
+    /// Serialized [issi, rssi_dbfs] pairs of `ms_rssi` for the dashboard.
+    pub ms_rssi_out: Vec<(u32, f32)>,
 }
 
 /// A position beacon that was observed but not decodable to coordinates.
@@ -284,6 +290,8 @@ impl TelemetryBts {
             undecoded_beacons_out: Vec::new(),
             evm_pct: None,
             rssi_dbfs: None,
+            ms_rssi: HashMap::new(),
+            ms_rssi_out: Vec::new(),
         }
     }
 
@@ -511,7 +519,13 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
         TelemetryEvent::EmergencyAlarm { source_issi, .. } => { bts.emergencies.insert(source_issi); }
         TelemetryEvent::EmergencyCancel { source_issi } => { bts.emergencies.remove(&source_issi); }
         TelemetryEvent::BrewConnected { connected, .. } => bts.backhaul_connected = Some(connected),
-        TelemetryEvent::MsRssi { rssi_dbfs, .. } => bts.rssi_dbfs = Some(rssi_dbfs),
+        TelemetryEvent::MsRssi { issi, rssi_dbfs } => {
+            bts.rssi_dbfs = Some(rssi_dbfs);
+            bts.ms_rssi.insert(issi, rssi_dbfs);
+            let mut v: Vec<(u32, f32)> = bts.ms_rssi.iter().map(|(k, val)| (*k, *val)).collect();
+            v.sort_unstable_by_key(|(k, _)| *k);
+            bts.ms_rssi_out = v;
+        }
         _ => {}
     }
     drop(t);
@@ -631,6 +645,21 @@ mod ip_snr_tests {
         assert!(json.contains("10.19.144.201"), "ip serialized");
         assert!(json.contains("\"evm_pct\":1.25"), "evm serialized");
         assert!(json.contains("\"rssi_dbfs\":-3.3"), "rssi serialized");
+    }
+
+    #[test]
+    fn ms_rssi_per_issi_serializes() {
+        let mut bts = TelemetryBts::new("bts-1".to_string(), None);
+        // simulate two MsRssi events
+        bts.ms_rssi.insert(90, -3.3);
+        bts.ms_rssi.insert(100, -8.8);
+        let mut v: Vec<(u32,f32)> = bts.ms_rssi.iter().map(|(k,val)|(*k,*val)).collect();
+        v.sort_unstable_by_key(|(k,_)|*k);
+        bts.ms_rssi_out = v;
+        let json = serde_json::to_string(&bts).unwrap();
+        assert!(json.contains("ms_rssi_out"));
+        assert!(json.contains("90") && json.contains("-3.3"));
+        assert!(json.contains("100") && json.contains("-8.8"));
     }
 
     #[test]
