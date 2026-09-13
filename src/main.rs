@@ -8,6 +8,7 @@ mod protocol;
 mod router;
 mod server;
 mod state;
+mod store;
 mod telemetry;
 
 use config::Config;

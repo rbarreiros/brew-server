@@ -6,6 +6,12 @@ Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
 Version 0.7 adds:
 
+- **Persistent history.** Completed calls and SDS are written to an append-only
+  binary log (`bincode`-framed, crash-safe on read) and replayed on startup, so
+  call/SDS history and counters survive restarts. Configured under `[storage]`
+  (`enabled`, `path`); it keeps everything with no rotation. A torn trailing
+  record from a hard crash is detected and skipped.
+
 - **Position mapping.** SDS position beacons are decoded to latitude/longitude,
   tracked per subscriber ISSI, and plotted on a new `/map` page (Leaflet +
   OpenStreetMap); a `/api/positions` endpoint exposes the latest fixes. Two

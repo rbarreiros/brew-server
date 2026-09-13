@@ -18,6 +18,26 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     pub control: ControlConfig,
     pub dashboard: DashboardConfig,
+    pub storage: StorageConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// When enabled, completed calls and SDS are appended to a binary log and
+    /// replayed on startup so history survives restarts.
+    pub enabled: bool,
+    /// Path to the append-only binary history log.
+    pub path: PathBuf,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: PathBuf::from("brew-history.bin"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +159,7 @@ impl Default for Config {
             telemetry: TelemetryConfig::default(),
             control: ControlConfig::default(),
             dashboard: DashboardConfig::default(),
+            storage: StorageConfig::default(),
         }
     }
 }

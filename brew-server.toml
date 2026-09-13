@@ -65,7 +65,13 @@ realm = "brew-server-dashboard"
 "user" = "pass"
 
 [dashboard.tls]
-enabled = false
+enabled = true
 cert_path = "tls/dashboard-cert.pem"
 key_path = "tls/dashboard-key.pem"
 
+# Persistent history: append-only binary log of completed calls and SDS,
+# replayed on startup so history survives restarts. Keeps everything (no
+# rotation). Disable by setting enabled = false.
+[storage]
+enabled = true
+path = "brew-history.bin"
