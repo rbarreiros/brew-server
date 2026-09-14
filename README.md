@@ -4,6 +4,35 @@ Experimental Rust Brew core for linking two or more MidnightBlue BlueStation or 
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 0.8 adds:
+
+- **Persistent telemetry SDS log.** SDS entries observed on a FlowStation
+  Telemetry channel (`SdsLog`) are now also appended to the same append-only
+  history log used for calls/SDS, tagged with the reporting station, so the
+  Telemetry SDS Log survives a server restart instead of resetting with the
+  BTS's live in-memory state. Replayed on startup like the rest of `[storage]`
+  history, and readable with the same `brew-history` tool (new `SdsTelemetry`
+  record type).
+
+Version 0.7 adds:
+
+- **Persistent history.** Completed calls and SDS are written to an append-only
+  binary log (`bincode`-framed, crash-safe on read) and replayed on startup, so
+  call/SDS history and counters survive restarts. Configured under `[storage]`
+  (`enabled`, `path`); it keeps everything with no rotation. A torn trailing
+  record from a hard crash is detected and skipped. Read the log with the
+  bundled `brew-history` tool: `brew-history brew-history.bin` for readable text,
+  or `brew-history brew-history.bin --json` to pipe into `jq`.
+
+- **Position mapping.** SDS position beacons are decoded to latitude/longitude,
+  tracked per subscriber ISSI, and plotted on a new `/map` page (Leaflet +
+  OpenStreetMap); a `/api/positions` endpoint exposes the latest fixes. Two
+  sources are supported: **binary TETRA LIP** short location reports (ETSI TS
+  100 392-18), decoded from the raw SDS relayed over the Brew channel, and
+  **textual** beacons (APRS, decimal degrees, Maidenhead). No FlowStation change
+  is required — the LIP payload is decoded in `handle_sds_transfer` from the SDS
+  that the Brew channel already relays. See "Position mapping" below.
+
 Version 0.6 adds:
 
 - **Brew protocol version 1 support.** The server advertises and negotiates the
@@ -84,6 +113,16 @@ curl http://127.0.0.1:9000/healthz
 
 `brew-server.toml`:
 
+The configuration file is **watched while the server runs**: when it changes,
+the server validates the new file and, if it parses, **restarts the whole
+process** (re-executing itself with the same arguments) so the new configuration
+takes effect from a clean state — all listeners rebind and in-memory state is
+rebuilt. Changes are detected within a couple of seconds. A malformed edit is
+logged and ignored (no restart), so a bad edit can't drop the server into a
+crash loop. Because the reload is a full process restart, run under a supervisor
+(systemd, Docker `restart:` policy, etc.) as normal; active connections are
+dropped and clients reconnect.
+
 ```toml
 listen = "0.0.0.0:9000"
 websocket_path = "/brew/"
@@ -104,8 +143,9 @@ realm = "brew-server"
 session_ttl_seconds = 300
 
 [auth.users]
-"100000001" = "change-me-bs1"
-"100000002" = "change-me-bs2"
+# Brew usernames must be numeric, max 7 digits.
+"1000001" = "change-me-bs1"
+"1000002" = "change-me-bs2"
 
 [dashboard]
 enabled = true
@@ -123,7 +163,7 @@ key_path = "tls/dashboard-key.pem"
 
 The `[dashboard]` block controls the monitoring UI on its own port, separate
 from the Brew API above — see "Web monitoring dashboard" below for auth and TLS
-details. Use a different username/password for each BlueStation. The username is only an HTTP Digest identity; it does not have to equal a radio ISSI, although using a numeric site identity is convenient.
+details. Use a different username/password for each BlueStation. The Brew username is an HTTP Digest identity that must be **numeric and at most 7 digits** (a connection presenting a longer or non-numeric username is refused); it does not have to equal a radio ISSI, though a numeric site identity is convenient.
 
 ## TLS
 
@@ -334,6 +374,8 @@ enabled = false
 ```
 
 - Dashboard: `http://<server>:9003/`
+- MS map (linked from the dashboard): `/map` — plots decoded MS positions;
+  JSON at `/api/positions`
 - Log pages (linked from the dashboard): `/calls` (recent calls, 10/page),
   `/sds` (recent SDS, 10/page), `/telemetry-sds` (telemetry SDS log, 5/page)
 - JSON snapshot: `/api/status`
@@ -348,6 +390,32 @@ All dashboard routes sit behind optional HTTP **Basic** auth: add entries to
 open). Set `[dashboard.tls]` to serve the dashboard over HTTPS/WSS. The Brew API
 listener (`listen`, normally `:9000`) now serves only `/brew` and `/healthz` —
 the dashboard is no longer mounted there.
+
+### Position mapping
+
+The `/map` page plots the latest known position of each mobile station, from two
+sources, both decoded on the Brew SDS channel (`handle_sds_transfer`) — the SDS
+that FlowStation relays for delivery, not the lossy telemetry `SdsLog`:
+
+- **Binary TETRA LIP** (ETSI TS 100 392-18) short location reports, SDS protocol
+  id `0x0A`. The frame is scanned for the `0x0A` PID and the bit-packed PDU is
+  decoded: 2-bit PDU type (0 = short report), 2-bit time-elapsed, 25-bit signed
+  longitude (`raw * 360 / 2^25`), 24-bit signed latitude (`raw * 180 / 2^24`).
+  Verified against a live beacon `0a 01 0e 62 39 b0 43 9a ff e0 20` → 37.9920 N,
+  23.7642 E.
+- **Textual beacons** — an APRS string (`4426.12N/02606.55E`), decimal degrees
+  (`44.4353, 26.1092`), or a Maidenhead locator (`KN34bk`) — parsed from any
+  ASCII in the SDS body.
+
+The decoded fix is stored per subscriber ISSI (attributed via the SDS route's
+source ISSI) and served at `/api/positions`. **No FlowStation change is
+required.** Position-beacon SDS rows are also labelled in the Telemetry SDS Log.
+
+Note: this depends on the SDS (with its LIP payload) being relayed over the Brew
+channel to a registered destination. A temporary `debug`-level log
+(`SDS_TRANSFER raw frame`) dumps each frame's hex to confirm the payload offset
+against live traffic; enable it with `RUST_LOG=brew_server=debug` and remove the
+line once positions are confirmed on the map.
 
 ### Dashboard authentication and HTTPS
 
@@ -399,5 +467,7 @@ registered on each station; active emergency alarms appear as a banner — see
 "FlowStation Telemetry" above, which is where the carrier-timeslot data comes
 from. When Control is enabled, each connected station gets a command panel (Kick
 MS, DGNA, live SDS, clear emergency, restart/shutdown) — see "FlowStation
-Control" above. Counters/history are currently in-memory and reset when the
-server (or the BTS's telemetry/control connection) restarts.
+Control" above. Live per-station state (health, active calls, RF quality,
+registrations) is in-memory and resets when the BTS's telemetry/control
+connection restarts; calls, SDS, and the Telemetry SDS Log survive a server
+restart when `[storage]` is enabled (see "Persistent history" above).

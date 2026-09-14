@@ -153,7 +153,7 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         users: state.config.control.users.clone(),
         tls: state.config.control.tls.clone(),
     };
-    fsnet::serve(cfg, move |socket, identity| {
+    fsnet::serve(cfg, move |socket, identity, _peer| {
         let state = state.clone();
         async move { session(state, socket, identity).await }
     })

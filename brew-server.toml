@@ -8,9 +8,9 @@ higher_priority_number_wins = true
 preempt_cause = 1
 
 [tls]
-enabled = false
-cert_path = "/etc/brew-server/tls/cert.pem"
-key_path = "/etc/brew-server/tls/key.pem"
+enabled = true
+cert_path = "/etc/ssl/brew/server.crt"
+key_path = "/etc/ssl/brew/server.key"
 
 [auth]
 enabled = true
@@ -18,33 +18,40 @@ realm = "brew-server"
 session_ttl_seconds = 300
 
 [auth.users]
-"100000001" = "change-me-bs1"
-"100000002" = "change-me-bs2"
+# Brew usernames (BlueStation identities) must be numeric, max 7 digits.
+"1000001" = "change-me-bs1"
+"1000002" = "change-me-bs2"
 
 # Optional: FlowStation's outbound Telemetry channel (BTS -> this server).
 # Off by default. See README.md "FlowStation Telemetry" for details.
 [telemetry]
-enabled = false
+enabled = true
 listen = "0.0.0.0:9001"
 
 [telemetry.users]
-# "100000001" = "change-me-telemetry1"
+"100000001" = "change-me-bs1"
+"100000002" = "change-me-bs2"
 
 [telemetry.tls]
-enabled = false
+enabled = true
+cert_path = "/etc/ssl/brew/server.crt"
+key_path = "/etc/ssl/brew/server.key"
 
 # Optional: FlowStation's inbound Control channel (BTS -> this server, commands
 # pushed back down the same connection). Off by default. See README.md
 # "FlowStation Control" for details.
 [control]
-enabled = false
+enabled = true
 listen = "0.0.0.0:9002"
 
 [control.users]
-# "100000001" = "change-me-control1"
+"100000001" = "change-me-bs1"
+"100000002" = "change-me-bs2"
 
 [control.tls]
-enabled = false
+enabled = true
+cert_path = "/etc/ssl/brew/server.crt"
+key_path = "/etc/ssl/brew/server.key"
 
 # Monitoring dashboard. Now on its OWN listener/port, separate from the Brew
 # API. Enabled by default. Set [dashboard.users] to require HTTP Basic auth
@@ -55,9 +62,16 @@ listen = "0.0.0.0:9003"
 realm = "brew-server-dashboard"
 
 [dashboard.users]
-"admin" = "change-me-dashboard"
+"user" = "pass"
 
 [dashboard.tls]
 enabled = true
 cert_path = "tls/dashboard-cert.pem"
 key_path = "tls/dashboard-key.pem"
+
+# Persistent history: append-only binary log of completed calls and SDS,
+# replayed on startup so history survives restarts. Keeps everything (no
+# rotation). Disable by setting enabled = false.
+[storage]
+enabled = true
+path = "brew-history.bin"
