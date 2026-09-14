@@ -101,22 +101,30 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> Self {
-        let monitor = if config.storage.enabled {
+        let store = if config.storage.enabled {
             match crate::store::Store::open(&config.storage.path) {
-                Ok(store) => Monitor::with_store(std::sync::Arc::new(store)),
+                Ok(store) => Some(std::sync::Arc::new(store)),
                 Err(e) => {
                     tracing::error!(error = %e, path = %config.storage.path.display(), "cannot open history store; continuing without persistence");
-                    Monitor::new()
+                    None
                 }
             }
         } else {
-            Monitor::new()
+            None
+        };
+        let monitor = match &store {
+            Some(store) => Monitor::with_store(store.clone()),
+            None => Monitor::new(),
+        };
+        let telemetry = match &store {
+            Some(store) => TelemetryState::with_store(store.clone()),
+            None => TelemetryState::default(),
         };
         Self {
             config,
             inner: RwLock::new(Inner::default()),
             monitor,
-            telemetry: RwLock::new(TelemetryState::default()),
+            telemetry: RwLock::new(telemetry),
             control: RwLock::new(ControlState::default()),
         }
     }

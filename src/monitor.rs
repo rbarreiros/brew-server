@@ -42,6 +42,7 @@ impl Monitor {
                     crate::store::StoredRecord::SdsReport { uuid } => {
                         if let Some(r) = inner.sds.iter_mut().find(|r| r.uuid == uuid) { r.reports += 1; }
                     }
+                    crate::store::StoredRecord::SdsTelemetry(_) => {}
                 }
             }
             tracing::info!(path = %store.path().display(), calls = inner.total_calls, sds = inner.total_sds, "replayed persisted history");

@@ -185,6 +185,35 @@ pub struct SdsLogEntry {
     pub text: String,
 }
 
+/// A telemetry SDS log entry as persisted to the history store, tagged with the
+/// reporting station so it can be told apart on replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdsTelemetryRecord {
+    pub bts: String,
+    pub at_ms: u64,
+    pub direction: String,
+    pub source_issi: u32,
+    pub dest_issi: u32,
+    pub is_group: bool,
+    pub protocol_id: u8,
+    pub text: String,
+}
+
+impl SdsTelemetryRecord {
+    fn from_entry(bts: &str, entry: &SdsLogEntry) -> Self {
+        Self {
+            bts: bts.to_string(),
+            at_ms: entry.at_ms,
+            direction: entry.direction.clone(),
+            source_issi: entry.source_issi,
+            dest_issi: entry.dest_issi,
+            is_group: entry.is_group,
+            protocol_id: entry.protocol_id,
+            text: entry.text.clone(),
+        }
+    }
+}
+
 /// Live, in-memory picture of one connected FlowStation BTS derived from its
 /// telemetry stream. Resets when the connection drops (no persistence, mirrors
 /// the rest of this server's dashboard state).
@@ -367,9 +396,50 @@ pub struct TelemetryState {
     /// modified: the raw SDS (incl. LIP payloads) is relayed over the Brew
     /// protocol and decoded here, independent of the lossy telemetry SdsLog.
     pub sds_positions: HashMap<u32, PositionFix>,
+    /// SDS entries observed on any FlowStation telemetry channel, newest first,
+    /// persisted to the history store so this survives restarts (unlike the
+    /// per-station `recent_sds`, which resets when a BTS reconnects).
+    recent_sds: VecDeque<SdsTelemetryRecord>,
+    /// Serialized view of `recent_sds` for the dashboard.
+    pub recent_sds_out: Vec<SdsTelemetryRecord>,
+    store: Option<Arc<crate::store::Store>>,
 }
 
 impl TelemetryState {
+    /// Creates a `TelemetryState` backed by an append-only store, replaying
+    /// persisted SDS telemetry history from disk.
+    pub fn with_store(store: Arc<crate::store::Store>) -> Self {
+        let mut recent_sds: VecDeque<SdsTelemetryRecord> = VecDeque::new();
+        if let Ok(records) = crate::store::Store::replay(store.path()) {
+            for rec in records {
+                if let crate::store::StoredRecord::SdsTelemetry(r) = rec {
+                    recent_sds.push_front(r);
+                    while recent_sds.len() > 200 { recent_sds.pop_back(); }
+                }
+            }
+        }
+        let recent_sds_out = recent_sds.iter().cloned().collect();
+        Self { recent_sds, recent_sds_out, store: Some(store), ..Self::default() }
+    }
+
+    fn persist(&self, rec: &crate::store::StoredRecord) {
+        if let Some(store) = &self.store {
+            if let Err(e) = store.append(rec) {
+                tracing::error!(error = %e, "failed to persist telemetry history record");
+            }
+        }
+    }
+
+    /// Records an SDS telemetry entry for `bts` in the durable, cross-restart
+    /// log (independent of the ephemeral per-station `recent_sds`).
+    fn record_sds_telemetry(&mut self, bts: &str, entry: &SdsLogEntry) {
+        let rec = SdsTelemetryRecord::from_entry(bts, entry);
+        self.persist(&crate::store::StoredRecord::SdsTelemetry(rec.clone()));
+        self.recent_sds.push_front(rec);
+        while self.recent_sds.len() > 200 { self.recent_sds.pop_back(); }
+        self.recent_sds_out = self.recent_sds.iter().cloned().collect();
+    }
+
     pub fn snapshot(&self) -> Vec<TelemetryBts> {
         self.stations.values().cloned().collect()
     }
@@ -487,6 +557,7 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
         | TelemetryEvent::SdrHealth(_) | TelemetryEvent::SysHealth(_)
         | TelemetryEvent::MsRssi { .. } | TelemetryEvent::TsVoiceActivity { .. });
 
+    let mut sds_entry: Option<SdsLogEntry> = None;
     match event {
         TelemetryEvent::MsRegistration { issi } => { bts.registrations.insert(issi); bts.sync_registrations(); }
         TelemetryEvent::MsDeregistration { issi } | TelemetryEvent::MsTimeoutDrop { issi } => {
@@ -510,7 +581,9 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
             info!(bts = %id, channel = "telemetry", source_issi, dest_issi, is_group, protocol_id,
                 lip = (protocol_id == 10), has_text = !text.trim().is_empty(),
                 "SDS ({direction})");
-            bts.push_sds(SdsLogEntry { at_ms: now_ms(), direction, source_issi, dest_issi, is_group, protocol_id, text });
+            let entry = SdsLogEntry { at_ms: now_ms(), direction, source_issi, dest_issi, is_group, protocol_id, text };
+            bts.push_sds(entry.clone());
+            sds_entry = Some(entry);
         }
         TelemetryEvent::TxQuality(q) => { bts.evm_pct = Some(q.evm_pct); bts.last_tx_quality = Some(q); }
         TelemetryEvent::SdrHealth(h) => bts.last_sdr_health = Some(h),
@@ -527,6 +600,9 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
             bts.ms_rssi_out = v;
         }
         _ => {}
+    }
+    if let Some(entry) = sds_entry {
+        t.record_sds_telemetry(id, &entry);
     }
     drop(t);
     if notify {
@@ -667,5 +743,54 @@ mod ip_snr_tests {
         let bts = TelemetryBts::new("bts-x".to_string(), None);
         let json = serde_json::to_string(&bts).unwrap();
         assert!(json.contains("\"ip\":null"));
+    }
+}
+
+#[cfg(test)]
+mod sds_persist_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn entry(source_issi: u32, text: &str) -> SdsLogEntry {
+        SdsLogEntry {
+            at_ms: now_ms(),
+            direction: "rx".to_string(),
+            source_issi,
+            dest_issi: 0,
+            is_group: false,
+            protocol_id: 3,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn sds_telemetry_survives_restart_via_store() {
+        let path = std::env::temp_dir().join(format!("brew-telemetry-test-{}.bin", uuid::Uuid::new_v4().simple()));
+        {
+            let store = Arc::new(crate::store::Store::open(&path).unwrap());
+            let mut t = TelemetryState::with_store(store);
+            t.record_sds_telemetry("bts-1", &entry(1001, "hello"));
+            assert_eq!(t.recent_sds_out.len(), 1);
+        }
+        // A new TelemetryState over the same file must replay the history.
+        {
+            let store = Arc::new(crate::store::Store::open(&path).unwrap());
+            let t = TelemetryState::with_store(store);
+            assert_eq!(t.recent_sds_out.len(), 1, "sds telemetry restored");
+            assert_eq!(t.recent_sds_out[0].bts, "bts-1");
+            assert_eq!(t.recent_sds_out[0].source_issi, 1001);
+            assert_eq!(t.recent_sds_out[0].text, "hello");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn recent_sds_out_is_newest_first_and_capped() {
+        let mut t = TelemetryState::default();
+        for i in 0..205u32 {
+            t.record_sds_telemetry("bts-1", &entry(i, "x"));
+        }
+        assert_eq!(t.recent_sds_out.len(), 200, "capped at 200");
+        assert_eq!(t.recent_sds_out[0].source_issi, 204, "newest first");
     }
 }

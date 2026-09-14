@@ -9,6 +9,7 @@
 //! log keeps everything (no rotation/compaction) by design.
 
 use crate::monitor::{CallRecord, SdsRecord};
+use crate::telemetry::SdsTelemetryRecord;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,8 @@ pub enum StoredRecord {
     Sds(SdsRecord),
     /// A delivery report for a previously stored SDS (by uuid).
     SdsReport { uuid: uuid::Uuid },
+    /// An SDS log entry observed on a FlowStation telemetry channel.
+    SdsTelemetry(SdsTelemetryRecord),
 }
 
 /// Append-only log writer/reader. Cheap to clone-share via `Arc`.

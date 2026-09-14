@@ -4,6 +4,16 @@ Experimental Rust Brew core for linking two or more MidnightBlue BlueStation or 
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 0.8 adds:
+
+- **Persistent telemetry SDS log.** SDS entries observed on a FlowStation
+  Telemetry channel (`SdsLog`) are now also appended to the same append-only
+  history log used for calls/SDS, tagged with the reporting station, so the
+  Telemetry SDS Log survives a server restart instead of resetting with the
+  BTS's live in-memory state. Replayed on startup like the rest of `[storage]`
+  history, and readable with the same `brew-history` tool (new `SdsTelemetry`
+  record type).
+
 Version 0.7 adds:
 
 - **Persistent history.** Completed calls and SDS are written to an append-only
@@ -457,5 +467,7 @@ registered on each station; active emergency alarms appear as a banner — see
 "FlowStation Telemetry" above, which is where the carrier-timeslot data comes
 from. When Control is enabled, each connected station gets a command panel (Kick
 MS, DGNA, live SDS, clear emergency, restart/shutdown) — see "FlowStation
-Control" above. Counters/history are currently in-memory and reset when the
-server (or the BTS's telemetry/control connection) restarts.
+Control" above. Live per-station state (health, active calls, RF quality,
+registrations) is in-memory and resets when the BTS's telemetry/control
+connection restarts; calls, SDS, and the Telemetry SDS Log survive a server
+restart when `[storage]` is enabled (see "Persistent history" above).

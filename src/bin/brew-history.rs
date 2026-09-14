@@ -37,10 +37,23 @@ struct SdsRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct SdsTelemetryRecord {
+    bts: String,
+    at_ms: u64,
+    direction: String,
+    source_issi: u32,
+    dest_issi: u32,
+    is_group: bool,
+    protocol_id: u8,
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum StoredRecord {
     Call(CallRecord),
     Sds(SdsRecord),
     SdsReport { uuid: Uuid },
+    SdsTelemetry(SdsTelemetryRecord),
 }
 
 fn main() {
@@ -80,11 +93,13 @@ fn main() {
     let mut calls = 0u64;
     let mut sds = 0u64;
     let mut reports = 0u64;
+    let mut telemetry_sds = 0u64;
     for rec in &records {
         match rec {
             StoredRecord::Call(_) => calls += 1,
             StoredRecord::Sds(_) => sds += 1,
             StoredRecord::SdsReport { .. } => reports += 1,
+            StoredRecord::SdsTelemetry(_) => telemetry_sds += 1,
         }
         if json {
             println!("{}", serde_json::to_string(rec).unwrap());
@@ -95,11 +110,12 @@ fn main() {
 
     if !json {
         eprintln!(
-            "\n{} record(s): {} call(s), {} SDS, {} SDS report(s)",
+            "\n{} record(s): {} call(s), {} SDS, {} SDS report(s), {} telemetry SDS",
             records.len(),
             calls,
             sds,
-            reports
+            reports,
+            telemetry_sds
         );
     }
 }
@@ -135,6 +151,18 @@ fn print_text(rec: &StoredRecord) {
         }
         StoredRecord::SdsReport { uuid } => {
             println!("{}  REPORT for [{}]", " ".repeat(19), short(uuid));
+        }
+        StoredRecord::SdsTelemetry(t) => {
+            println!(
+                "{}  SDS-TM {} {} -> {} pid {} [{}]{}",
+                fmt_ts(t.at_ms),
+                t.direction,
+                t.source_issi,
+                t.dest_issi,
+                t.protocol_id,
+                t.bts,
+                if t.text.trim().is_empty() { String::new() } else { format!(" {:?}", t.text) },
+            );
         }
     }
 }
