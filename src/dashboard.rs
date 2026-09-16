@@ -234,47 +234,47 @@ async function load(){{
 load();setInterval(load,3000);
 </script></body></html>"#, style = STYLE));
 
-+/// SIP live panel: registrations, trunks and active calls, polled from
-+/// /api/sip every 2s. Renders a clear "disabled" notice when SIP is off.
-+static SIP_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>SIP / VoIP - TETRA Network</title>{style}</head><body><header><h1>SIP / VoIP</h1><div><span class=live></span><span id=status>Live</span></div></header><main class=wrap>
-+<p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/sip-config">SIP configuration &rarr;</a></p>
-+<div class=banner id=disabled-banner>SIP subsystem is disabled. Enable it in the <code>[sip]</code> section of the config file.</div>
-+<section class=cards>
-+<div class=card><div class=muted>Listen</div><div class=n id=listen style="font-size:16px">-</div></div>
-+<div class=card><div class=muted>Registrations</div><div class=n id=nreg>-</div></div>
-+<div class=card><div class=muted>Trunks up</div><div class=n id=ntrunk>-</div></div>
-+<div class=card><div class=muted>Active calls</div><div class=n id=nactive>-</div></div>
-+<div class=card><div class=muted>Total calls</div><div class=n id=ntotal>-</div></div>
-+<div class=card><div class=muted>Realm</div><div class=n id=realm style="font-size:16px">-</div></div>
-+</section>
-+<section class=panel><h2>Extension registrations</h2><table><thead><tr><th>AOR</th><th>Contact</th><th>Source</th><th>User-Agent</th><th>Auth</th><th>Expires in</th></tr></thead><tbody id=regs></tbody></table></section>
-+<section class=panel><h2>Trunks</h2><table><thead><tr><th>Name</th><th>Direction</th><th>Remote</th><th>Status</th><th>Peer</th><th>Detail</th><th>Calls</th></tr></thead><tbody id=trunks></tbody></table></section>
-+<section class=panel><h2>Active calls</h2><table><thead><tr><th>From</th><th>To</th><th>State</th><th>Duration</th><th>RTP A/B</th><th>Call-ID</th></tr></thead><tbody id=calls></tbody></table></section>
-+</main><script>
-+const $=id=>document.getElementById(id);
-+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c]));
-+const now=()=>Date.now();
-+const dur=(a,b)=>{{if(!a)return'-';return Math.max(0,Math.floor(((b||now())-a)/1000))+'s';}};
-+const legName=e=>{{if(!e)return'-';switch(e.type){{case'sip_extension':return'ext '+esc(e.aor);case'sip_trunk':return'trunk '+esc(e.trunk)+(e.number?(' /'+esc(e.number)):'');case'brew_private':return'ISSI '+e.issi;case'brew_group':return'GSSI '+e.gssi;case'sip_external':return esc(e.uri);default:return esc(JSON.stringify(e));}}}};
-+function badge(s){{const m={{up:'health-ok',registering:'health-degraded',failed:'health-critical',down:'health-unknown'}};return`<span class="pill ${{m[s]||'health-unknown'}}">${{esc(s)}}</span>`;}}
-+async function load(){{
-+  try{{
-+    const d=await(await fetch('/api/sip')).json();
-+    $('status').textContent='Live';
-+    $('disabled-banner').style.display=d.enabled?'none':'block';
-+    $('listen').textContent=d.listen||'-';
-+    $('realm').textContent=d.realm||'-';
-+    $('nreg').textContent=d.registrations.length;
-+    $('ntrunk').textContent=d.trunks.filter(t=>t.status==='up').length+'/'+d.trunks.length;
-+    $('nactive').textContent=d.active_calls.length;
-+    $('ntotal').textContent=d.total_calls;
-+    $('regs').innerHTML=d.registrations.map(r=>`<tr><td>${{esc(r.aor)}}</td><td class=muted>${{esc(r.contact)}}</td><td>${{esc(r.source)}}</td><td class=muted>${{esc(r.user_agent)}}</td><td>${{r.authenticated?'<span class="pill health-ok">yes</span>':'<span class="pill health-unknown">no</span>'}}</td><td>${{Math.max(0,Math.floor((r.expires_at_ms-now())/1000))}}s</td></tr>`).join('')||'<tr><td colspan=6 class=muted>No registrations</td></tr>';
-+    $('trunks').innerHTML=d.trunks.map(t=>`<tr><td>${{esc(t.name)}}</td><td>${{esc(t.direction)}}</td><td>${{esc(t.remote_host)}}</td><td>${{badge(t.status)}}</td><td class=muted>${{esc(t.peer_addr||'-')}}</td><td class=muted>${{esc(t.detail)}}</td><td>${{t.active_calls}}</td></tr>`).join('')||'<tr><td colspan=7 class=muted>No trunks provisioned</td></tr>';
-+    $('calls').innerHTML=d.active_calls.map(c=>`<tr><td>${{legName(c.from)}}</td><td>${{legName(c.to)}}</td><td>${{esc(c.state)}}</td><td>${{dur(c.answered_at_ms||c.started_at_ms)}}</td><td class=muted>${{c.rtp_a_port||'-'}}/${{c.rtp_b_port||'-'}}</td><td class=muted>${{esc(String(c.call_id).slice(0,18))}}</td></tr>`).join('')||'<tr><td colspan=6 class=muted>No active calls</td></tr>';
-+  }}catch(e){{$('status').textContent='Disconnected';}}
-+}}
-+load();setInterval(load,2000);
-+</script></body></html>"#, style = STYLE));
+/// SIP live panel: registrations, trunks and active calls, polled from
+/// /api/sip every 2s. Renders a clear "disabled" notice when SIP is off.
+static SIP_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>SIP / VoIP - TETRA Network</title>{style}</head><body><header><h1>SIP / VoIP</h1><div><span class=live></span><span id=status>Live</span></div></header><main class=wrap>
+<p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/sip-config">SIP configuration &rarr;</a></p>
+<div class=banner id=disabled-banner>SIP subsystem is disabled. Enable it in the <code>[sip]</code> section of the config file.</div>
+<section class=cards>
+<div class=card><div class=muted>Listen</div><div class=n id=listen style="font-size:16px">-</div></div>
+<div class=card><div class=muted>Registrations</div><div class=n id=nreg>-</div></div>
+<div class=card><div class=muted>Trunks up</div><div class=n id=ntrunk>-</div></div>
+<div class=card><div class=muted>Active calls</div><div class=n id=nactive>-</div></div>
+<div class=card><div class=muted>Total calls</div><div class=n id=ntotal>-</div></div>
+<div class=card><div class=muted>Realm</div><div class=n id=realm style="font-size:16px">-</div></div>
+</section>
+<section class=panel><h2>Extension registrations</h2><table><thead><tr><th>AOR</th><th>Contact</th><th>Source</th><th>User-Agent</th><th>Auth</th><th>Expires in</th></tr></thead><tbody id=regs></tbody></table></section>
+<section class=panel><h2>Trunks</h2><table><thead><tr><th>Name</th><th>Direction</th><th>Remote</th><th>Status</th><th>Peer</th><th>Detail</th><th>Calls</th></tr></thead><tbody id=trunks></tbody></table></section>
+<section class=panel><h2>Active calls</h2><table><thead><tr><th>From</th><th>To</th><th>State</th><th>Duration</th><th>RTP A/B</th><th>Call-ID</th></tr></thead><tbody id=calls></tbody></table></section>
+</main><script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c]));
+const now=()=>Date.now();
+const dur=(a,b)=>{{if(!a)return'-';return Math.max(0,Math.floor(((b||now())-a)/1000))+'s';}};
+const legName=e=>{{if(!e)return'-';switch(e.type){{case'sip_extension':return'ext '+esc(e.aor);case'sip_trunk':return'trunk '+esc(e.trunk)+(e.number?(' /'+esc(e.number)):'');case'brew_private':return'ISSI '+e.issi;case'brew_group':return'GSSI '+e.gssi;case'sip_external':return esc(e.uri);default:return esc(JSON.stringify(e));}}}};
+function badge(s){{const m={{up:'health-ok',registering:'health-degraded',failed:'health-critical',down:'health-unknown'}};return`<span class="pill ${{m[s]||'health-unknown'}}">${{esc(s)}}</span>`;}}
+async function load(){{
+  try{{
+    const d=await(await fetch('/api/sip')).json();
+    $('status').textContent='Live';
+    $('disabled-banner').style.display=d.enabled?'none':'block';
+    $('listen').textContent=d.listen||'-';
+    $('realm').textContent=d.realm||'-';
+    $('nreg').textContent=d.registrations.length;
+    $('ntrunk').textContent=d.trunks.filter(t=>t.status==='up').length+'/'+d.trunks.length;
+    $('nactive').textContent=d.active_calls.length;
+    $('ntotal').textContent=d.total_calls;
+    $('regs').innerHTML=d.registrations.map(r=>`<tr><td>${{esc(r.aor)}}</td><td class=muted>${{esc(r.contact)}}</td><td>${{esc(r.source)}}</td><td class=muted>${{esc(r.user_agent)}}</td><td>${{r.authenticated?'<span class="pill health-ok">yes</span>':'<span class="pill health-unknown">no</span>'}}</td><td>${{Math.max(0,Math.floor((r.expires_at_ms-now())/1000))}}s</td></tr>`).join('')||'<tr><td colspan=6 class=muted>No registrations</td></tr>';
+    $('trunks').innerHTML=d.trunks.map(t=>`<tr><td>${{esc(t.name)}}</td><td>${{esc(t.direction)}}</td><td>${{esc(t.remote_host)}}</td><td>${{badge(t.status)}}</td><td class=muted>${{esc(t.peer_addr||'-')}}</td><td class=muted>${{esc(t.detail)}}</td><td>${{t.active_calls}}</td></tr>`).join('')||'<tr><td colspan=7 class=muted>No trunks provisioned</td></tr>';
+    $('calls').innerHTML=d.active_calls.map(c=>`<tr><td>${{legName(c.from)}}</td><td>${{legName(c.to)}}</td><td>${{esc(c.state)}}</td><td>${{dur(c.answered_at_ms||c.started_at_ms)}}</td><td class=muted>${{c.rtp_a_port||'-'}}/${{c.rtp_b_port||'-'}}</td><td class=muted>${{esc(String(c.call_id).slice(0,18))}}</td></tr>`).join('')||'<tr><td colspan=6 class=muted>No active calls</td></tr>';
+  }}catch(e){{$('status').textContent='Disconnected';}}
+}}
+load();setInterval(load,2000);
+</script></body></html>"#, style = STYLE));
 
 /// SIP configuration screen: a read-only view of the provisioned extensions,
 /// trunks and voice routes from the config file, plus an inline explanation
