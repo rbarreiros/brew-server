@@ -365,6 +365,15 @@ async fn end_call(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: 
 
 async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: SubscriberMessage) {
     let mut inner = state.inner.write().await;
+    // The connecting client's advertised mode (Terminal/Basestation), used to
+    // tag the subscriber registration so MS-registration counts can exclude
+    // Basestation (BlueStation gateway) registrations, which are not an MS.
+    let source_mode = inner.clients.get(&source).map(|c| c.mode).unwrap_or_default();
+    // Set below when this message is a Terminal-mode register/deregister, so
+    // it can be logged to the dashboard's registration log once `inner` is
+    // released (mirrors how position decoding logs via `state.telemetry`
+    // outside of the `inner` lock elsewhere in this module).
+    let mut ms_reg_event: Option<&'static str> = None;
     match msg.msg_type {
         SUB_REGISTER | SUB_REREGISTER => {
             let previous = inner.subscribers.get(&msg.issi).map(|s| (s.client_id, s.groups.clone()));
@@ -376,8 +385,9 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
                     }
                 }
             }
-            inner.subscribers.insert(msg.issi, Subscriber { client_id: source, groups: old_groups });
-            info!(%source, issi=msg.issi, "subscriber registered");
+            inner.subscribers.insert(msg.issi, Subscriber { client_id: source, groups: old_groups, mode: source_mode });
+            info!(%source, issi=msg.issi, mode=source_mode.as_str(), "subscriber registered");
+            if source_mode == crate::state::ClientMode::Terminal { ms_reg_event = Some("register"); }
         }
         SUB_DEREGISTER => {
             if let Some(sub) = inner.subscribers.remove(&msg.issi) {
@@ -386,14 +396,15 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
                         let still_present = inner.subscribers.values().any(|other| other.client_id == source && other.groups.contains(&gssi));
                         if !still_present { if let Some(clients) = inner.group_clients.get_mut(&gssi) { clients.remove(&source); } }
                     }
-                    info!(%source, issi=msg.issi, "subscriber deregistered");
+                    info!(%source, issi=msg.issi, mode=sub.mode.as_str(), "subscriber deregistered");
+                    if sub.mode == crate::state::ClientMode::Terminal { ms_reg_event = Some("deregister"); }
                 } else { inner.subscribers.insert(msg.issi, sub); }
             }
         }
         SUB_AFFILIATE => {
             let owner = inner.subscribers.get(&msg.issi).map(|s| s.client_id);
             if let Some(owner) = owner { if owner != source { warn!(%source, issi=msg.issi, "affiliation from non-owner"); return; } }
-            else { inner.subscribers.insert(msg.issi, Subscriber { client_id: source, groups: HashSet::new() }); }
+            else { inner.subscribers.insert(msg.issi, Subscriber { client_id: source, groups: HashSet::new(), mode: source_mode }); }
             for gssi in msg.groups {
                 if let Some(sub) = inner.subscribers.get_mut(&msg.issi) { sub.groups.insert(gssi); }
                 inner.group_clients.entry(gssi).or_default().insert(source);
@@ -410,6 +421,13 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
             }
         }
         _ => debug!(%source, msg_type=msg.msg_type, "unknown subscriber message"),
+    }
+    drop(inner);
+    // Log Terminal-mode (actual MS) registration lifecycle events to the same
+    // dashboard registration log FlowStation telemetry registrations use, so
+    // an MS registering directly over the Brew protocol is visible there too.
+    if let Some(kind) = ms_reg_event {
+        state.telemetry.write().await.record_brew_registration(msg.issi, kind);
     }
 }
 

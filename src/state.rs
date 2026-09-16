@@ -52,6 +52,12 @@ pub struct Client {
 pub struct Subscriber {
     pub client_id: ClientId,
     pub groups: HashSet<u32>,
+    /// The connection mode of the client that registered this ISSI (Terminal
+    /// or Basestation). Only `Terminal` connections represent an actual mobile
+    /// station; a `Basestation` (BlueStation gateway) registering on a
+    /// subscriber's behalf is not itself an MS. Dashboard MS-registration
+    /// counts should filter on this.
+    pub mode: ClientMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +95,48 @@ pub struct Inner {
     pub sds_routes: HashMap<Uuid, SdsRoute>,
     pub digest_nonces: HashMap<String, Instant>,
     pub auth_sessions: HashMap<String, (Instant, ClientMode, ConnVersion)>,
+}
+
+impl Inner {
+    /// Number of registered subscribers that represent an actual mobile
+    /// station, i.e. registered by a `Terminal`-mode client. A `Basestation`
+    /// (BlueStation gateway) can also hold a subscriber registration, but it
+    /// is not itself an MS, so it is excluded from MS-registration counts.
+    pub fn ms_registration_count(&self) -> usize {
+        self.subscribers.values().filter(|s| s.mode == ClientMode::Terminal).count()
+    }
+}
+
+#[cfg(test)]
+mod ms_registration_tests {
+    use super::*;
+
+    fn subscriber(mode: ClientMode) -> Subscriber {
+        Subscriber { client_id: Uuid::new_v4(), groups: HashSet::new(), mode }
+    }
+
+    #[test]
+    fn counts_only_terminal_mode_subscribers() {
+        let mut inner = Inner::default();
+        inner.subscribers.insert(1001, subscriber(ClientMode::Terminal));
+        inner.subscribers.insert(1002, subscriber(ClientMode::Terminal));
+        inner.subscribers.insert(2001, subscriber(ClientMode::Basestation));
+        assert_eq!(inner.ms_registration_count(), 2);
+        assert_eq!(inner.subscribers.len(), 3, "raw map still holds every registration");
+    }
+
+    #[test]
+    fn zero_when_only_basestations_registered() {
+        let mut inner = Inner::default();
+        inner.subscribers.insert(2001, subscriber(ClientMode::Basestation));
+        inner.subscribers.insert(2002, subscriber(ClientMode::Basestation));
+        assert_eq!(inner.ms_registration_count(), 0);
+    }
+
+    #[test]
+    fn zero_when_no_subscribers() {
+        assert_eq!(Inner::default().ms_registration_count(), 0);
+    }
 }
 
 pub struct AppState {

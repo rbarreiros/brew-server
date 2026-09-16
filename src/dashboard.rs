@@ -35,6 +35,7 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/api/status", get(snapshot))
         .route("/api/live", get(live))
         .route("/api/telemetry", get(telemetry_snapshot))
+        .route("/api/registrations", get(registration_log))
         .route("/api/positions", get(positions_snapshot))
         .route("/api/control", get(control_list))
         .route("/api/control/{id}", axum::routing::post(control_command))
@@ -166,8 +167,8 @@ static TELEMETRY_SDS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::ne
 ));
 
 static REGISTRATIONS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| log_page(
-    "Mobile Station Registrations", "/api/telemetry",
-    "d.flatMap(s=>(s.recent_regs_out||[]).map(x=>({...x,bts:s.id}))).sort((a,b)=>b.at_ms-a.at_ms).slice(0,100)",
+    "Mobile Station Registrations", "/api/registrations",
+    "d",
     "`<tr><td>${dt(x.at_ms)}</td><td>${esc(x.bts)}</td><td>${x.issi}</td><td>${x.kind==='register'?'<span class=\"badge badge-reg-in\">Registered</span>':x.kind==='deregister'?'<span class=\"badge badge-reg-out\">Deregistered</span>':'<span class=\"badge badge-reg-timeout\">Timed out</span>'}</td></tr>`",
     &["Time", "BTS", "ISSI", "Event"], 15, "No registration events yet",
 ));
@@ -233,12 +234,16 @@ pub async fn calls_page() -> Html<&'static str> { Html(CALLS_HTML.as_str()) }
 pub async fn sds_page() -> Html<&'static str> { Html(SDS_HTML.as_str()) }
 pub async fn telemetry_sds_page() -> Html<&'static str> { Html(TELEMETRY_SDS_HTML.as_str()) }
 pub async fn registrations_page() -> Html<&'static str> { Html(REGISTRATIONS_HTML.as_str()) }
-pub async fn snapshot(State(state): State<Arc<AppState>>) -> Json<crate::monitor::Snapshot> { let i=state.inner.read().await; let counts=(i.clients.len(),i.subscribers.len(),i.group_clients.len()); drop(i); Json(state.monitor.snapshot(counts.0,counts.1,counts.2).await) }
+pub async fn snapshot(State(state): State<Arc<AppState>>) -> Json<crate::monitor::Snapshot> { let i=state.inner.read().await; let counts=(i.clients.len(),i.ms_registration_count(),i.group_clients.len()); drop(i); Json(state.monitor.snapshot(counts.0,counts.1,counts.2).await) }
 pub async fn live(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> impl IntoResponse { ws.on_upgrade(move |s| live_socket(state,s)) }
 async fn live_socket(state: Arc<AppState>, mut socket: WebSocket) { let mut rx=state.monitor.subscribe(); while let Ok(ev)=rx.recv().await { if socket.send(Message::Text(serde_json::to_string(&ev).unwrap().into())).await.is_err(){break;} } }
 
 pub async fn telemetry_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<TelemetryBts>> {
     Json(state.telemetry.read().await.snapshot())
+}
+
+pub async fn registration_log(State(state): State<Arc<AppState>>) -> Json<Vec<crate::telemetry::RegLogRow>> {
+    Json(state.telemetry.read().await.registration_log())
 }
 
 pub async fn positions_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<crate::telemetry::PositionFix>> {
@@ -453,7 +458,7 @@ mod tests {
             ("calls", CALLS_HTML.as_str(), "/api/status"),
             ("sds", SDS_HTML.as_str(), "/api/status"),
             ("telemetry", TELEMETRY_SDS_HTML.as_str(), "/api/telemetry"),
-            ("registrations", REGISTRATIONS_HTML.as_str(), "/api/telemetry"),
+            ("registrations", REGISTRATIONS_HTML.as_str(), "/api/registrations"),
         ] {
             assert!(!html.contains("__STYLE__"), "{name}: style substituted");
             assert!(html.contains("id=log"), "{name}: log table body present");

@@ -456,7 +456,11 @@ chain (leaf first) and `key_path` the matching PKCS#8/RSA key, same format as
 the Brew `[tls]` block.
 
 The dashboard shows connected BlueStations, registered subscribers, groups, and
-active/live group and private calls with durations and voice-frame counts.
+active/live group and private calls with durations and voice-frame counts. The
+**Subscribers** count reflects only `Terminal`-mode registrations (actual
+mobile stations); a `Basestation` (BlueStation gateway) can also hold a
+subscriber registration on a client's behalf, but is not itself an MS and is
+excluded from this count.
 Recent calls, recent SDS, and the telemetry SDS log have moved to their own
 paginated pages, linked from the "Logs" panel (`/calls`, `/sds`,
 `/telemetry-sds`). When the FlowStation Telemetry channel is enabled, it also
@@ -470,8 +474,12 @@ both the "Logs" panel and the Registered Subscribers panel) lists individual
 registration lifecycle events — register, deregister, and timeout-drop —
 across all connected FlowStations, newest first, so registration churn (a
 subscriber repeatedly registering/dropping) is visible over time rather than
-only as the current registered set. This log is a rolling in-memory buffer
-(last 50 events per station) and is not persisted across restarts. When
+only as the current registered set. It also includes register/deregister
+events seen directly on the Brew protocol channel (a `Terminal`-mode client
+registering/deregistering an ISSI with this server, independent of any
+FlowStation), tagged with the source `brew` so they're told apart from
+FlowStation-reported events. This log is a rolling in-memory buffer (last 50
+events per source) and is not persisted across restarts. When
 Control is enabled, each connected station gets a command panel (Kick
 MS, DGNA, live SDS, clear emergency, restart/shutdown) — see "FlowStation
 Control" above. Live per-station state (health, active calls, RF quality,

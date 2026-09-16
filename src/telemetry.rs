@@ -433,6 +433,16 @@ pub struct TelemetryState {
     recent_sds: VecDeque<SdsTelemetryRecord>,
     /// Serialized view of `recent_sds` for the dashboard.
     pub recent_sds_out: Vec<SdsTelemetryRecord>,
+    /// Mobile-station registration lifecycle events (register/deregister)
+    /// observed on the Brew protocol channel directly, i.e. a `Terminal`-mode
+    /// client registering/deregistering an ISSI with this server — distinct
+    /// from the per-FlowStation telemetry registrations in `stations`. Tagged
+    /// with a synthetic "brew" station id (see `RegLogEntry`/`bts` below) so
+    /// the dashboard's registration log can show both sources together.
+    /// Newest first, capped like the per-station logs; not persisted.
+    recent_brew_regs: VecDeque<RegLogEntry>,
+    /// Serialized view of `recent_brew_regs` for the dashboard.
+    pub recent_brew_regs_out: Vec<RegLogEntry>,
     store: Option<Arc<crate::store::Store>>,
 }
 
@@ -511,6 +521,44 @@ impl TelemetryState {
             }
         }
     }
+
+    /// Records a mobile-station registration lifecycle event seen directly on
+    /// the Brew protocol channel (a `Terminal`-mode client registering or
+    /// deregistering an ISSI with this server), so it appears in the same
+    /// registration log as FlowStation telemetry registrations. `kind` is
+    /// "register" or "deregister".
+    pub fn record_brew_registration(&mut self, issi: u32, kind: &'static str) {
+        self.recent_brew_regs.push_front(RegLogEntry { at_ms: now_ms(), issi, kind });
+        while self.recent_brew_regs.len() > 50 {
+            self.recent_brew_regs.pop_back();
+        }
+        self.recent_brew_regs_out = self.recent_brew_regs.iter().cloned().collect();
+    }
+
+    /// Flat, newest-first list of registration lifecycle events across every
+    /// FlowStation's telemetry channel *and* the Brew protocol channel
+    /// directly (tagged with the synthetic station id "brew"), for the
+    /// `/registrations` dashboard page. Capped to the most recent 100 entries.
+    pub fn registration_log(&self) -> Vec<RegLogRow> {
+        let mut out: Vec<RegLogRow> = self.stations.values()
+            .flat_map(|s| s.recent_regs_out.iter().map(|e| RegLogRow { bts: s.id.clone(), entry: e.clone() }))
+            .chain(self.recent_brew_regs.iter().map(|e| RegLogRow { bts: "brew".to_string(), entry: e.clone() }))
+            .collect();
+        out.sort_unstable_by(|a, b| b.entry.at_ms.cmp(&a.entry.at_ms));
+        out.truncate(100);
+        out
+    }
+}
+
+/// One row of the combined registration log served to the dashboard: a
+/// registration lifecycle event tagged with the station that reported it
+/// ("brew" for events seen directly on the Brew protocol channel, rather than
+/// via a FlowStation's telemetry channel).
+#[derive(Debug, Clone, Serialize)]
+pub struct RegLogRow {
+    pub bts: String,
+    #[serde(flatten)]
+    pub entry: RegLogEntry,
 }
 
 /// A position fix as served to the map, including which station reported it.
@@ -864,5 +912,58 @@ mod sds_persist_tests {
         }
         assert_eq!(t.recent_sds_out.len(), 200, "capped at 200");
         assert_eq!(t.recent_sds_out[0].source_issi, 204, "newest first");
+    }
+}
+
+#[cfg(test)]
+mod registration_log_tests {
+    use super::*;
+
+    #[test]
+    fn record_brew_registration_logs_newest_first_and_capped() {
+        let mut t = TelemetryState::default();
+        t.record_brew_registration(1001, "register");
+        t.record_brew_registration(1002, "register");
+        t.record_brew_registration(1001, "deregister");
+        assert_eq!(t.recent_brew_regs_out.len(), 3);
+        assert_eq!(t.recent_brew_regs_out[0].issi, 1001);
+        assert_eq!(t.recent_brew_regs_out[0].kind, "deregister");
+        for i in 0..60 {
+            t.record_brew_registration(i, "register");
+        }
+        assert_eq!(t.recent_brew_regs_out.len(), 50, "log capped at 50 entries");
+    }
+
+    #[test]
+    fn registration_log_merges_and_tags_brew_and_flowstation_events() {
+        let mut t = TelemetryState::default();
+        t.stations.insert("bts-1".to_string(), TelemetryBts::new("bts-1".to_string(), None));
+        t.stations.get_mut("bts-1").unwrap().push_reg(2001, "register");
+        // Ensure a distinct, later timestamp so ordering is deterministic
+        // rather than relying on both events landing in the same millisecond.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        t.record_brew_registration(3001, "register");
+
+        let log = t.registration_log();
+        assert_eq!(log.len(), 2);
+        // Newest first: the Brew-channel event was recorded after the
+        // FlowStation one, so it must sort first.
+        assert_eq!(log[0].bts, "brew");
+        assert_eq!(log[0].entry.issi, 3001);
+        assert_eq!(log[1].bts, "bts-1");
+        assert_eq!(log[1].entry.issi, 2001);
+    }
+
+    #[test]
+    fn registration_log_caps_at_100_across_all_sources() {
+        let mut t = TelemetryState::default();
+        for i in 0..60u32 {
+            t.record_brew_registration(i, "register");
+        }
+        t.stations.insert("bts-1".to_string(), TelemetryBts::new("bts-1".to_string(), None));
+        for i in 0..60u32 {
+            t.stations.get_mut("bts-1").unwrap().push_reg(i, "register");
+        }
+        assert_eq!(t.registration_log().len(), 100);
     }
 }
