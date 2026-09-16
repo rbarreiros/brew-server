@@ -7,6 +7,7 @@ mod position;
 mod protocol;
 mod router;
 mod server;
+mod sip;
 mod state;
 mod store;
 mod telemetry;
@@ -36,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         telemetry::run(state.clone()),
         control::run(state.clone()),
         dashboard::run(state.clone()),
+        sip::run(state.clone()),
     )?;
     Ok(())
 }

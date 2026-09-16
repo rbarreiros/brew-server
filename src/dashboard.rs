@@ -39,6 +39,10 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/api/positions", get(positions_snapshot))
         .route("/api/control", get(control_list))
         .route("/api/control/{id}", axum::routing::post(control_command))
+        .route("/sip", get(sip_page))
+        .route("/sip-config", get(sip_config_page))
+        .route("/api/sip", get(sip_snapshot))
+        .route("/api/sip/config", get(sip_config))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_basic))
         .with_state(state.clone());
 
@@ -230,6 +234,89 @@ async function load(){{
 load();setInterval(load,3000);
 </script></body></html>"#, style = STYLE));
 
++/// SIP live panel: registrations, trunks and active calls, polled from
++/// /api/sip every 2s. Renders a clear "disabled" notice when SIP is off.
++static SIP_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>SIP / VoIP - TETRA Network</title>{style}</head><body><header><h1>SIP / VoIP</h1><div><span class=live></span><span id=status>Live</span></div></header><main class=wrap>
++<p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/sip-config">SIP configuration &rarr;</a></p>
++<div class=banner id=disabled-banner>SIP subsystem is disabled. Enable it in the <code>[sip]</code> section of the config file.</div>
++<section class=cards>
++<div class=card><div class=muted>Listen</div><div class=n id=listen style="font-size:16px">-</div></div>
++<div class=card><div class=muted>Registrations</div><div class=n id=nreg>-</div></div>
++<div class=card><div class=muted>Trunks up</div><div class=n id=ntrunk>-</div></div>
++<div class=card><div class=muted>Active calls</div><div class=n id=nactive>-</div></div>
++<div class=card><div class=muted>Total calls</div><div class=n id=ntotal>-</div></div>
++<div class=card><div class=muted>Realm</div><div class=n id=realm style="font-size:16px">-</div></div>
++</section>
++<section class=panel><h2>Extension registrations</h2><table><thead><tr><th>AOR</th><th>Contact</th><th>Source</th><th>User-Agent</th><th>Auth</th><th>Expires in</th></tr></thead><tbody id=regs></tbody></table></section>
++<section class=panel><h2>Trunks</h2><table><thead><tr><th>Name</th><th>Direction</th><th>Remote</th><th>Status</th><th>Peer</th><th>Detail</th><th>Calls</th></tr></thead><tbody id=trunks></tbody></table></section>
++<section class=panel><h2>Active calls</h2><table><thead><tr><th>From</th><th>To</th><th>State</th><th>Duration</th><th>RTP A/B</th><th>Call-ID</th></tr></thead><tbody id=calls></tbody></table></section>
++</main><script>
++const $=id=>document.getElementById(id);
++const esc=s=>String(s??'').replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c]));
++const now=()=>Date.now();
++const dur=(a,b)=>{{if(!a)return'-';return Math.max(0,Math.floor(((b||now())-a)/1000))+'s';}};
++const legName=e=>{{if(!e)return'-';switch(e.type){{case'sip_extension':return'ext '+esc(e.aor);case'sip_trunk':return'trunk '+esc(e.trunk)+(e.number?(' /'+esc(e.number)):'');case'brew_private':return'ISSI '+e.issi;case'brew_group':return'GSSI '+e.gssi;case'sip_external':return esc(e.uri);default:return esc(JSON.stringify(e));}}}};
++function badge(s){{const m={{up:'health-ok',registering:'health-degraded',failed:'health-critical',down:'health-unknown'}};return`<span class="pill ${{m[s]||'health-unknown'}}">${{esc(s)}}</span>`;}}
++async function load(){{
++  try{{
++    const d=await(await fetch('/api/sip')).json();
++    $('status').textContent='Live';
++    $('disabled-banner').style.display=d.enabled?'none':'block';
++    $('listen').textContent=d.listen||'-';
++    $('realm').textContent=d.realm||'-';
++    $('nreg').textContent=d.registrations.length;
++    $('ntrunk').textContent=d.trunks.filter(t=>t.status==='up').length+'/'+d.trunks.length;
++    $('nactive').textContent=d.active_calls.length;
++    $('ntotal').textContent=d.total_calls;
++    $('regs').innerHTML=d.registrations.map(r=>`<tr><td>${{esc(r.aor)}}</td><td class=muted>${{esc(r.contact)}}</td><td>${{esc(r.source)}}</td><td class=muted>${{esc(r.user_agent)}}</td><td>${{r.authenticated?'<span class="pill health-ok">yes</span>':'<span class="pill health-unknown">no</span>'}}</td><td>${{Math.max(0,Math.floor((r.expires_at_ms-now())/1000))}}s</td></tr>`).join('')||'<tr><td colspan=6 class=muted>No registrations</td></tr>';
++    $('trunks').innerHTML=d.trunks.map(t=>`<tr><td>${{esc(t.name)}}</td><td>${{esc(t.direction)}}</td><td>${{esc(t.remote_host)}}</td><td>${{badge(t.status)}}</td><td class=muted>${{esc(t.peer_addr||'-')}}</td><td class=muted>${{esc(t.detail)}}</td><td>${{t.active_calls}}</td></tr>`).join('')||'<tr><td colspan=7 class=muted>No trunks provisioned</td></tr>';
++    $('calls').innerHTML=d.active_calls.map(c=>`<tr><td>${{legName(c.from)}}</td><td>${{legName(c.to)}}</td><td>${{esc(c.state)}}</td><td>${{dur(c.answered_at_ms||c.started_at_ms)}}</td><td class=muted>${{c.rtp_a_port||'-'}}/${{c.rtp_b_port||'-'}}</td><td class=muted>${{esc(String(c.call_id).slice(0,18))}}</td></tr>`).join('')||'<tr><td colspan=6 class=muted>No active calls</td></tr>';
++  }}catch(e){{$('status').textContent='Disconnected';}}
++}}
++load();setInterval(load,2000);
++</script></body></html>"#, style = STYLE));
+
+/// SIP configuration screen: a read-only view of the provisioned extensions,
+/// trunks and voice routes from the config file, plus an inline explanation
+/// that edits are made in the TOML (which the server hot-reloads).
+static SIP_CONFIG_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>SIP Config - TETRA Network</title>{style}</head><body><header><h1>SIP CONFIGURATION</h1><div><span class=live></span><span id=status>Live</span></div></header><main class=wrap>
+<p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/sip">SIP live panel &rarr;</a></p>
+<div class=banner id=disabled-banner>SIP subsystem is disabled. Set <code>enabled = true</code> under <code>[sip]</code>.</div>
+<section class=panel><h2>General</h2><table><tbody id=general></tbody></table>
+<p class=map-note style="color:#8fa2b8;font-size:12px">This screen is read-only. Provision extensions, trunks and routes by editing the <code>[sip]</code> section of the server's TOML config file; the running process watches the file and restarts to apply changes. Passwords are never shown here.</p>
+</section>
+<section class=panel><h2>Extensions</h2><table><thead><tr><th>User</th><th>Display name</th><th>ISSI</th><th>Outbound</th><th>Password</th></tr></thead><tbody id=exts></tbody></table></section>
+<section class=panel><h2>Trunks</h2><table><thead><tr><th>Name</th><th>Direction</th><th>Remote host</th><th>Username</th><th>Realm</th><th>Reg interval</th><th>Enabled</th><th>Password</th></tr></thead><tbody id=trunks></tbody></table></section>
+<section class=panel><h2>Voice routes</h2><table><thead><tr><th>#</th><th>Name</th><th>Match</th><th>From</th><th>To</th><th>Enabled</th></tr></thead><tbody id=routes></tbody></table>
+<p class=map-note style="color:#8fa2b8;font-size:12px">Routes are evaluated top to bottom; the first enabled route whose match pattern (and optional <em>from</em> restriction) matches the dialled destination wins. Endpoints: <code>ext:USER</code>, <code>trunk:NAME[/NUMBER]</code>, <code>issi:N</code> (Brew private), <code>group:N</code> (Brew group).</p>
+</section>
+<style>#general td:first-child{{color:#8fa2b8;width:220px}}</style>
+</main><script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c]));
+const yn=b=>b?'<span class="pill health-ok">yes</span>':'<span class="pill health-unknown">no</span>';
+const pw=b=>b?'<span class="pill health-ok">set</span>':'<span class="pill health-critical">none</span>';
+async function load(){{
+  try{{
+    const d=await(await fetch('/api/sip/config')).json();
+    $('status').textContent='Live';
+    $('disabled-banner').style.display=d.enabled?'none':'block';
+    $('general').innerHTML=[
+      ['Enabled',yn(d.enabled)],
+      ['Listen',esc(d.listen)],
+      ['Advertised host',esc(d.advertised_host||'(socket local address)')],
+      ['Realm',esc(d.realm)],
+      ['RTP port range',esc(d.rtp_port_min)+' - '+esc(d.rtp_port_max)],
+      ['Registration TTL',esc(d.registration_ttl_seconds)+'s'],
+    ].map(r=>`<tr><td>${{r[0]}}</td><td>${{r[1]}}</td></tr>`).join('');
+    $('exts').innerHTML=d.extensions.map(e=>`<tr><td>${{esc(e.user)}}</td><td>${{esc(e.display_name||'-')}}</td><td>${{e.issi||'-'}}</td><td>${{yn(e.allow_outbound)}}</td><td>${{pw(e.has_password)}}</td></tr>`).join('')||'<tr><td colspan=5 class=muted>No extensions provisioned</td></tr>';
+    $('trunks').innerHTML=d.trunks.map(t=>`<tr><td>${{esc(t.name)}}</td><td>${{esc(t.direction)}}</td><td>${{esc(t.remote_host||'-')}}</td><td>${{esc(t.username)}}</td><td class=muted>${{esc(t.realm||'-')}}</td><td>${{esc(t.register_interval_seconds)}}s</td><td>${{yn(t.enabled)}}</td><td>${{pw(t.has_password)}}</td></tr>`).join('')||'<tr><td colspan=8 class=muted>No trunks provisioned</td></tr>';
+    $('routes').innerHTML=d.routes.map((r,i)=>`<tr><td class=muted>${{i+1}}</td><td>${{esc(r.name||'-')}}</td><td><code>${{esc(r.match_pattern)}}</code></td><td>${{esc(r.from||'any')}}</td><td>${{esc(r.to||'-')}}</td><td>${{yn(r.enabled)}}</td></tr>`).join('')||'<tr><td colspan=6 class=muted>No routes configured</td></tr>';
+  }}catch(e){{$('status').textContent='Disconnected';}}
+}}
+load();setInterval(load,5000);
+</script></body></html>"#, style = STYLE));
+
 pub async fn calls_page() -> Html<&'static str> { Html(CALLS_HTML.as_str()) }
 pub async fn sds_page() -> Html<&'static str> { Html(SDS_HTML.as_str()) }
 pub async fn telemetry_sds_page() -> Html<&'static str> { Html(TELEMETRY_SDS_HTML.as_str()) }
@@ -251,6 +338,84 @@ pub async fn positions_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<
 }
 
 pub async fn map_page() -> Html<&'static str> { Html(MAP_HTML.as_str()) }
+
+/// JSON snapshot of the SIP subsystem for the live panel. Returns an object
+/// with `enabled=false` when SIP is not running, so the page can render a clear
+/// disabled state rather than erroring.
+pub async fn sip_snapshot(State(state): State<Arc<AppState>>) -> Response {
+    match state.sip_snapshot().await {
+        Some(snap) => Json(snap).into_response(),
+        None => Json(serde_json::json!({
+            "enabled": false,
+            "listen": "",
+            "realm": "",
+            "registrations": [],
+            "trunks": [],
+            "active_calls": [],
+            "total_calls": 0,
+            "total_registrations": 0,
+        })).into_response(),
+    }
+}
+
+/// JSON view of the *provisioned* SIP configuration (extensions, trunks,
+/// routes) as loaded from the config file. Passwords are redacted. This backs
+/// the read-only config screen; edits are made in the TOML file, which the
+/// running process watches and reloads.
+pub async fn sip_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let sip = &state.config.sip;
+    let extensions: Vec<_> = sip.extensions.iter().map(|(user, e)| serde_json::json!({
+        "user": user,
+        "display_name": e.display_name,
+        "issi": e.issi,
+        "allow_outbound": e.allow_outbound,
+        "has_password": !e.password.is_empty(),
+    })).collect();
+    let trunks: Vec<_> = sip.trunks.iter().map(|(name, t)| serde_json::json!({
+        "name": name,
+        "direction": format!("{:?}", t.direction).to_lowercase(),
+        "remote_host": t.remote_host,
+        "username": if t.username.is_empty() { name.clone() } else { t.username.clone() },
+        "realm": t.realm,
+        "register_interval_seconds": t.register_interval_seconds,
+        "enabled": t.enabled,
+        "has_password": !t.password.is_empty(),
+    })).collect();
+    let routes: Vec<_> = sip.routes.iter().map(|r| serde_json::json!({
+        "name": r.name,
+        "match_pattern": r.match_pattern,
+        "from": r.from.as_ref().map(describe_endpoint),
+        "to": r.to.as_ref().map(describe_endpoint),
+        "enabled": r.enabled,
+    })).collect();
+    Json(serde_json::json!({
+        "enabled": sip.enabled,
+        "listen": sip.listen.to_string(),
+        "advertised_host": sip.advertised_host,
+        "realm": sip.realm,
+        "rtp_port_min": sip.rtp_port_min,
+        "rtp_port_max": sip.rtp_port_max,
+        "registration_ttl_seconds": sip.registration_ttl_seconds,
+        "extensions": extensions,
+        "trunks": trunks,
+        "routes": routes,
+    }))
+}
+
+/// Renders a route endpoint config as a short human string for the config page.
+fn describe_endpoint(ep: &crate::config::RouteEndpoint) -> String {
+    use crate::config::RouteEndpoint::*;
+    match ep {
+        SipExtension { user } => format!("ext:{user}"),
+        SipTrunk { trunk, number } if number.is_empty() => format!("trunk:{trunk}"),
+        SipTrunk { trunk, number } => format!("trunk:{trunk}/{number}"),
+        BrewPrivate { issi } => format!("issi:{issi}"),
+        BrewGroup { gssi } => format!("group:{gssi}"),
+    }
+}
+
+pub async fn sip_page() -> Html<&'static str> { Html(SIP_HTML.as_str()) }
+pub async fn sip_config_page() -> Html<&'static str> { Html(SIP_CONFIG_HTML.as_str()) }
 
 pub async fn control_list(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
     Json(state.control.read().await.connected_ids())
@@ -288,7 +453,7 @@ h2 .backlink{text-transform:none;letter-spacing:normal;margin-left:8px}
 
 const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><header><h1>TETRA NETWORK MONITOR</h1><div><span class=live></span><span id=status>Live</span></div></header><main class=wrap>
 <div class=banner id=emergency-banner></div>
-<section class=cards><div class=card><div class=muted>BlueStations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Logs</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-FlowStation SDS stream</span></a><a class=navlink href="/registrations">MS Registrations<span class=sub>Register/deregister/timeout events</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a></div></section>
+<section class=cards><div class=card><div class=muted>BlueStations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Logs</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-FlowStation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a></div></section>
 <section class=panel><h2>FlowStation Telemetry</h2><div class=bts-grid id=telemetry-stations></div></section>
 <section class=panel><h2>Registered Subscribers <a class=backlink href="/registrations">(view registration log &rarr;)</a></h2><div class=bts-grid id=registrations></div></section>
 <section class=panel><h2>FlowStation Control</h2><div class=bts-grid id=control-stations></div></section>

@@ -306,7 +306,30 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
     };
     let mut inner = state.inner.write().await;
     let Some(target_client) = inner.subscribers.get(&destination).map(|s| s.client_id) else {
-        warn!(%source, uuid=%id, destination, "private call destination not registered");
+        drop(inner);
+        // The destination is not a registered Brew subscriber. Before giving up,
+        // offer it to the SIP subsystem: a voice route may bridge this TETRA
+        // private call out to a SIP extension or trunk (Brew -> SIP direction).
+        // The dialled number is the destination ISSI rendered as decimal, which
+        // route patterns can match (e.g. "7*" or an exact ISSI string).
+        let bridged = {
+            let guard = state.sip.read().await;
+            match guard.as_ref() {
+                Some(h) => {
+                    if let Some(bridge) = h.transport.bridge.read().await.clone() {
+                        let origin = crate::sip::routing::CallOrigin::BrewPrivate(source_issi);
+                        bridge.brew_to_sip(origin, &destination.to_string()).await
+                    } else { false }
+                }
+                None => false,
+            }
+        };
+        if bridged {
+            state.monitor.call_started(id, "private", source_issi, destination, 0).await;
+            info!(%source, uuid=%id, source_issi, destination, mnemonic=?mnemonic, "routed private SETUP_REQUEST to SIP");
+        } else {
+            warn!(%source, uuid=%id, destination, "private call destination not registered (no SIP route)");
+        }
         return;
     };
     if target_client == source { return; }

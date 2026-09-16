@@ -75,3 +75,78 @@ key_path = "tls/dashboard-key.pem"
 [storage]
 enabled = true
 path = "brew-history.bin"
+
+# ---------------------------------------------------------------------------
+# SIP / VoIP subsystem. Off by default. When enabled it binds a UDP SIP
+# listener that terminates SIP extensions (user/pass registrations) and SIP
+# trunks (peer gateways such as Asterisk), and bridges calls to the Brew/TETRA
+# side via the voice routes below. See README.md "SIP / VoIP".
+[sip]
+enabled = false
+listen = "0.0.0.0:5060"
+# Address advertised to peers in Contact/Via (leave empty to use the socket's
+# local address). Set this to your public/reachable IP when behind NAT.
+advertised_host = ""
+# UDP port range the RTP relay allocates media legs from.
+rtp_port_min = 16000
+rtp_port_max = 17000
+realm = "brew-server"
+registration_ttl_seconds = 3600
+
+# SIP extensions (user/pass). The table key is the AOR user part the phone
+# registers as. `issi` optionally maps the extension to a TETRA subscriber so
+# voice routes can address it from the Brew side.
+[sip.extensions.1001]
+password = "change-me-1001"
+display_name = "Reception"
+issi = 1001
+allow_outbound = true
+
+[sip.extensions.1002]
+password = "change-me-1002"
+display_name = "Dispatch"
+allow_outbound = true
+
+# SIP trunks to VoIP gateways. `direction` is one of:
+#   outbound - we REGISTER to the peer at `remote_host` (ITSP / Asterisk).
+#   inbound  - the peer REGISTERs to us (learn its address from its REGISTER).
+#   peer     - static IP-authenticated peer, no registration either way.
+[sip.trunks.asterisk]
+direction = "outbound"
+remote_host = "192.0.2.10:5060"
+username = "brew-trunk"
+password = "change-me-trunk"
+register_interval_seconds = 300
+enabled = true
+
+# Voice routes. Evaluated top to bottom; first enabled match wins. `to`/`from`
+# endpoints: { kind = "sip_extension", user = "1001" },
+#            { kind = "sip_trunk", trunk = "asterisk", number = "..." },
+#            { kind = "brew_private", issi = 90 },
+#            { kind = "brew_group", gssi = 1001 }.
+# `match_pattern` matches the dialled destination: "*" any, trailing "*" prefix,
+# otherwise exact.
+
+# Extensions dialling 9 + number go out the Asterisk trunk.
+[[sip.routes]]
+name = "outbound-via-asterisk"
+match_pattern = "9*"
+to = { kind = "sip_trunk", trunk = "asterisk" }
+enabled = true
+
+# Anything arriving from the Asterisk trunk is patched into TETRA group 1001,
+# reaching affiliated basestation mobile stations and brew mobile clients.
+[[sip.routes]]
+name = "asterisk-to-tetra-group"
+match_pattern = "*"
+from = { kind = "sip_trunk", trunk = "asterisk" }
+to = { kind = "brew_group", gssi = 1001 }
+enabled = true
+
+# Dial 7 + ISSI from a SIP extension to reach a TETRA subscriber privately.
+[[sip.routes]]
+name = "ext-to-tetra-private"
+match_pattern = "7*"
+from = { kind = "sip_extension", user = "1001" }
+to = { kind = "brew_private", issi = 90 }
+enabled = true

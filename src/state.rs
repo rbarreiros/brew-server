@@ -190,6 +190,17 @@ pub struct AppState {
     pub monitor: Monitor,
     pub telemetry: RwLock<TelemetryState>,
     pub control: RwLock<ControlState>,
+    /// SIP subsystem runtime handles, populated when the SIP listener starts.
+    /// `None` until then (and when SIP is disabled) so the dashboard can render
+    /// an appropriate "disabled" state without panicking.
+    pub sip: RwLock<Option<SipHandles>>,
+}
+
+/// Runtime handles for the SIP subsystem, shared with the dashboard.
+#[derive(Clone)]
+pub struct SipHandles {
+    pub state: std::sync::Arc<crate::sip::SipState>,
+    pub transport: std::sync::Arc<crate::sip::SipTransport>,
 }
 
 impl AppState {
@@ -219,6 +230,26 @@ impl AppState {
             monitor,
             telemetry: RwLock::new(telemetry),
             control: RwLock::new(ControlState::default()),
+            sip: RwLock::new(None),
+        }
+    }
+
+    /// Registers the SIP runtime handles once the SIP listener has bound. Called
+    /// from the SIP transport during startup.
+    pub async fn set_sip(
+        &self,
+        state: std::sync::Arc<crate::sip::SipState>,
+        transport: std::sync::Arc<crate::sip::SipTransport>,
+    ) {
+        *self.sip.write().await = Some(SipHandles { state, transport });
+    }
+
+    /// Returns a SIP snapshot for the dashboard, or None when SIP is inactive.
+    pub async fn sip_snapshot(&self) -> Option<crate::sip::SipSnapshot> {
+        let guard = self.sip.read().await;
+        match guard.as_ref() {
+            Some(h) => Some(h.state.snapshot().await),
+            None => None,
         }
     }
 
