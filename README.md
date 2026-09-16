@@ -465,9 +465,17 @@ per-carrier **TS1-TS4 timeslot occupancy grid** (busy vs. available), RF
 quality, and a **Registered Subscribers** panel listing which ISSIs are
 registered on each station; active emergency alarms appear as a banner — see
 "FlowStation Telemetry" above, which is where the carrier-timeslot data comes
-from. When Control is enabled, each connected station gets a command panel (Kick
+from. A **Mobile Station Registrations** log (`/registrations`, linked from
+both the "Logs" panel and the Registered Subscribers panel) lists individual
+registration lifecycle events — register, deregister, and timeout-drop —
+across all connected FlowStations, newest first, so registration churn (a
+subscriber repeatedly registering/dropping) is visible over time rather than
+only as the current registered set. This log is a rolling in-memory buffer
+(last 50 events per station) and is not persisted across restarts. When
+Control is enabled, each connected station gets a command panel (Kick
 MS, DGNA, live SDS, clear emergency, restart/shutdown) — see "FlowStation
 Control" above. Live per-station state (health, active calls, RF quality,
-registrations) is in-memory and resets when the BTS's telemetry/control
-connection restarts; calls, SDS, and the Telemetry SDS Log survive a server
-restart when `[storage]` is enabled (see "Persistent history" above).
+registrations, the registration event log) is in-memory and resets when the
+BTS's telemetry/control connection restarts; calls, SDS, and the Telemetry SDS
+Log survive a server restart when `[storage]` is enabled (see "Persistent
+history" above).

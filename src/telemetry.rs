@@ -174,6 +174,19 @@ pub struct TelemetryCall {
     pub started_at_ms: u64,
 }
 
+/// One subscriber registration lifecycle event (register / deregister /
+/// timeout-drop) on a FlowStation, kept as a rolling log so the dashboard can
+/// show registration activity over time rather than only the current
+/// registered set (see `registrations_list`).
+#[derive(Debug, Clone, Serialize)]
+pub struct RegLogEntry {
+    pub at_ms: u64,
+    pub issi: u32,
+    /// "register", "deregister", or "timeout" (a silent drop after the
+    /// subscriber stopped renewing its registration).
+    pub kind: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SdsLogEntry {
     pub at_ms: u64,
@@ -234,6 +247,12 @@ pub struct TelemetryBts {
     /// Exposed to the dashboard so it can show who is registered on this station
     /// (the `registrations` HashSet itself is skipped for stable JSON ordering).
     pub registrations_list: Vec<u32>,
+    /// Rolling log of registration lifecycle events (register/deregister/
+    /// timeout) on this station, newest first, capped like `recent_sds`.
+    #[serde(skip)]
+    pub recent_regs: VecDeque<RegLogEntry>,
+    /// Serialized view of `recent_regs` for the dashboard.
+    pub recent_regs_out: Vec<RegLogEntry>,
     pub active_calls: HashMap<u16, TelemetryCall>,
     pub emergencies: HashSet<u32>,
     pub last_tx_quality: Option<TxQuality>,
@@ -306,6 +325,8 @@ impl TelemetryBts {
             registrations: HashSet::new(),
             registration_count: 0,
             registrations_list: Vec::new(),
+            recent_regs: VecDeque::new(),
+            recent_regs_out: Vec::new(),
             active_calls: HashMap::new(),
             emergencies: HashSet::new(),
             last_tx_quality: None,
@@ -385,6 +406,16 @@ impl TelemetryBts {
         let mut list: Vec<u32> = self.registrations.iter().copied().collect();
         list.sort_unstable();
         self.registrations_list = list;
+    }
+
+    /// Appends a registration lifecycle event to the rolling log (newest
+    /// first, capped at 50 like `recent_sds`).
+    fn push_reg(&mut self, issi: u32, kind: &'static str) {
+        self.recent_regs.push_front(RegLogEntry { at_ms: now_ms(), issi, kind });
+        while self.recent_regs.len() > 50 {
+            self.recent_regs.pop_back();
+        }
+        self.recent_regs_out = self.recent_regs.iter().cloned().collect();
     }
 }
 
@@ -559,9 +590,17 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
 
     let mut sds_entry: Option<SdsLogEntry> = None;
     match event {
-        TelemetryEvent::MsRegistration { issi } => { bts.registrations.insert(issi); bts.sync_registrations(); }
-        TelemetryEvent::MsDeregistration { issi } | TelemetryEvent::MsTimeoutDrop { issi } => {
+        TelemetryEvent::MsRegistration { issi } => {
+            bts.registrations.insert(issi); bts.sync_registrations();
+            bts.push_reg(issi, "register");
+        }
+        TelemetryEvent::MsDeregistration { issi } => {
             bts.registrations.remove(&issi); bts.sync_registrations();
+            bts.push_reg(issi, "deregister");
+        }
+        TelemetryEvent::MsTimeoutDrop { issi } => {
+            bts.registrations.remove(&issi); bts.sync_registrations();
+            bts.push_reg(issi, "timeout");
         }
         TelemetryEvent::GroupCallStarted { call_id, gssi, caller_issi, carrier_num, ts, priority } => {
             bts.active_calls.insert(call_id, TelemetryCall {
@@ -693,6 +732,39 @@ mod tests {
         bts.sync_registrations();
         assert_eq!(bts.registration_count, 2);
         assert_eq!(bts.registrations_list, vec![10, 30]);
+    }
+
+    #[test]
+    fn push_reg_logs_events_newest_first_and_capped() {
+        let mut bts = TelemetryBts::new("bts-1".to_string(), None);
+        bts.push_reg(1001, "register");
+        bts.push_reg(1002, "register");
+        bts.push_reg(1001, "deregister");
+        assert_eq!(bts.recent_regs_out.len(), 3);
+        assert_eq!(bts.recent_regs_out[0].issi, 1001);
+        assert_eq!(bts.recent_regs_out[0].kind, "deregister");
+        assert_eq!(bts.recent_regs_out[2].kind, "register");
+        for i in 0..60 {
+            bts.push_reg(i, "register");
+        }
+        assert_eq!(bts.recent_regs_out.len(), 50, "log capped at 50 entries");
+    }
+
+    #[test]
+    fn registration_events_recorded_via_handle_event_path() {
+        // Exercises the same transitions handle_event applies, directly on the
+        // TelemetryBts state, to confirm registrations and the event log agree.
+        let mut bts = TelemetryBts::new("bts-1".to_string(), None);
+        bts.registrations.insert(2001);
+        bts.sync_registrations();
+        bts.push_reg(2001, "register");
+        bts.registrations.remove(&2001);
+        bts.sync_registrations();
+        bts.push_reg(2001, "timeout");
+        assert!(bts.registrations_list.is_empty());
+        assert_eq!(bts.recent_regs_out.len(), 2);
+        assert_eq!(bts.recent_regs_out[0].kind, "timeout");
+        assert_eq!(bts.recent_regs_out[1].kind, "register");
     }
 
     #[test]

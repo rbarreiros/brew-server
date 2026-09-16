@@ -30,6 +30,7 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/calls", get(calls_page))
         .route("/sds", get(sds_page))
         .route("/telemetry-sds", get(telemetry_sds_page))
+        .route("/registrations", get(registrations_page))
         .route("/map", get(map_page))
         .route("/api/status", get(snapshot))
         .route("/api/live", get(live))
@@ -164,6 +165,13 @@ static TELEMETRY_SDS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::ne
     &["Time", "BTS", "Dir", "From", "To", "Type", "Text"], 5, "No telemetry SDS yet",
 ));
 
+static REGISTRATIONS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| log_page(
+    "Mobile Station Registrations", "/api/telemetry",
+    "d.flatMap(s=>(s.recent_regs_out||[]).map(x=>({...x,bts:s.id}))).sort((a,b)=>b.at_ms-a.at_ms).slice(0,100)",
+    "`<tr><td>${dt(x.at_ms)}</td><td>${esc(x.bts)}</td><td>${x.issi}</td><td>${x.kind==='register'?'<span class=\"badge badge-reg-in\">Registered</span>':x.kind==='deregister'?'<span class=\"badge badge-reg-out\">Deregistered</span>':'<span class=\"badge badge-reg-timeout\">Timed out</span>'}</td></tr>`",
+    &["Time", "BTS", "ISSI", "Event"], 15, "No registration events yet",
+));
+
 /// Standalone map page. Plots the latest decoded MS positions on an
 /// OpenStreetMap base layer using Leaflet (loaded from unpkg CDN). Positions
 /// come only from *textual* beacons; the page explains that binary LIP is not
@@ -224,6 +232,7 @@ load();setInterval(load,3000);
 pub async fn calls_page() -> Html<&'static str> { Html(CALLS_HTML.as_str()) }
 pub async fn sds_page() -> Html<&'static str> { Html(SDS_HTML.as_str()) }
 pub async fn telemetry_sds_page() -> Html<&'static str> { Html(TELEMETRY_SDS_HTML.as_str()) }
+pub async fn registrations_page() -> Html<&'static str> { Html(REGISTRATIONS_HTML.as_str()) }
 pub async fn snapshot(State(state): State<Arc<AppState>>) -> Json<crate::monitor::Snapshot> { let i=state.inner.read().await; let counts=(i.clients.len(),i.subscribers.len(),i.group_clients.len()); drop(i); Json(state.monitor.snapshot(counts.0,counts.1,counts.2).await) }
 pub async fn live(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> impl IntoResponse { ws.on_upgrade(move |s| live_socket(state,s)) }
 async fn live_socket(state: Arc<AppState>, mut socket: WebSocket) { let mut rx=state.monitor.subscribe(); while let Ok(ev)=rx.recv().await { if socket.send(Message::Text(serde_json::to_string(&ev).unwrap().into())).await.is_err(){break;} } }
@@ -267,14 +276,16 @@ const STYLE: &str = r#"<style>
 .reg-list{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}.reg-issi{background:#0d1826;border:1px solid #203047;border-radius:5px;padding:3px 7px;font-size:12px;font-family:ui-monospace,monospace;color:#cfe0f2}.reg-count{font-size:12px;color:#8fa2b8}
 .navlinks{display:flex;gap:12px;flex-wrap:wrap}.navlink{display:block;background:#0d1826;border:1px solid #203047;border-radius:10px;padding:14px 18px;color:#cfe0f2;text-decoration:none;font-size:14px;font-weight:600;transition:background .1s}.navlink:hover{background:#16273c;border-color:#2c405c}.navlink .sub{display:block;font-size:12px;font-weight:400;color:#8fa2b8;margin-top:4px}
 .backlink{color:#8fa2b8;text-decoration:none;font-size:13px}.backlink:hover{color:#cfe0f2}
+h2 .backlink{text-transform:none;letter-spacing:normal;margin-left:8px}
 .badge{display:inline-block;padding:2px 7px;border-radius:99px;font-size:11px;font-weight:600}.badge-pos{background:#123047;color:#5cc0f2;border:1px solid #1d4a66}.badge-sds{background:#203047;color:#8fa2b8}.pos-undec{color:#8fa2b8;font-style:italic}
+.badge-reg-in{background:#173822;color:#52d273;border:1px solid #245c37}.badge-reg-out{background:#203047;color:#8fa2b8;border:1px solid #2c405c}.badge-reg-timeout{background:#3a2f12;color:#e8b93d;border:1px solid #5c4a1d}
 </style>"#;
 
 const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><header><h1>TETRA NETWORK MONITOR</h1><div><span class=live></span><span id=status>Live</span></div></header><main class=wrap>
 <div class=banner id=emergency-banner></div>
-<section class=cards><div class=card><div class=muted>BlueStations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Logs</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-FlowStation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a></div></section>
+<section class=cards><div class=card><div class=muted>BlueStations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Logs</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-FlowStation SDS stream</span></a><a class=navlink href="/registrations">MS Registrations<span class=sub>Register/deregister/timeout events</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a></div></section>
 <section class=panel><h2>FlowStation Telemetry</h2><div class=bts-grid id=telemetry-stations></div></section>
-<section class=panel><h2>Registered Subscribers</h2><div class=bts-grid id=registrations></div></section>
+<section class=panel><h2>Registered Subscribers <a class=backlink href="/registrations">(view registration log &rarr;)</a></h2><div class=bts-grid id=registrations></div></section>
 <section class=panel><h2>FlowStation Control</h2><div class=bts-grid id=control-stations></div></section>
 </main><script>
 let snap=null;let tsnap=null;const $=id=>document.getElementById(id);const dt=x=>new Date(x).toLocaleTimeString();const dur=(a,b)=>Math.max(0,Math.floor(((b||Date.now())-a)/1000))+'s';const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -429,6 +440,7 @@ mod tests {
         assert!(h.contains("href=\"/calls\""));
         assert!(h.contains("href=\"/sds\""));
         assert!(h.contains("href=\"/telemetry-sds\""));
+        assert!(h.contains("href=\"/registrations\""));
         // the three moved tables must be gone from the main page
         assert!(!h.contains("id=sdstable"), "recent SDS table removed from index");
         assert!(!h.contains("id=history"), "recent calls table removed from index");
@@ -441,6 +453,7 @@ mod tests {
             ("calls", CALLS_HTML.as_str(), "/api/status"),
             ("sds", SDS_HTML.as_str(), "/api/status"),
             ("telemetry", TELEMETRY_SDS_HTML.as_str(), "/api/telemetry"),
+            ("registrations", REGISTRATIONS_HTML.as_str(), "/api/telemetry"),
         ] {
             assert!(!html.contains("__STYLE__"), "{name}: style substituted");
             assert!(html.contains("id=log"), "{name}: log table body present");
