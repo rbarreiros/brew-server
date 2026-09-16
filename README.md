@@ -457,6 +457,10 @@ the Brew `[tls]` block.
 
 The dashboard shows connected BlueStations, registered subscribers, groups, and
 active/live group and private calls with durations and voice-frame counts. The
+**BlueStations** count reflects only `Basestation`-mode connections (actual
+FlowStation gateways); a `Terminal`-mode connection (a mobile station
+registering directly over the Brew protocol) is not a BlueStation and is
+excluded from this count — it is counted instead by **Subscribers**. The
 **Subscribers** count reflects only `Terminal`-mode registrations (actual
 mobile stations); a `Basestation` (BlueStation gateway) can also hold a
 subscriber registration on a client's behalf, but is not itself an MS and is

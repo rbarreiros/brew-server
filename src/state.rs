@@ -105,6 +105,15 @@ impl Inner {
     pub fn ms_registration_count(&self) -> usize {
         self.subscribers.values().filter(|s| s.mode == ClientMode::Terminal).count()
     }
+
+    /// Number of connected clients that are actual BlueStation (FlowStation)
+    /// gateways, i.e. `Basestation`-mode connections. A `Terminal`-mode
+    /// connection is a mobile station registering directly over the Brew
+    /// protocol, not a BlueStation, so it is excluded here (it is counted
+    /// instead by `ms_registration_count`).
+    pub fn bluestation_count(&self) -> usize {
+        self.clients.values().filter(|c| c.mode == ClientMode::Basestation).count()
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +145,42 @@ mod ms_registration_tests {
     #[test]
     fn zero_when_no_subscribers() {
         assert_eq!(Inner::default().ms_registration_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod bluestation_count_tests {
+    use super::*;
+
+    fn client(mode: ClientMode) -> Client {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Client { tx, mode, version: ConnVersion::default() }
+    }
+
+    #[test]
+    fn counts_only_basestation_mode_clients() {
+        let mut inner = Inner::default();
+        inner.clients.insert(Uuid::new_v4(), client(ClientMode::Basestation));
+        inner.clients.insert(Uuid::new_v4(), client(ClientMode::Basestation));
+        inner.clients.insert(Uuid::new_v4(), client(ClientMode::Terminal));
+        inner.clients.insert(Uuid::new_v4(), client(ClientMode::Terminal));
+        // Reproduces the reported scenario: 2 Terminal MS + 2 Basestation
+        // (FlowStation) connections must show 2 BlueStations, not 4.
+        assert_eq!(inner.bluestation_count(), 2);
+        assert_eq!(inner.clients.len(), 4, "raw client map still holds every connection");
+    }
+
+    #[test]
+    fn zero_when_only_terminals_connected() {
+        let mut inner = Inner::default();
+        inner.clients.insert(Uuid::new_v4(), client(ClientMode::Terminal));
+        inner.clients.insert(Uuid::new_v4(), client(ClientMode::Terminal));
+        assert_eq!(inner.bluestation_count(), 0);
+    }
+
+    #[test]
+    fn zero_when_no_clients() {
+        assert_eq!(Inner::default().bluestation_count(), 0);
     }
 }
 
