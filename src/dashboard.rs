@@ -340,7 +340,7 @@ static CONNECTIONS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(
 
 <section class=panel><h2>Brew Connections<span class=backlink id=bc-count></span></h2><table><thead><tr><th>ID</th><th>Mode</th><th>Version</th><th>Remote address</th><th>Connected</th><th>Registered ISSIs</th></tr></thead><tbody id=brew-clients></tbody></table></section>
 
-<section class=panel><h2>Mobile Stations<span class=backlink id=ms-count></span></h2><table><thead><tr><th>ISSI</th><th>Basestation</th><th>Basestation address</th><th>Groups</th></tr></thead><tbody id=mobile-stations></tbody></table></section>
+<section class=panel><h2>Registered Subscribers<span class=backlink id=ms-count></span></h2><table><thead><tr><th>ISSI</th><th>Registered via</th><th>Basestation</th><th>Basestation address</th><th>Groups</th></tr></thead><tbody id=mobile-stations></tbody></table></section>
 
 <section class=panel><h2>SIP Registrations<span class=backlink id=sip-count></span></h2><div class=banner id=sip-disabled-banner>SIP subsystem is disabled.</div><table><thead><tr><th>AOR</th><th>Contact</th><th>Source</th><th>User-Agent</th><th>Registered</th><th>Expires</th><th>Auth</th></tr></thead><tbody id=sip-regs></tbody></table></section>
 
@@ -358,7 +358,7 @@ async function load(){{
     $('bc-count').textContent=' ('+d.brew_clients.length+')';
     $('ms-count').textContent=' ('+d.mobile_stations.length+')';
     $('brew-clients').innerHTML=d.brew_clients.map(c=>`<tr><td class=muted>${{esc(c.id).slice(0,8)}}</td><td>${{esc(c.mode)}}</td><td>${{c.version}}</td><td>${{esc(c.remote_addr||'-')}}</td><td>${{ago(c.connected_at_ms)}}</td><td>${{c.registered_issis}}</td></tr>`).join('')||'<tr><td colspan=6 class=muted>No Brew connections</td></tr>';
-    $('mobile-stations').innerHTML=d.mobile_stations.map(m=>`<tr><td>${{m.issi}}</td><td class=muted>${{esc(m.basestation_id).slice(0,8)}}</td><td>${{esc(m.basestation_addr||'-')}}</td><td>${{(m.groups||[]).join(', ')||'-'}}</td></tr>`).join('')||'<tr><td colspan=4 class=muted>No registered mobile stations</td></tr>';
+    $('mobile-stations').innerHTML=d.mobile_stations.map(m=>`<tr><td>${{m.issi}}</td><td>${{esc(m.mode)}}</td><td class=muted>${{esc(m.basestation_id).slice(0,8)}}</td><td>${{esc(m.basestation_addr||'-')}}</td><td>${{(m.groups||[]).join(', ')||'-'}}</td></tr>`).join('')||'<tr><td colspan=5 class=muted>No registered subscribers</td></tr>';
     $('sip-disabled-banner').style.display=d.sip.enabled?'none':'block';
     $('sip-count').textContent=' ('+d.sip.registrations.length+')';
     $('sip-regs').innerHTML=d.sip.registrations.map(r=>`<tr><td>${{esc(r.aor)}}</td><td class=muted>${{esc(r.contact)}}</td><td>${{esc(r.source)}}</td><td class=muted>${{esc(r.user_agent||'-')}}</td><td>${{dt(r.registered_at_ms)}}</td><td>${{dt(r.expires_at_ms)}}</td><td>${{yn(r.authenticated)}}</td></tr>`).join('')||'<tr><td colspan=7 class=muted>No SIP registrations</td></tr>';
@@ -492,11 +492,12 @@ pub async fn map_page() -> Html<&'static str> { Html(MAP_HTML.as_str()) }
 /// with `enabled=false` when SIP is not running, so the page can render a clear
 /// disabled state rather than erroring.
 /// Live "who's connected right now" snapshot: Brew connections (Basestations
-/// and any direct Terminal/brew mobile clients), registered mobile stations
-/// (Terminal-mode subscribers -- actual MS, not a Basestation registering on
-/// one's behalf), and SIP registrations/trunks. Unlike `/api/registrations`
-/// (a historical event log), this reflects only what is connected/registered
-/// at this instant.
+/// and any direct Terminal/brew mobile clients), registered subscribers
+/// (every ISSI in `inner.subscribers`, whether registered directly by a
+/// Terminal-mode MS or on its behalf by a Basestation gateway -- matches
+/// what the main dashboard's "Registered Subscribers" panel shows), and SIP
+/// registrations/trunks. Unlike `/api/registrations` (a historical event
+/// log), this reflects only what is connected/registered at this instant.
 pub async fn connections_snapshot(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let (brew_clients, mobile_stations) = {
         let inner = state.inner.read().await;
@@ -512,11 +513,11 @@ pub async fn connections_snapshot(State(state): State<Arc<AppState>>) -> Json<se
             })
         }).collect();
         let mobile_stations: Vec<_> = inner.subscribers.iter()
-            .filter(|(_, s)| s.mode == crate::state::ClientMode::Terminal)
             .map(|(issi, s)| {
                 let basestation = inner.clients.get(&s.client_id);
                 serde_json::json!({
                     "issi": issi,
+                    "mode": s.mode.as_str(),
                     "basestation_id": s.client_id.to_string(),
                     "basestation_addr": basestation.and_then(|c| c.remote_addr).map(|a| a.to_string()),
                     "groups": s.groups.iter().copied().collect::<Vec<_>>(),
@@ -768,7 +769,7 @@ h2 .backlink{text-transform:none;letter-spacing:normal;margin-left:8px}
 
 const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><header><h1>TETRA NETWORK MONITOR</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=ver>v__VERSION__</div></div></header><main class=wrap>
 <div class=banner id=emergency-banner></div>
-<section class=cards><div class=card><div class=muted>Basestations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Logs</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-Basestation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/connections">Live Connections<span class=sub>Who's connected now: Brew, MS &amp; SIP</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a><a class=navlink href="/settings">Settings<span class=sub>Edit &amp; save server configuration</span></a></div></section>
+<section class=cards><div class=card><div class=muted>Basestations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Menu</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-Basestation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/connections">Live Connections<span class=sub>Who's connected now: Brew, MS &amp; SIP</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a><a class=navlink href="/settings">Settings<span class=sub>Edit &amp; save server configuration</span></a></div></section>
 <section class=panel><h2>Basestation Telemetry</h2><div class=bts-grid id=telemetry-stations></div></section>
 <section class=panel><h2>Registered Subscribers <a class=backlink href="/registrations">(view registration log &rarr;)</a></h2><div class=bts-grid id=registrations></div></section>
 <section class=panel><h2>Basestation Control</h2><div class=bts-grid id=control-stations></div></section>
