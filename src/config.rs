@@ -13,6 +13,12 @@ pub struct Config {
     pub allow_multiple_calls_per_group: bool,
     pub higher_priority_number_wins: bool,
     pub preempt_cause: u8,
+    /// Maximum duration (seconds) a Brew call (private or group -- a station
+    /// call between BlueStations/mobiles, or the Brew leg of a SIP-bridged
+    /// call) may run before the server force-ends it with a normal
+    /// CALL_RELEASE/CALL_GROUP_IDLE, the same as if a participant had hung
+    /// up. 0 disables the limit.
+    pub max_call_duration_seconds: u64,
     pub auth: AuthConfig,
     pub tls: TlsConfig,
     pub telemetry: TelemetryConfig,
@@ -170,6 +176,11 @@ pub struct SipConfig {
     /// Seconds a REGISTER binding is kept before it is considered expired when
     /// the client does not supply its own Expires.
     pub registration_ttl_seconds: u64,
+    /// Maximum duration (seconds) a SIP call may run before the server
+    /// force-ends it: a BYE to the SIP peer(s), and, for a call bridged to
+    /// Brew, the same CALL_RELEASE the Brew side gets from a normal hangup.
+    /// 0 disables the limit.
+    pub max_call_duration_seconds: u64,
     /// Statically provisioned SIP extensions (user/pass), keyed by the AOR user
     /// part (the number/name the extension registers as).
     pub extensions: HashMap<String, SipExtensionConfig>,
@@ -190,6 +201,7 @@ impl Default for SipConfig {
             rtp_port_max: 17000,
             realm: "brew-server".into(),
             registration_ttl_seconds: 3600,
+            max_call_duration_seconds: 14400,
             extensions: HashMap::new(),
             trunks: HashMap::new(),
             routes: Vec::new(),
@@ -344,6 +356,7 @@ impl Default for Config {
             allow_multiple_calls_per_group: false,
             higher_priority_number_wins: true,
             preempt_cause: 1,
+            max_call_duration_seconds: 14400,
             auth: AuthConfig::default(),
             tls: TlsConfig::default(),
             telemetry: TelemetryConfig::default(),

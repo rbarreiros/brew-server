@@ -8,7 +8,7 @@ use crate::{
     },
     state::{ActiveCall, AppState, CallKind, ClientId, SdsRoute, Subscriber},
 };
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::{collections::{HashMap, HashSet}, sync::Arc, time::Instant};
 use tracing::{debug, info, warn};
 
 pub async fn handle_packet(state: Arc<AppState>, source: ClientId, raw: Vec<u8>) {
@@ -154,6 +154,7 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
         destination: gt.destination,
         priority: gt.priority,
         peers: targets.clone(),
+        started_at: std::time::Instant::now(),
     });
     let txs = targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| c.tx.clone())).collect::<Vec<_>>();
     drop(inner);
@@ -344,7 +345,7 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
     };
     if target_client == source { return; }
     let peers = HashSet::from([target_client]);
-    inner.calls.insert(id, ActiveCall { kind: CallKind::Private, owner: source, source_issi, destination, priority: 0, peers: peers.clone() });
+    inner.calls.insert(id, ActiveCall { kind: CallKind::Private, owner: source, source_issi, destination, priority: 0, peers: peers.clone(), started_at: std::time::Instant::now() });
     let tx = inner.clients.get(&target_client).map(|c| c.tx.clone());
     drop(inner);
     if let Some(tx) = tx { let _ = tx.send(raw); }
@@ -377,6 +378,41 @@ async fn route_call_frame(state: &Arc<AppState>, source: ClientId, id: uuid::Uui
     drop(inner);
     state.monitor.voice_frame(id).await;
     for tx in txs { let _ = tx.send(raw.clone()); }
+}
+
+/// Periodically ends Brew calls (private or group -- a station call directly
+/// between Basestations/mobiles, or the Brew leg of a SIP-bridged call) that
+/// have run longer than `Config::max_call_duration_seconds`. Reuses `end_call`
+/// so a timed-out call ends exactly like a normal hangup (CALL_RELEASE /
+/// CALL_GROUP_IDLE to participants, dashboard event, SIP-bridge teardown),
+/// not a silent kill. A no-op (never spawned as a busy loop) when the limit
+/// is 0 (disabled) -- see `main.rs`, which only spawns this when non-zero.
+/// Pure filter: which calls in `calls` have been running at least `limit`.
+/// Split out from `run_call_duration_sweep` so it's testable without an
+/// actual timer/interval.
+fn expired_calls(calls: &HashMap<uuid::Uuid, ActiveCall>, limit: std::time::Duration) -> Vec<(uuid::Uuid, ClientId, CallKind)> {
+    calls.iter()
+        .filter(|(_, call)| call.started_at.elapsed() >= limit)
+        .map(|(id, call)| (*id, call.owner, call.kind))
+        .collect()
+}
+
+pub async fn run_call_duration_sweep(state: Arc<AppState>) {
+    let limit = std::time::Duration::from_secs(state.config.max_call_duration_seconds);
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+    loop {
+        ticker.tick().await;
+        let expired = {
+            let inner = state.inner.read().await;
+            expired_calls(&inner.calls, limit)
+        };
+        for (id, owner, kind) in expired {
+            let release_state = if kind == CallKind::Group { protocol::CALL_GROUP_IDLE } else { protocol::CALL_RELEASE };
+            let raw = protocol::build_call_cause(release_state, &id, 0);
+            warn!(uuid=%id, ?kind, limit_secs = state.config.max_call_duration_seconds, "call exceeded max duration; force-ending");
+            end_call(&state, owner, id, raw).await;
+        }
+    }
 }
 
 async fn end_call(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: Vec<u8>) {
@@ -530,5 +566,45 @@ mod position_tests {
         let raw = framed(b"\x0144.4353, 26.1092");
         let (lat, lon, _) = extract_sds_position(&raw).expect("text decode");
         assert!((lat - 44.4353).abs() < 0.01 && (lon - 26.1092).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod call_duration_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn call(started_at: std::time::Instant, kind: CallKind) -> ActiveCall {
+        ActiveCall {
+            kind,
+            owner: uuid::Uuid::new_v4(),
+            source_issi: 1001,
+            destination: 90,
+            priority: 0,
+            peers: HashSet::new(),
+            started_at,
+        }
+    }
+
+    #[test]
+    fn finds_only_calls_at_or_past_the_limit() {
+        let now = std::time::Instant::now();
+        let mut calls = HashMap::new();
+        let old_id = uuid::Uuid::new_v4();
+        calls.insert(old_id, call(now - Duration::from_secs(120), CallKind::Private));
+        let fresh_id = uuid::Uuid::new_v4();
+        calls.insert(fresh_id, call(now - Duration::from_secs(5), CallKind::Group));
+
+        let expired = expired_calls(&calls, Duration::from_secs(60));
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, old_id);
+    }
+
+    #[test]
+    fn empty_when_nothing_exceeds_limit() {
+        let now = std::time::Instant::now();
+        let mut calls = HashMap::new();
+        calls.insert(uuid::Uuid::new_v4(), call(now, CallKind::Private));
+        assert!(expired_calls(&calls, Duration::from_secs(60)).is_empty());
     }
 }

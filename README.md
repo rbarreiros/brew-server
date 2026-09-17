@@ -131,6 +131,7 @@ route_without_affiliations = true
 allow_multiple_calls_per_group = true
 higher_priority_number_wins = true
 preempt_cause = 1
+max_call_duration_seconds = 14400 # force-end a Brew call (station or SIP-bridged) past this; 0 disables
 
 [tls]
 enabled = false
@@ -372,6 +373,7 @@ rtp_port_min = 16000             # RTP relay media port pool
 rtp_port_max = 17000
 realm = "brew-server"
 registration_ttl_seconds = 3600
+max_call_duration_seconds = 14400 # force-end a SIP call (and its Brew leg, if bridged) past this; 0 disables
 ```
 
 The subsystem provides:
@@ -491,8 +493,16 @@ enabled = false
 - Dashboard: `http://<server>:9003/`
 - MS map (linked from the dashboard): `/map` — plots decoded MS positions;
   JSON at `/api/positions`
+- **Live connections** (linked from the dashboard): `/connections` — who is
+  connected/registered *right now*: Brew connections (Basestations and any
+  direct Terminal/mobile clients, with remote address and how long they've
+  been connected), registered mobile stations (Terminal-mode subscribers —
+  actual MS, cross-referenced to the Basestation they're on), and SIP
+  registrations/trunks. JSON at `/api/connections`. This is a live snapshot,
+  distinct from `/registrations` below, which is a historical event log.
 - Log pages (linked from the dashboard): `/calls` (recent calls, 10/page),
-  `/sds` (recent SDS, 10/page), `/telemetry-sds` (telemetry SDS log, 5/page)
+  `/sds` (recent SDS, 10/page), `/telemetry-sds` (telemetry SDS log, 5/page),
+  `/registrations` (register/deregister/timeout event log)
 - JSON snapshot: `/api/status`
 - Live event WebSocket: `/api/live`
 - Basestation telemetry snapshot: `/api/telemetry` (empty unless the `[telemetry]`

@@ -152,6 +152,18 @@ impl BrewBridge {
         self.teardown(&call_id).await;
     }
 
+    /// Force-ends a call this bridge placed, in either direction, regardless
+    /// of who or what triggered it (e.g. the SIP max-call-duration sweep in
+    /// `transport::run`). Sends a best-effort BYE to the SIP peer if this leg
+    /// stored dialog info, then runs the same cleanup/Brew-side notify as any
+    /// other teardown. A no-op for a call this bridge did not place.
+    pub async fn force_end(&self, call_id: &str) {
+        if let Some(bye) = self.legs.read().await.get(call_id).and_then(|l| l.bye.clone()) {
+            self.send_bye(call_id, &bye).await;
+        }
+        self.teardown(call_id).await;
+    }
+
     async fn send_bye(&self, call_id: &str, d: &DialogBye) {
         use crate::sip::message::Method;
         let mut bye = SipMessage::new_request(Method::Bye, d.request_uri.clone());
@@ -287,7 +299,7 @@ impl BrewBridge {
         let (virtual_tx, virtual_rx) = mpsc::unbounded_channel();
         let target_tx = {
             let mut inner = self.app.inner.write().await;
-            inner.clients.insert(virtual_client, Client { tx: virtual_tx, mode: ClientMode::Terminal, version: ConnVersion::V1 });
+            inner.clients.insert(virtual_client, Client { tx: virtual_tx, mode: ClientMode::Terminal, version: ConnVersion::V1, remote_addr: None, connected_at_ms: crate::telemetry::now_ms() });
             inner.calls.insert(brew_call_id, ActiveCall {
                 kind: CallKind::Private,
                 owner: virtual_client,
@@ -295,6 +307,7 @@ impl BrewBridge {
                 destination: issi,
                 priority: 0,
                 peers: HashSet::from([target_client]),
+                started_at: std::time::Instant::now(),
             });
             inner.clients.get(&target_client).map(|c| c.tx.clone())
         };
@@ -414,7 +427,7 @@ impl BrewBridge {
         let (virtual_tx, virtual_rx) = mpsc::unbounded_channel();
         let target_txs = {
             let mut inner = self.app.inner.write().await;
-            inner.clients.insert(virtual_client, Client { tx: virtual_tx, mode: ClientMode::Terminal, version: ConnVersion::V1 });
+            inner.clients.insert(virtual_client, Client { tx: virtual_tx, mode: ClientMode::Terminal, version: ConnVersion::V1, remote_addr: None, connected_at_ms: crate::telemetry::now_ms() });
             let members = inner.group_clients.entry(gssi).or_default();
             members.insert(virtual_client);
             let targets: HashSet<ClientId> = members.iter().copied().filter(|c| *c != virtual_client).collect();
@@ -425,6 +438,7 @@ impl BrewBridge {
                 destination: gssi,
                 priority: 0,
                 peers: targets.clone(),
+                started_at: std::time::Instant::now(),
             });
             inner.group_floor.insert(gssi, brew_call_id);
             targets.iter().filter_map(|c| inner.clients.get(c).map(|cl| cl.tx.clone())).collect::<Vec<_>>()
@@ -542,7 +556,7 @@ impl BrewBridge {
         let (virtual_tx, virtual_rx) = mpsc::unbounded_channel();
         let brew_target_tx = {
             let mut inner = self.app.inner.write().await;
-            inner.clients.insert(virtual_client, Client { tx: virtual_tx, mode: ClientMode::Terminal, version: ConnVersion::V1 });
+            inner.clients.insert(virtual_client, Client { tx: virtual_tx, mode: ClientMode::Terminal, version: ConnVersion::V1, remote_addr: None, connected_at_ms: crate::telemetry::now_ms() });
             inner.calls.insert(link.call_id, ActiveCall {
                 kind: CallKind::Private,
                 owner: link.client,
@@ -550,6 +564,7 @@ impl BrewBridge {
                 destination: 0,
                 priority: 0,
                 peers: HashSet::from([virtual_client]),
+                started_at: std::time::Instant::now(),
             });
             inner.clients.get(&link.client).map(|c| c.tx.clone())
         };

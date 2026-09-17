@@ -46,6 +46,13 @@ pub struct Client {
     /// discovery `X-Brew-Version` header (if any) and promoted lazily as v1
     /// message layouts are observed on the wire.
     pub version: ConnVersion,
+    /// Remote address of the WebSocket connection, when known. `None` for the
+    /// virtual clients the SIP bridge registers (see `sip::bridge`), which
+    /// have no real socket.
+    pub remote_addr: Option<std::net::SocketAddr>,
+    /// When this connection was accepted, for the dashboard's live
+    /// connections page.
+    pub connected_at_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +81,9 @@ pub struct ActiveCall {
     pub destination: u32,
     pub priority: u8,
     pub peers: HashSet<ClientId>,
+    /// When this call was set up, for max-call-duration enforcement and for
+    /// showing call age on the dashboard.
+    pub started_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -154,7 +164,7 @@ mod basestation_count_tests {
 
     fn client(mode: ClientMode) -> Client {
         let (tx, _rx) = mpsc::unbounded_channel();
-        Client { tx, mode, version: ConnVersion::default() }
+        Client { tx, mode, version: ConnVersion::default(), remote_addr: None, connected_at_ms: 0 }
     }
 
     #[test]

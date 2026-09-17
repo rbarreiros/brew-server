@@ -202,6 +202,14 @@ pub async fn run(app: Arc<crate::state::AppState>) -> anyhow::Result<()> {
         });
     }
 
+    // Periodic max-call-duration sweep, disabled (never spawned) when the
+    // limit is 0.
+    if cfg.max_call_duration_seconds > 0 {
+        let transport = transport.clone();
+        let limit = Duration::from_secs(cfg.max_call_duration_seconds);
+        tokio::spawn(async move { call_duration_sweep_loop(transport, limit).await; });
+    }
+
     // Receive loop.
     let mut buf = vec![0u8; 65535];
     loop {
@@ -558,6 +566,34 @@ async fn terminate_to_trunk(
     t.send_to(&invite, peer_addr).await;
     t.state.answer_call(&call_id).await;
     info!(trunk = %trunk, number = %number, %call_id, "bridged SIP call to trunk");
+}
+
+/// Ends SIP calls (plain SIP-SIP relays and Brew-bridged legs alike) that
+/// have run longer than `limit`. Mirrors `handle_bye`'s cleanup (abort the
+/// relay task if any, tear down a bridged leg via `BrewBridge::force_end`,
+/// remove from `SipState`) so a timed-out call is torn down the same way a
+/// real BYE would, not silently killed.
+async fn call_duration_sweep_loop(t: Arc<SipTransport>, limit: Duration) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        ticker.tick().await;
+        let now = now_ms();
+        let limit_ms = limit.as_millis() as u64;
+        let expired: Vec<String> = t.state.snapshot().await.active_calls.iter()
+            .filter(|c| now.saturating_sub(c.started_at_ms) >= limit_ms)
+            .map(|c| c.call_id.clone())
+            .collect();
+        for call_id in expired {
+            warn!(%call_id, limit_secs = limit.as_secs(), "SIP call exceeded max duration; force-ending");
+            if let Some(handle) = t.relay_tasks.lock().await.remove(&call_id) {
+                handle.abort();
+            }
+            if let Some(bridge) = t.bridge.read().await.clone() {
+                bridge.force_end(&call_id).await;
+            }
+            t.state.end_call(&call_id).await;
+        }
+    }
 }
 
 async fn handle_bye(t: Arc<SipTransport>, peer: SocketAddr, req: SipMessage) {

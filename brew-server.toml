@@ -6,6 +6,10 @@ fallback_broadcast_when_no_affiliations = true
 allow_multiple_calls_per_group = true
 higher_priority_number_wins = true
 preempt_cause = 1
+# Force-ends a Brew call (station-to-station private/group, or the Brew leg
+# of a SIP-bridged call) once it has run this long, the same as a normal
+# hangup (CALL_RELEASE/CALL_GROUP_IDLE). 0 disables the limit.
+max_call_duration_seconds = 14400
 
 [tls]
 enabled = true
@@ -92,6 +96,10 @@ rtp_port_min = 16000
 rtp_port_max = 17000
 realm = "brew-server"
 registration_ttl_seconds = 3600
+# Force-ends a SIP call once it has run this long: a BYE to the SIP peer(s),
+# and, for a call bridged to Brew, the matching CALL_RELEASE on that side.
+# 0 disables the limit.
+max_call_duration_seconds = 14400
 
 # SIP extensions (user/pass). The table key is the AOR user part the phone
 # registers as. `issi` optionally maps the extension to a TETRA subscriber so
