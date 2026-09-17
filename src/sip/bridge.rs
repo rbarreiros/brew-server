@@ -309,9 +309,23 @@ impl BrewBridge {
         // so the caller gets no ringback and, if the callee never picks up,
         // no error either. Instead these are sent by the call-control task
         // below, driven by the ISSI's actual SETUP_ACCEPT/ALERT/CONNECT_REQUEST.
+        //
+        // All three MUST share one To-tag: base_response_pub generates a
+        // fresh random one on every call (the request has none of its own),
+        // so building them independently gave each response a different tag
+        // -- whichever one we actually ended up sending established the real
+        // dialog with the peer, but a later BYE built from a *different*
+        // response's tag (e.g. `ok`'s, when only `ringing` was ever sent) is
+        // for a dialog the peer never heard of, and gets 481'd. One tag,
+        // reused everywhere, keeps the dialog identity consistent regardless
+        // of which response actually goes out.
+        let to_header = format!("{};tag={}", req.header("to").unwrap_or_default(), uuid::Uuid::new_v4().simple());
         let mut ringing = self.transport.base_response_pub(req, 180, "Ringing");
         let mut ok = self.transport.base_response_pub(req, 200, "OK");
-        let reject = self.transport.base_response_pub(req, 486, "Busy Here");
+        let mut reject = self.transport.base_response_pub(req, 486, "Busy Here");
+        for resp in [&mut ringing, &mut ok, &mut reject] {
+            resp.set_header("To", to_header.clone());
+        }
         for resp in [&mut ringing, &mut ok] {
             resp.push_header("Contact", format!("<sip:brew@{}>", self.transport.advertised_host));
         }
