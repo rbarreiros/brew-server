@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, net::SocketAddr, path::Path, path::PathBuf};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub listen: SocketAddr,
@@ -22,7 +22,7 @@ pub struct Config {
     pub sip: SipConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
     /// When enabled, completed calls and SDS are appended to a binary log and
@@ -41,7 +41,7 @@ impl Default for StorageConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TlsConfig {
     pub enabled: bool,
@@ -59,7 +59,7 @@ impl Default for TlsConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthConfig {
     pub enabled: bool,
@@ -79,7 +79,7 @@ impl Default for AuthConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TelemetryConfig {
     pub enabled: bool,
@@ -100,7 +100,7 @@ impl Default for TelemetryConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ControlConfig {
     pub enabled: bool,
@@ -121,7 +121,7 @@ impl Default for ControlConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DashboardConfig {
     pub enabled: bool,
@@ -152,7 +152,7 @@ impl Default for DashboardConfig {
 /// runtime through the dashboard control API; runtime additions are held in
 /// memory only and are lost on the config-file reload/restart, so anything that
 /// must survive a restart belongs in the file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SipConfig {
     /// Master switch for the whole SIP subsystem.
@@ -199,7 +199,7 @@ impl Default for SipConfig {
 
 /// A provisioned SIP extension: a username/password the server authenticates on
 /// REGISTER and INVITE. The extension's AOR user part is the map key.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SipExtensionConfig {
     /// Shared secret for SIP digest auth. Required in practice; an empty
@@ -226,7 +226,7 @@ impl Default for SipExtensionConfig {
 }
 
 /// How a trunk associates with a remote peer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrunkDirection {
     /// The remote peer registers to us (we are the registrar). We learn its
@@ -245,7 +245,7 @@ impl Default for TrunkDirection {
 }
 
 /// A provisioned SIP trunk to a VoIP gateway (Asterisk, an ITSP, another PBX).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SipTrunkConfig {
     pub direction: TrunkDirection,
@@ -281,7 +281,7 @@ impl Default for SipTrunkConfig {
 }
 
 /// One side of a voice route: which kind of endpoint, and its address.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RouteEndpoint {
     /// A SIP extension identified by its AOR user part.
@@ -297,7 +297,7 @@ pub enum RouteEndpoint {
 
 /// A voice route rule. A call whose origin matches `from` and whose dialled
 /// destination matches `match_pattern` is bridged to `to`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VoiceRouteConfig {
     /// Operator label for the route.
@@ -356,6 +356,35 @@ impl Config {
             .with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
+
+    /// Parses `text` as a config, same rules `load` applies to a file's
+    /// contents. Used by the dashboard's config editor to validate a proposed
+    /// change before writing it to disk.
+    pub fn parse(text: &str) -> Result<Self> {
+        toml::from_str(text).context("parsing config")
+    }
+
+    /// Renders this config back to TOML, the same shape `load` accepts. Used
+    /// both to seed the dashboard's editor with the live config and to
+    /// serialize a dashboard-made structured edit (e.g. one trunk added)
+    /// before it is written to disk.
+    pub fn to_toml_pretty(&self) -> Result<String> {
+        toml::to_string_pretty(self).context("serializing config to TOML")
+    }
+
+    /// Atomically writes `text` to `path`: write to a sibling temp file, then
+    /// rename over the target. A crash or concurrent read mid-write never
+    /// observes a partial file, and the existing `config_watcher` (which polls
+    /// the file's mtime) picks up the change as a single event.
+    pub fn save_atomic(path: impl AsRef<Path>, text: &str) -> Result<()> {
+        let path = path.as_ref();
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, text)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -366,5 +395,53 @@ mod tests {
     fn default_config_loads_when_file_missing() {
         let cfg = Config::load("/nonexistent/path/brew-server.toml").unwrap();
         assert_eq!(cfg.websocket_subprotocol, Config::default().websocket_subprotocol);
+    }
+
+    /// The dashboard config editor relies on serialize(edit)->parse being
+    /// lossless for every shape actually used in a real config, including the
+    /// trickiest bits: HashMap-keyed extensions/trunks and the internally
+    /// tagged `RouteEndpoint` enum inside `Option`.
+    #[test]
+    fn to_toml_pretty_round_trips_through_parse() {
+        let mut cfg = Config::default();
+        cfg.sip.enabled = true;
+        cfg.sip.extensions.insert("1001".into(), SipExtensionConfig {
+            password: "secret".into(),
+            display_name: "Front Desk".into(),
+            issi: 42,
+            allow_outbound: true,
+        });
+        cfg.sip.trunks.insert("asterisk".into(), SipTrunkConfig {
+            direction: TrunkDirection::Outbound,
+            remote_host: "10.0.0.5:5060".into(),
+            username: "brew".into(),
+            password: "hunter2".into(),
+            realm: "asterisk".into(),
+            register_interval_seconds: 120,
+            enabled: true,
+        });
+        cfg.sip.routes.push(VoiceRouteConfig {
+            name: "outbound".into(),
+            match_pattern: "9*".into(),
+            to: Some(RouteEndpoint::SipTrunk { trunk: "asterisk".into(), number: "".into() }),
+            from: Some(RouteEndpoint::BrewPrivate { issi: 42 }),
+            enabled: true,
+        });
+
+        let text = cfg.to_toml_pretty().expect("serialize");
+        let parsed = Config::parse(&text).expect("re-parse");
+
+        assert_eq!(parsed.sip.enabled, true);
+        assert_eq!(parsed.sip.extensions["1001"].issi, 42);
+        assert_eq!(parsed.sip.trunks["asterisk"].direction, TrunkDirection::Outbound);
+        assert_eq!(parsed.sip.routes.len(), 1);
+        match &parsed.sip.routes[0].to {
+            Some(RouteEndpoint::SipTrunk { trunk, .. }) => assert_eq!(trunk, "asterisk"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match &parsed.sip.routes[0].from {
+            Some(RouteEndpoint::BrewPrivate { issi }) => assert_eq!(*issi, 42),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

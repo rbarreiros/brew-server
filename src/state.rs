@@ -186,6 +186,11 @@ mod bluestation_count_tests {
 
 pub struct AppState {
     pub config: Config,
+    /// Path of the config file this process was started with, so the
+    /// dashboard's config editor can write changes back to the same file the
+    /// startup `config_watcher` polls (which then restarts the process to
+    /// apply them).
+    pub config_path: std::path::PathBuf,
     pub inner: RwLock<Inner>,
     pub monitor: Monitor,
     pub telemetry: RwLock<TelemetryState>,
@@ -204,7 +209,7 @@ pub struct SipHandles {
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, config_path: std::path::PathBuf) -> Self {
         let store = if config.storage.enabled {
             match crate::store::Store::open(&config.storage.path) {
                 Ok(store) => Some(std::sync::Arc::new(store)),
@@ -226,6 +231,7 @@ impl AppState {
         };
         Self {
             config,
+            config_path,
             inner: RwLock::new(Inner::default()),
             monitor,
             telemetry: RwLock::new(telemetry),

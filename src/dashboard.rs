@@ -1,4 +1,5 @@
 use crate::{
+    config,
     control::{self, ControlCommand, SendError},
     state::AppState,
     telemetry::TelemetryBts,
@@ -43,6 +44,13 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/sip-config", get(sip_config_page))
         .route("/api/sip", get(sip_snapshot))
         .route("/api/sip/config", get(sip_config))
+        .route("/settings", get(settings_page))
+        .route("/api/config/raw", get(config_raw_get).put(config_raw_put))
+        .route("/api/config/sip/full", get(sip_config_full))
+        .route("/api/config/sip/extensions/{user}", axum::routing::post(upsert_sip_extension).delete(delete_sip_extension))
+        .route("/api/config/sip/trunks/{name}", axum::routing::post(upsert_sip_trunk).delete(delete_sip_trunk))
+        .route("/api/config/sip/routes", axum::routing::post(upsert_sip_route))
+        .route("/api/config/sip/routes/{name}", axum::routing::delete(delete_sip_route))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_basic))
         .with_state(state.clone());
 
@@ -317,6 +325,103 @@ async function load(){{
 load();setInterval(load,5000);
 </script></body></html>"#, style = STYLE));
 
+static SETTINGS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Settings - TETRA Network</title>{style}</head><body><header><h1>SETTINGS</h1><div><span class=live></span><span id=status>Live</span></div></header><main class=wrap>
+<p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/sip-config">SIP Config (read-only view) &rarr;</a></p>
+<div class=banner id=save-banner></div>
+<p class=map-note style="color:#8fa2b8;font-size:12px">Every save here writes the server's TOML config file and the process restarts within a couple seconds to apply it (the same mechanism as hand-editing the file). A brief connection drop across the restart is expected.</p>
+
+<section class=panel><h2>SIP Extensions</h2><table><thead><tr><th>User (AOR)</th><th>Display name</th><th>ISSI</th><th>Password</th><th>Outbound</th><th></th></tr></thead><tbody id=exts></tbody></table>
+<div class=ctl-row><input id=ext-user placeholder="user (e.g. 1001)"><input id=ext-name placeholder="display name"><input id=ext-issi placeholder="ISSI" type=number><input id=ext-pass placeholder="password"><label><input id=ext-out type=checkbox checked> outbound</label><button onclick="saveExt()">Add / Update</button></div>
+</section>
+
+<section class=panel><h2>SIP Trunks</h2><table><thead><tr><th>Name</th><th>Direction</th><th>Remote host</th><th>Username</th><th>Password</th><th>Realm</th><th>Reg interval</th><th>Enabled</th><th></th></tr></thead><tbody id=trunks></tbody></table>
+<div class=ctl-row><input id=tr-name placeholder="name"><select id=tr-dir><option value=outbound>outbound</option><option value=inbound>inbound</option><option value=peer>peer</option></select><input id=tr-host placeholder="remote host:port"><input id=tr-user placeholder="username"><input id=tr-pass placeholder="password"><input id=tr-realm placeholder="realm"><input id=tr-interval placeholder="reg interval s" type=number value=300><label><input id=tr-en type=checkbox checked> enabled</label><button onclick="saveTrunk()">Add / Update</button></div>
+</section>
+
+<section class=panel><h2>Voice routes</h2><table><thead><tr><th>Name</th><th>Match</th><th>From</th><th>To</th><th>Enabled</th><th></th></tr></thead><tbody id=routes></tbody></table>
+<div class=ctl-row><input id=rt-name placeholder="name"><input id=rt-match placeholder="match pattern, e.g. 9*"><input id=rt-from placeholder="from (optional): ext:USER | trunk:NAME | issi:N | group:N"><input id=rt-to placeholder="to: ext:USER | trunk:NAME[/NUMBER] | issi:N | group:N"><label><input id=rt-en type=checkbox checked> enabled</label><button onclick="saveRoute()">Add / Update</button></div>
+<p class=map-note style="color:#8fa2b8;font-size:12px">Endpoint shorthand: <code>ext:USER</code>, <code>trunk:NAME</code> or <code>trunk:NAME/NUMBER</code>, <code>issi:N</code> (Brew private), <code>group:N</code> (Brew group). Updating a route matches by name and keeps its position; a new name appends to the end (reorder via the raw editor below).</p>
+</section>
+
+<section class=panel><h2>Full configuration (raw TOML)</h2>
+<p class=map-note style="color:#8fa2b8;font-size:12px">Every setting lives here, including ones with no form above (listen addresses, TLS, dashboard/auth/telemetry/control users, storage, call-routing flags). Loads the live config; Save validates it before writing anything.</p>
+<textarea id=raw style="width:100%;min-height:420px;background:#0d1826;color:#e7edf5;border:1px solid #203047;border-radius:8px;padding:12px;font-family:ui-monospace,monospace;font-size:12px"></textarea>
+<div class=ctl-row><button onclick="loadRaw()">Reload from server</button><button onclick="saveRaw()">Save</button><span id=raw-result class=ctl-result></span></div>
+</section>
+</main><script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c]));
+const yn=b=>b?'<span class="pill health-ok">yes</span>':'<span class="pill health-unknown">no</span>';
+function banner(ok,msg){{const b=$('save-banner');b.style.display='block';b.style.background=ok?'#173822':'#3a1414';b.style.borderColor=ok?'#245c37':'#f2545b';b.style.color=ok?'#52d273':'#ffb4b8';b.textContent=msg;setTimeout(()=>{{b.style.display='none'}},6000);}}
+async function api(method,url,body){{
+  const r=await fetch(url,{{method,headers:body!==undefined?{{'Content-Type':'application/json'}}:undefined,body:body!==undefined?JSON.stringify(body):undefined}});
+  const t=await r.text();
+  if(!r.ok){{banner(false,'Failed: '+t);throw new Error(t);}}
+  banner(true,'Saved. Restarting to apply…');
+  return t;
+}}
+function endpoint(s){{
+  if(!s)return null;
+  const [kind,rest]=s.split(':');
+  if(kind==='ext')return {{kind:'sip_extension',user:rest}};
+  if(kind==='trunk'){{const[trunk,number]=rest.split('/');return {{kind:'sip_trunk',trunk,number:number||''}};}}
+  if(kind==='issi')return {{kind:'brew_private',issi:parseInt(rest,10)}};
+  if(kind==='group')return {{kind:'brew_group',gssi:parseInt(rest,10)}};
+  return null;
+}}
+function describe(ep){{
+  if(!ep)return '';
+  if(ep.kind==='sip_extension')return 'ext:'+ep.user;
+  if(ep.kind==='sip_trunk')return ep.number?`trunk:${{ep.trunk}}/${{ep.number}}`:'trunk:'+ep.trunk;
+  if(ep.kind==='brew_private')return 'issi:'+ep.issi;
+  if(ep.kind==='brew_group')return 'group:'+ep.gssi;
+  return '';
+}}
+async function loadSip(){{
+  const d=await(await fetch('/api/config/sip/full')).json();
+  $('exts').innerHTML=Object.entries(d.extensions).map(([user,e])=>`<tr><td>${{esc(user)}}</td><td>${{esc(e.display_name||'-')}}</td><td>${{e.issi||'-'}}</td><td class=muted>${{e.password?'•'.repeat(8):'(none)'}}</td><td>${{yn(e.allow_outbound)}}</td><td><button onclick="delExt('${{esc(user)}}')">Delete</button></td></tr>`).join('')||'<tr><td colspan=6 class=muted>No extensions provisioned</td></tr>';
+  $('trunks').innerHTML=Object.entries(d.trunks).map(([name,t])=>`<tr><td>${{esc(name)}}</td><td>${{esc(t.direction)}}</td><td>${{esc(t.remote_host||'-')}}</td><td>${{esc(t.username)}}</td><td class=muted>${{t.password?'•'.repeat(8):'(none)'}}</td><td class=muted>${{esc(t.realm||'-')}}</td><td>${{esc(t.register_interval_seconds)}}s</td><td>${{yn(t.enabled)}}</td><td><button onclick="delTrunk('${{esc(name)}}')">Delete</button></td></tr>`).join('')||'<tr><td colspan=9 class=muted>No trunks provisioned</td></tr>';
+  $('routes').innerHTML=d.routes.map(r=>`<tr><td>${{esc(r.name||'-')}}</td><td><code>${{esc(r.match_pattern)}}</code></td><td>${{esc(describe(r.from))||'any'}}</td><td>${{esc(describe(r.to))}}</td><td>${{yn(r.enabled)}}</td><td><button onclick="delRoute('${{esc(r.name)}}')">Delete</button></td></tr>`).join('')||'<tr><td colspan=6 class=muted>No routes configured</td></tr>';
+}}
+async function saveExt(){{
+  const user=$('ext-user').value.trim(); if(!user)return;
+  await api('POST',`/api/config/sip/extensions/${{encodeURIComponent(user)}}`,{{
+    password:$('ext-pass').value, display_name:$('ext-name').value,
+    issi:parseInt($('ext-issi').value,10)||0, allow_outbound:$('ext-out').checked,
+  }});
+  loadSip();
+}}
+async function delExt(user){{ await api('DELETE',`/api/config/sip/extensions/${{encodeURIComponent(user)}}`); loadSip(); }}
+async function saveTrunk(){{
+  const name=$('tr-name').value.trim(); if(!name)return;
+  await api('POST',`/api/config/sip/trunks/${{encodeURIComponent(name)}}`,{{
+    direction:$('tr-dir').value, remote_host:$('tr-host').value, username:$('tr-user').value,
+    password:$('tr-pass').value, realm:$('tr-realm').value,
+    register_interval_seconds:parseInt($('tr-interval').value,10)||300, enabled:$('tr-en').checked,
+  }});
+  loadSip();
+}}
+async function delTrunk(name){{ await api('DELETE',`/api/config/sip/trunks/${{encodeURIComponent(name)}}`); loadSip(); }}
+async function saveRoute(){{
+  const name=$('rt-name').value.trim(); if(!name)return;
+  await api('POST','/api/config/sip/routes',{{
+    name, match_pattern:$('rt-match').value||'*',
+    from:endpoint($('rt-from').value.trim()), to:endpoint($('rt-to').value.trim()),
+    enabled:$('rt-en').checked,
+  }});
+  loadSip();
+}}
+async function delRoute(name){{ await api('DELETE',`/api/config/sip/routes/${{encodeURIComponent(name)}}`); loadSip(); }}
+async function loadRaw(){{ $('raw').value=await(await fetch('/api/config/raw')).text(); }}
+async function saveRaw(){{
+  const r=await fetch('/api/config/raw',{{method:'PUT',body:$('raw').value}});
+  const t=await r.text();
+  if(!r.ok){{banner(false,'Failed: '+t);return;}}
+  banner(true,'Saved. Restarting to apply…');
+}}
+loadSip();loadRaw();
+</script></body></html>"#, style = STYLE));
+
 pub async fn calls_page() -> Html<&'static str> { Html(CALLS_HTML.as_str()) }
 pub async fn sds_page() -> Html<&'static str> { Html(SDS_HTML.as_str()) }
 pub async fn telemetry_sds_page() -> Html<&'static str> { Html(TELEMETRY_SDS_HTML.as_str()) }
@@ -416,6 +521,121 @@ fn describe_endpoint(ep: &crate::config::RouteEndpoint) -> String {
 
 pub async fn sip_page() -> Html<&'static str> { Html(SIP_HTML.as_str()) }
 pub async fn sip_config_page() -> Html<&'static str> { Html(SIP_CONFIG_HTML.as_str()) }
+pub async fn settings_page() -> Html<&'static str> { Html(SETTINGS_HTML.as_str()) }
+
+/// Re-serializes `cfg` to TOML, round-trip-validates it by parsing it back
+/// (belt and braces: catches anything `to_toml_pretty` itself can't express),
+/// and writes it to the process's config file. The already-running
+/// `config_watcher` picks up the mtime change within ~2s and restarts the
+/// process so the new config takes effect; this function does not restart
+/// anything itself.
+async fn save_config(state: &Arc<AppState>, cfg: &config::Config) -> anyhow::Result<()> {
+    let text = cfg.to_toml_pretty()?;
+    config::Config::parse(&text)?;
+    config::Config::save_atomic(&state.config_path, &text)?;
+    Ok(())
+}
+
+/// Applies `edit` to a clone of the live config and saves it. Used by every
+/// structured (non-raw-editor) settings endpoint below so they share one
+/// clone/edit/validate/write/report path.
+async fn mutate_and_save(
+    state: &Arc<AppState>,
+    edit: impl FnOnce(&mut config::Config),
+) -> Response {
+    let mut cfg = state.config.clone();
+    edit(&mut cfg);
+    match save_config(state, &cfg).await {
+        Ok(()) => Json(serde_json::json!({
+            "saved": true,
+            "note": "written to the config file; the process restarts within a couple seconds to apply it",
+        })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+/// Unredacted JSON view of `[sip]` (real passwords included, unlike
+/// `sip_config`'s summary), so the settings editor can prefill edit forms
+/// with actual current values instead of a "set/none" placeholder. Safe here
+/// for the same reason `config_raw_get` is: every route on this router sits
+/// behind `require_basic`.
+pub async fn sip_config_full(State(state): State<Arc<AppState>>) -> Json<crate::config::SipConfig> {
+    Json(state.config.sip.clone())
+}
+
+/// Full config as TOML text, for the raw editor. Unlike `sip_config`'s
+/// redacted summary, this includes real secrets (trunk/extension passwords,
+/// dashboard/auth user passwords) — acceptable because every route on this
+/// router already sits behind `require_basic`, the same gate protecting the
+/// rest of the admin surface.
+pub async fn config_raw_get(State(state): State<Arc<AppState>>) -> Response {
+    match state.config.to_toml_pretty() {
+        Ok(text) => (StatusCode::OK, text).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Validates and saves a full replacement config submitted as raw TOML text
+/// (the editor's "Save" button). This is the only path that can touch every
+/// setting, including ones with no dedicated form (listen addresses, TLS,
+/// dashboard/auth/telemetry/control users, storage, call-routing flags).
+pub async fn config_raw_put(State(state): State<Arc<AppState>>, body: String) -> Response {
+    let cfg = match config::Config::parse(&body) {
+        Ok(cfg) => cfg,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid config: {e}")).into_response(),
+    };
+    match save_config(&state, &cfg).await {
+        Ok(()) => Json(serde_json::json!({
+            "saved": true,
+            "note": "written to the config file; the process restarts within a couple seconds to apply it",
+        })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+pub async fn upsert_sip_extension(
+    State(state): State<Arc<AppState>>,
+    Path(user): Path<String>,
+    Json(ext): Json<crate::config::SipExtensionConfig>,
+) -> Response {
+    mutate_and_save(&state, |cfg| { cfg.sip.extensions.insert(user, ext); }).await
+}
+
+pub async fn delete_sip_extension(State(state): State<Arc<AppState>>, Path(user): Path<String>) -> Response {
+    mutate_and_save(&state, |cfg| { cfg.sip.extensions.remove(&user); }).await
+}
+
+pub async fn upsert_sip_trunk(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(trunk): Json<crate::config::SipTrunkConfig>,
+) -> Response {
+    mutate_and_save(&state, |cfg| { cfg.sip.trunks.insert(name, trunk); }).await
+}
+
+pub async fn delete_sip_trunk(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    mutate_and_save(&state, |cfg| { cfg.sip.trunks.remove(&name); }).await
+}
+
+/// Adds or replaces (matched by `name`) a voice route. Routes are order-
+/// sensitive (`SipConfig::routes` is evaluated top to bottom), so an update
+/// keeps the existing position and only a new name appends at the end;
+/// reordering is left to the raw editor.
+pub async fn upsert_sip_route(
+    State(state): State<Arc<AppState>>,
+    Json(route): Json<crate::config::VoiceRouteConfig>,
+) -> Response {
+    mutate_and_save(&state, |cfg| {
+        match cfg.sip.routes.iter_mut().find(|r| r.name == route.name) {
+            Some(existing) => *existing = route,
+            None => cfg.sip.routes.push(route),
+        }
+    }).await
+}
+
+pub async fn delete_sip_route(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    mutate_and_save(&state, |cfg| { cfg.sip.routes.retain(|r| r.name != name); }).await
+}
 
 pub async fn control_list(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
     Json(state.control.read().await.connected_ids())
@@ -453,7 +673,7 @@ h2 .backlink{text-transform:none;letter-spacing:normal;margin-left:8px}
 
 const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><header><h1>TETRA NETWORK MONITOR</h1><div><span class=live></span><span id=status>Live</span></div></header><main class=wrap>
 <div class=banner id=emergency-banner></div>
-<section class=cards><div class=card><div class=muted>BlueStations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Logs</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-FlowStation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a></div></section>
+<section class=cards><div class=card><div class=muted>BlueStations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Logs</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-FlowStation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a><a class=navlink href="/settings">Settings<span class=sub>Edit &amp; save server configuration</span></a></div></section>
 <section class=panel><h2>FlowStation Telemetry</h2><div class=bts-grid id=telemetry-stations></div></section>
 <section class=panel><h2>Registered Subscribers <a class=backlink href="/registrations">(view registration log &rarr;)</a></h2><div class=bts-grid id=registrations></div></section>
 <section class=panel><h2>FlowStation Control</h2><div class=bts-grid id=control-stations></div></section>
