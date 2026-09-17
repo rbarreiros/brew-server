@@ -170,13 +170,14 @@ dependencies = [
 
 [[package]]
 name = "brew-server"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
  "axum-server",
  "base64",
  "bincode",
+ "cc",
  "futures-util",
  "md5",
  "serde",

@@ -46,12 +46,25 @@ pub struct Client {
     /// discovery `X-Brew-Version` header (if any) and promoted lazily as v1
     /// message layouts are observed on the wire.
     pub version: ConnVersion,
+    /// Remote address of the WebSocket connection, when known. `None` for the
+    /// virtual clients the SIP bridge registers (see `sip::bridge`), which
+    /// have no real socket.
+    pub remote_addr: Option<std::net::SocketAddr>,
+    /// When this connection was accepted, for the dashboard's live
+    /// connections page.
+    pub connected_at_ms: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct Subscriber {
     pub client_id: ClientId,
     pub groups: HashSet<u32>,
+    /// The connection mode of the client that registered this ISSI (Terminal
+    /// or Basestation). Only `Terminal` connections represent an actual mobile
+    /// station; a `Basestation` (Basestation gateway) registering on a
+    /// subscriber's behalf is not itself an MS. Dashboard MS-registration
+    /// counts should filter on this.
+    pub mode: ClientMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +81,9 @@ pub struct ActiveCall {
     pub destination: u32,
     pub priority: u8,
     pub peers: HashSet<ClientId>,
+    /// When this call was set up, for max-call-duration enforcement and for
+    /// showing call age on the dashboard.
+    pub started_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -91,16 +107,119 @@ pub struct Inner {
     pub auth_sessions: HashMap<String, (Instant, ClientMode, ConnVersion)>,
 }
 
+impl Inner {
+    /// Number of registered subscribers that represent an actual mobile
+    /// station, i.e. registered by a `Terminal`-mode client. A `Basestation`
+    /// (Basestation gateway) can also hold a subscriber registration, but it
+    /// is not itself an MS, so it is excluded from MS-registration counts.
+    pub fn ms_registration_count(&self) -> usize {
+        self.subscribers.values().filter(|s| s.mode == ClientMode::Terminal).count()
+    }
+
+    /// Number of connected clients that are actual Basestation (Basestation)
+    /// gateways, i.e. `Basestation`-mode connections. A `Terminal`-mode
+    /// connection is a mobile station registering directly over the Brew
+    /// protocol, not a Basestation, so it is excluded here (it is counted
+    /// instead by `ms_registration_count`).
+    pub fn basestation_count(&self) -> usize {
+        self.clients.values().filter(|c| c.mode == ClientMode::Basestation).count()
+    }
+}
+
+#[cfg(test)]
+mod ms_registration_tests {
+    use super::*;
+
+    fn subscriber(mode: ClientMode) -> Subscriber {
+        Subscriber { client_id: Uuid::new_v4(), groups: HashSet::new(), mode }
+    }
+
+    #[test]
+    fn counts_only_terminal_mode_subscribers() {
+        let mut inner = Inner::default();
+        inner.subscribers.insert(1001, subscriber(ClientMode::Terminal));
+        inner.subscribers.insert(1002, subscriber(ClientMode::Terminal));
+        inner.subscribers.insert(2001, subscriber(ClientMode::Basestation));
+        assert_eq!(inner.ms_registration_count(), 2);
+        assert_eq!(inner.subscribers.len(), 3, "raw map still holds every registration");
+    }
+
+    #[test]
+    fn zero_when_only_basestations_registered() {
+        let mut inner = Inner::default();
+        inner.subscribers.insert(2001, subscriber(ClientMode::Basestation));
+        inner.subscribers.insert(2002, subscriber(ClientMode::Basestation));
+        assert_eq!(inner.ms_registration_count(), 0);
+    }
+
+    #[test]
+    fn zero_when_no_subscribers() {
+        assert_eq!(Inner::default().ms_registration_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod basestation_count_tests {
+    use super::*;
+
+    fn client(mode: ClientMode) -> Client {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Client { tx, mode, version: ConnVersion::default(), remote_addr: None, connected_at_ms: 0 }
+    }
+
+    #[test]
+    fn counts_only_basestation_mode_clients() {
+        let mut inner = Inner::default();
+        inner.clients.insert(Uuid::new_v4(), client(ClientMode::Basestation));
+        inner.clients.insert(Uuid::new_v4(), client(ClientMode::Basestation));
+        inner.clients.insert(Uuid::new_v4(), client(ClientMode::Terminal));
+        inner.clients.insert(Uuid::new_v4(), client(ClientMode::Terminal));
+        // Reproduces the reported scenario: 2 Terminal MS + 2 Basestation
+        // (Basestation) connections must show 2 Basestations, not 4.
+        assert_eq!(inner.basestation_count(), 2);
+        assert_eq!(inner.clients.len(), 4, "raw client map still holds every connection");
+    }
+
+    #[test]
+    fn zero_when_only_terminals_connected() {
+        let mut inner = Inner::default();
+        inner.clients.insert(Uuid::new_v4(), client(ClientMode::Terminal));
+        inner.clients.insert(Uuid::new_v4(), client(ClientMode::Terminal));
+        assert_eq!(inner.basestation_count(), 0);
+    }
+
+    #[test]
+    fn zero_when_no_clients() {
+        assert_eq!(Inner::default().basestation_count(), 0);
+    }
+}
+
 pub struct AppState {
     pub config: Config,
+    /// Path of the config file this process was started with, so the
+    /// dashboard's config editor can write changes back to the same file the
+    /// startup `config_watcher` polls (which then restarts the process to
+    /// apply them).
+    pub config_path: std::path::PathBuf,
     pub inner: RwLock<Inner>,
     pub monitor: Monitor,
     pub telemetry: RwLock<TelemetryState>,
     pub control: RwLock<ControlState>,
+    /// SIP subsystem runtime handles, populated when the SIP listener starts.
+    /// `None` until then (and when SIP is disabled) so the dashboard can render
+    /// an appropriate "disabled" state without panicking.
+    pub sip: RwLock<Option<SipHandles>>,
+}
+
+/// Runtime handles for the SIP subsystem, shared with the dashboard.
+#[derive(Clone)]
+pub struct SipHandles {
+    pub state: std::sync::Arc<crate::sip::SipState>,
+    pub transport: std::sync::Arc<crate::sip::SipTransport>,
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, config_path: std::path::PathBuf) -> Self {
         let store = if config.storage.enabled {
             match crate::store::Store::open(&config.storage.path) {
                 Ok(store) => Some(std::sync::Arc::new(store)),
@@ -122,10 +241,31 @@ impl AppState {
         };
         Self {
             config,
+            config_path,
             inner: RwLock::new(Inner::default()),
             monitor,
             telemetry: RwLock::new(telemetry),
             control: RwLock::new(ControlState::default()),
+            sip: RwLock::new(None),
+        }
+    }
+
+    /// Registers the SIP runtime handles once the SIP listener has bound. Called
+    /// from the SIP transport during startup.
+    pub async fn set_sip(
+        &self,
+        state: std::sync::Arc<crate::sip::SipState>,
+        transport: std::sync::Arc<crate::sip::SipTransport>,
+    ) {
+        *self.sip.write().await = Some(SipHandles { state, transport });
+    }
+
+    /// Returns a SIP snapshot for the dashboard, or None when SIP is inactive.
+    pub async fn sip_snapshot(&self) -> Option<crate::sip::SipSnapshot> {
+        let guard = self.sip.read().await;
+        match guard.as_ref() {
+            Some(h) => Some(h.state.snapshot().await),
+            None => None,
         }
     }
 

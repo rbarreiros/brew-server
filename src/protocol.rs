@@ -100,7 +100,7 @@ const MNEMONIC_FIELD_LEN: usize = 34;
 
 /// Negotiated Brew protocol version for a single WebSocket connection.
 ///
-/// Real clients (e.g. FlowStation) do **not** carry `X-Brew-Version` on the
+/// Real clients (e.g. Basestation) do **not** carry `X-Brew-Version` on the
 /// WebSocket handshake — only, optionally, on the preceding HTTP discovery GET.
 /// The version is therefore treated as a per-connection property that starts at
 /// `V0` and is promoted to `V1` either by an explicit discovery header or lazily
@@ -201,7 +201,7 @@ fn u64le(data: &[u8], o: usize) -> u64 {
 ///   - Octet 1: length of the following text in bits
 ///   - Octet 2+: encoded character data
 ///
-/// Only the coding schemes practically used by BlueStation/FlowStation are
+/// Only the coding schemes practically used by Basestation/Basestation are
 /// decoded to text: 0x00 (ISO 8859-1 / 8-bit) and the 7-bit GSM-like packing
 /// (scheme 0x01) described in ETSI EN 300 392-2 clause 29.5.4. Unknown schemes
 /// return the raw bytes rendered as lossy UTF-8 so information is not silently
@@ -278,7 +278,7 @@ pub fn parse(data: &[u8]) -> Result<BrewMessage, ParseError> {
 /// Parses a Brew message in the context of a connection's negotiated version and
 /// reports the version implied by this message. The returned `ConnVersion` is
 /// the max of the input version and any version lazily detected from the
-/// message length (mirroring how FlowStation resolves the version from message
+/// message length (mirroring how Basestation resolves the version from message
 /// content when no `X-Brew-Version` handshake header is present). Callers should
 /// store `max(previous, returned)` as the connection's version.
 pub fn parse_with_version(data: &[u8], version: ConnVersion) -> Result<(BrewMessage, ConnVersion), ParseError> {
@@ -459,15 +459,126 @@ pub fn build_call_cause(call_state: u8, id: &Uuid, cause: u8) -> Vec<u8> {
     out
 }
 
+/// Builds a call-control message with no payload: `CALL_SETUP_ACCEPT` and
+/// `CALL_ALERT` are defined with none (real Brew clients -- see e.g.
+/// FlowStation's `net_brew::protocol::parse_frame` -- special-case these two
+/// as `// No extra payload`). This server's own parser is lenient about
+/// `CALL_CONNECT_CONFIRM`'s shape, but real clients are not (see
+/// `build_call_connect_confirm`) -- do not use this builder for it. Used by
+/// the SIP<->Brew bridge to drive a private call's accept/ring/answer
+/// handshake from the server side (there is no Brew client on the SIP leg to
+/// have sent one).
+pub fn build_call_control_empty(call_state: u8, id: &Uuid) -> Vec<u8> {
+    let mut out = Vec::with_capacity(18);
+    out.push(CLASS_CALL_CONTROL);
+    out.push(call_state);
+    out.extend_from_slice(id.as_bytes());
+    out
+}
+
+/// Builds `CALL_CONNECT_CONFIRM`, which -- unlike `CALL_SETUP_ACCEPT`/
+/// `CALL_ALERT` -- is *not* an empty-payload message: it carries a 2-byte
+/// `grant`/`permission` pair (real clients reject anything shorter; see e.g.
+/// FlowStation's `net_brew::protocol::BrewCircularGrant` and its
+/// `CALL_STATE_CONNECT_CONFIRM => if payload_data.len() < 2 { return
+/// Err(TooShort) }`). `0, 0` (no restriction) is the value this bridge sends,
+/// since it has no real grant/permission semantics of its own to convey.
+pub fn build_call_connect_confirm(id: &Uuid, grant: u8, permission: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20);
+    out.push(CLASS_CALL_CONTROL);
+    out.push(CALL_CONNECT_CONFIRM);
+    out.extend_from_slice(id.as_bytes());
+    out.push(grant);
+    out.push(permission);
+    out
+}
+
 pub fn raw_peer_pair(payload: &CallPayload) -> Option<(u32, u32)> {
     let CallPayload::Raw(raw) = payload else { return None };
     if raw.len() < 8 { return None; }
     Some((u32le(raw, 0), u32le(raw, 4)))
 }
 
+/// Bit count of one ACELP-coded TETRA speech frame (30ms @ 8kHz), per
+/// ETSI EN 300 395-2. Packed big-endian-bit into `ACELP_CODED_FRAME_BYTES`.
+pub const ACELP_CODED_FRAME_BITS: u16 = 137;
+/// `ceil(ACELP_CODED_FRAME_BITS / 8)`.
+pub const ACELP_CODED_FRAME_BYTES: usize = 18;
+/// PCM samples per ACELP frame (30ms @ 8kHz).
+pub const ACELP_PCM_SAMPLES: usize = 240;
+
+/// Builds a server-originated `CALL_SETUP_REQUEST` toward a registered Brew
+/// subscriber, used to originate a call from the SIP side (there is no Brew
+/// client on that leg to have sent one). `number`/the trailing single-byte
+/// fields are left zeroed: only source/destination/priority are meaningful
+/// for this bridge, and `CircularCall` parsing ignores the rest.
+pub fn build_circular_call_setup(id: &Uuid, source: u32, destination: u32, priority: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + 16 + CIRCULAR_CALL_BASE_LEN);
+    out.push(CLASS_CALL_CONTROL);
+    out.push(CALL_SETUP_REQUEST);
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&source.to_le_bytes());
+    out.extend_from_slice(&destination.to_le_bytes());
+    out.extend_from_slice(&[0u8; 32]); // number[32]: unused for a SIP-originated call
+    out.push(priority);
+    out.extend_from_slice(&[0u8; 10]); // service, mode, duplex, method, communication, grant, permission, timeout, ownership, queued
+    out
+}
+
+/// Builds a server-originated `CALL_GROUP_TX`, used to seize the group floor
+/// on behalf of a SIP caller bridged into a Brew group call.
+pub fn build_group_tx(id: &Uuid, source: u32, destination: u32, priority: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + 16 + GROUP_TX_BASE_LEN);
+    out.push(CLASS_CALL_CONTROL);
+    out.push(CALL_GROUP_TX);
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&source.to_le_bytes());
+    out.extend_from_slice(&destination.to_le_bytes());
+    out.push(priority);
+    out.push(0); // access
+    out.extend_from_slice(&0u16.to_le_bytes()); // service
+    out
+}
+
+/// Builds a `FRAME_TRAFFIC_CHANNEL` carrying one ACELP-coded speech frame.
+pub fn build_traffic_frame(id: &Uuid, coded: &[u8; ACELP_CODED_FRAME_BYTES]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20 + ACELP_CODED_FRAME_BYTES);
+    out.push(CLASS_FRAME);
+    out.push(FRAME_TRAFFIC_CHANNEL);
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&ACELP_CODED_FRAME_BITS.to_le_bytes());
+    out.extend_from_slice(coded);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_call_control_empty_round_trips_as_empty_payload() {
+        let id = Uuid::new_v4();
+        for state in [CALL_SETUP_ACCEPT, CALL_ALERT] {
+            let wire = build_call_control_empty(state, &id);
+            let BrewMessage::CallControl(cc) = parse(&wire).unwrap() else { panic!() };
+            assert_eq!(cc.call_state, state);
+            assert_eq!(cc.identifier, id);
+            assert!(matches!(cc.payload, CallPayload::Empty));
+        }
+    }
+
+    /// Real clients (e.g. FlowStation's `net_brew::protocol`) reject
+    /// CALL_CONNECT_CONFIRM outright if it carries fewer than 2 payload
+    /// bytes (grant, permission) -- unlike CALL_SETUP_ACCEPT/CALL_ALERT,
+    /// which are genuinely empty. This pins the wire shape so a future
+    /// change can't quietly regress back to the empty-payload bug.
+    #[test]
+    fn build_call_connect_confirm_carries_grant_and_permission() {
+        let id = Uuid::new_v4();
+        let wire = build_call_connect_confirm(&id, 1, 2);
+        assert_eq!(wire.len(), 20, "18-byte header + 2-byte grant/permission");
+        assert_eq!(&wire[18..20], &[1, 2]);
+    }
 
     #[test]
     fn parses_group_tx() {

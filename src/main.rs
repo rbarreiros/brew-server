@@ -7,9 +7,11 @@ mod position;
 mod protocol;
 mod router;
 mod server;
+mod sip;
 mod state;
 mod store;
 mod telemetry;
+mod transcode;
 
 use config::Config;
 use state::AppState;
@@ -25,17 +27,22 @@ async fn main() -> anyhow::Result<()> {
 
     let path = std::env::args().nth(1).unwrap_or_else(|| "brew-server.toml".to_owned());
     let config = Config::load(&path)?;
-    let state = Arc::new(AppState::new(config));
+    let state = Arc::new(AppState::new(config, std::path::PathBuf::from(&path)));
 
     // Watch the config file; when it changes, restart the whole process so the
     // new configuration takes effect from a clean state.
     tokio::spawn(config_watcher(path.clone()));
+
+    if state.config.max_call_duration_seconds > 0 {
+        tokio::spawn(router::run_call_duration_sweep(state.clone()));
+    }
 
     tokio::try_join!(
         server::run(state.clone()),
         telemetry::run(state.clone()),
         control::run(state.clone()),
         dashboard::run(state.clone()),
+        sip::run(state.clone()),
     )?;
     Ok(())
 }

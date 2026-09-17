@@ -1,5 +1,5 @@
-//! FlowStation Control channel: bidirectional, BTS-initiated WebSocket
-//! (subprotocol `bluestation-control-v1`) that a control server uses to push
+//! Basestation Control channel: bidirectional, BTS-initiated WebSocket
+//! (subprotocol `basestation-control-v1`) that a control server uses to push
 //! commands (kick, DGNA, live SDS, emergency clear, restart/shutdown) and
 //! read back responses for the few command types that define one.
 use crate::{fsnet, state::AppState};
@@ -33,7 +33,7 @@ pub enum ControlCommand {
 
 impl ControlCommand {
     /// The wire format is serde's default externally-tagged representation
-    /// (`{"KickMs":{"issi":1}}`), matching FlowStation's own derive-based
+    /// (`{"KickMs":{"issi":1}}`), matching Basestation's own derive-based
     /// JSON codec -- not the internal `#[serde(tag = "action")]` shape used
     /// for the dashboard's HTTP request body.
     fn to_wire_json(&self) -> serde_json::Value {
@@ -169,7 +169,7 @@ async fn session(state: Arc<AppState>, socket: WebSocket, identity: Option<Strin
         let mut ctl = state.control.write().await;
         ctl.sessions.insert(id.clone(), ControlSession { tx, pending_handle: HashMap::new(), pending_kick: HashMap::new() });
     }
-    info!(bts = %id, "FlowStation control connected");
+    info!(bts = %id, "Basestation control connected");
     state.monitor.emit("control_connected", serde_json::json!({"id": id}));
 
     let writer = tokio::spawn(async move {
@@ -191,7 +191,7 @@ async fn session(state: Arc<AppState>, socket: WebSocket, identity: Option<Strin
     writer.abort();
     state.control.write().await.sessions.remove(&id);
     state.monitor.emit("control_disconnected", serde_json::json!({"id": id}));
-    info!(bts = %id, "FlowStation control disconnected");
+    info!(bts = %id, "Basestation control disconnected");
 }
 
 async fn handle_response(state: &Arc<AppState>, id: &str, data: &[u8]) {

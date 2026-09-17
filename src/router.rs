@@ -8,7 +8,7 @@ use crate::{
     },
     state::{ActiveCall, AppState, CallKind, ClientId, SdsRoute, Subscriber},
 };
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::{collections::{HashMap, HashSet}, sync::Arc, time::Instant};
 use tracing::{debug, info, warn};
 
 pub async fn handle_packet(state: Arc<AppState>, source: ClientId, raw: Vec<u8>) {
@@ -127,7 +127,7 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
         inner.group_clients.get(&gt.destination).cloned().unwrap_or_default()
     };
 
-    // BlueStation can be connected and forwarding calls before an AFFILIATE event
+    // Basestation can be connected and forwarding calls before an AFFILIATE event
     // has reached Brew (for example during startup/resync or while debugging MM
     // group-affiliation propagation). In that case a strict affiliation-only core
     // silently produces target_count=0. For small/private networks we support an
@@ -142,7 +142,7 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
             %source,
             gssi = gt.destination,
             connected_clients = inner.clients.len(),
-            "no Brew affiliations recorded for GSSI; falling back to all connected BlueStations"
+            "no Brew affiliations recorded for GSSI; falling back to all connected Basestations"
         );
     }
     targets.remove(&source);
@@ -154,6 +154,7 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
         destination: gt.destination,
         priority: gt.priority,
         peers: targets.clone(),
+        started_at: std::time::Instant::now(),
     });
     let txs = targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| c.tx.clone())).collect::<Vec<_>>();
     drop(inner);
@@ -217,7 +218,7 @@ async fn handle_sds_transfer(state: &Arc<AppState>, source: ClientId, id: uuid::
     // LIP positions are confirmed decoding on the map.
     info!(uuid=%id, source_issi, bytes=%raw.len(), hex=%hex_dump(&raw), "SDS_TRANSFER raw frame");
 
-    // Position extraction from the relayed SDS. FlowStation cannot be modified,
+    // Position extraction from the relayed SDS. Basestation cannot be modified,
     // but it relays the full SDS (including binary LIP payloads) over the Brew
     // channel, so we decode positions here regardless of deliverability.
     if let Some((lat, lon, note)) = extract_sds_position(&raw) {
@@ -294,10 +295,10 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
     // Prefer the structured CircularCall payload (parsed per Brew v1). Fall back
     // to the conservative raw source/destination pair for any peer that sends a
     // payload we could not fully structure.
-    let (source_issi, destination, mnemonic) = match &payload {
-        CallPayload::CircularCall(c) => (c.source, c.destination, c.mnemonic.clone()),
+    let (source_issi, destination, number, mnemonic) = match &payload {
+        CallPayload::CircularCall(c) => (c.source, c.destination, c.number.clone(), c.mnemonic.clone()),
         other => match protocol::raw_peer_pair(other) {
-            Some((s, d)) => (s, d, None),
+            Some((s, d)) => (s, d, String::new(), None),
             None => {
                 warn!(%source, uuid=%id, "private SETUP_REQUEST has no routable source/destination pair");
                 return;
@@ -306,12 +307,45 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
     };
     let mut inner = state.inner.write().await;
     let Some(target_client) = inner.subscribers.get(&destination).map(|s| s.client_id) else {
-        warn!(%source, uuid=%id, destination, "private call destination not registered");
+        drop(inner);
+        // The destination is not a registered Brew subscriber. Before giving up,
+        // offer it to the SIP subsystem: a voice route may bridge this TETRA
+        // private call out to a SIP extension or trunk (Brew -> SIP direction).
+        // The dialled string is the ASCII `number` field when the caller sent
+        // one (a PBX/phone call to a non-ISSI number, e.g. "9" + a 10-digit
+        // PSTN number: destination is 0/unrouted and the actual digits live in
+        // `number`, not `destination` -- see BrewCircularCall), falling back to
+        // the destination ISSI rendered as decimal for ordinary ISSI-to-ISSI
+        // calls that never set `number`. Route patterns can match either shape
+        // (e.g. "9*" for a PSTN prefix, "7*" or an exact ISSI string).
+        let dialled = {
+            let trimmed = number.trim();
+            if trimmed.is_empty() { destination.to_string() } else { trimmed.to_string() }
+        };
+        let bridged = {
+            let guard = state.sip.read().await;
+            match guard.as_ref() {
+                Some(h) => {
+                    if let Some(bridge) = h.transport.bridge.read().await.clone() {
+                        let origin = crate::sip::routing::CallOrigin::BrewPrivate(source_issi);
+                        let link = crate::sip::bridge::BrewCallLink { call_id: id, client: source };
+                        bridge.brew_to_sip(origin, &dialled, link).await
+                    } else { false }
+                }
+                None => false,
+            }
+        };
+        if bridged {
+            state.monitor.call_started(id, "private", source_issi, destination, 0).await;
+            info!(%source, uuid=%id, source_issi, destination, dialled = %dialled, mnemonic=?mnemonic, "routed private SETUP_REQUEST to SIP");
+        } else {
+            warn!(%source, uuid=%id, destination, dialled = %dialled, "private call destination not registered (no SIP route)");
+        }
         return;
     };
     if target_client == source { return; }
     let peers = HashSet::from([target_client]);
-    inner.calls.insert(id, ActiveCall { kind: CallKind::Private, owner: source, source_issi, destination, priority: 0, peers: peers.clone() });
+    inner.calls.insert(id, ActiveCall { kind: CallKind::Private, owner: source, source_issi, destination, priority: 0, peers: peers.clone(), started_at: std::time::Instant::now() });
     let tx = inner.clients.get(&target_client).map(|c| c.tx.clone());
     drop(inner);
     if let Some(tx) = tx { let _ = tx.send(raw); }
@@ -346,6 +380,41 @@ async fn route_call_frame(state: &Arc<AppState>, source: ClientId, id: uuid::Uui
     for tx in txs { let _ = tx.send(raw.clone()); }
 }
 
+/// Periodically ends Brew calls (private or group -- a station call directly
+/// between Basestations/mobiles, or the Brew leg of a SIP-bridged call) that
+/// have run longer than `Config::max_call_duration_seconds`. Reuses `end_call`
+/// so a timed-out call ends exactly like a normal hangup (CALL_RELEASE /
+/// CALL_GROUP_IDLE to participants, dashboard event, SIP-bridge teardown),
+/// not a silent kill. A no-op (never spawned as a busy loop) when the limit
+/// is 0 (disabled) -- see `main.rs`, which only spawns this when non-zero.
+/// Pure filter: which calls in `calls` have been running at least `limit`.
+/// Split out from `run_call_duration_sweep` so it's testable without an
+/// actual timer/interval.
+fn expired_calls(calls: &HashMap<uuid::Uuid, ActiveCall>, limit: std::time::Duration) -> Vec<(uuid::Uuid, ClientId, CallKind)> {
+    calls.iter()
+        .filter(|(_, call)| call.started_at.elapsed() >= limit)
+        .map(|(id, call)| (*id, call.owner, call.kind))
+        .collect()
+}
+
+pub async fn run_call_duration_sweep(state: Arc<AppState>) {
+    let limit = std::time::Duration::from_secs(state.config.max_call_duration_seconds);
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+    loop {
+        ticker.tick().await;
+        let expired = {
+            let inner = state.inner.read().await;
+            expired_calls(&inner.calls, limit)
+        };
+        for (id, owner, kind) in expired {
+            let release_state = if kind == CallKind::Group { protocol::CALL_GROUP_IDLE } else { protocol::CALL_RELEASE };
+            let raw = protocol::build_call_cause(release_state, &id, 0);
+            warn!(uuid=%id, ?kind, limit_secs = state.config.max_call_duration_seconds, "call exceeded max duration; force-ending");
+            end_call(&state, owner, id, raw).await;
+        }
+    }
+}
+
 async fn end_call(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: Vec<u8>) {
     let mut inner = state.inner.write().await;
     let Some(call) = inner.calls.remove(&id) else { debug!(uuid=%id, "call end for unknown call"); return; };
@@ -361,10 +430,28 @@ async fn end_call(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: 
     for tx in txs { let _ = tx.send(raw.clone()); }
     state.monitor.call_ended(id).await;
     info!(%source, uuid=%id, kind=?call.kind, "routed call end");
+
+    // If this call was bridged to SIP (Brew subscriber calling out), the Brew
+    // side just ended it first: tell the SIP peer too, instead of leaving its
+    // dialog dangling with a dead RTP stream.
+    if let Some(h) = state.sip.read().await.as_ref() {
+        if let Some(bridge) = h.transport.bridge.read().await.clone() {
+            bridge.teardown_by_brew_call(id).await;
+        }
+    }
 }
 
 async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: SubscriberMessage) {
     let mut inner = state.inner.write().await;
+    // The connecting client's advertised mode (Terminal/Basestation), used to
+    // tag the subscriber registration so MS-registration counts can exclude
+    // Basestation (Basestation gateway) registrations, which are not an MS.
+    let source_mode = inner.clients.get(&source).map(|c| c.mode).unwrap_or_default();
+    // Set below when this message is a Terminal-mode register/deregister, so
+    // it can be logged to the dashboard's registration log once `inner` is
+    // released (mirrors how position decoding logs via `state.telemetry`
+    // outside of the `inner` lock elsewhere in this module).
+    let mut ms_reg_event: Option<&'static str> = None;
     match msg.msg_type {
         SUB_REGISTER | SUB_REREGISTER => {
             let previous = inner.subscribers.get(&msg.issi).map(|s| (s.client_id, s.groups.clone()));
@@ -376,8 +463,9 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
                     }
                 }
             }
-            inner.subscribers.insert(msg.issi, Subscriber { client_id: source, groups: old_groups });
-            info!(%source, issi=msg.issi, "subscriber registered");
+            inner.subscribers.insert(msg.issi, Subscriber { client_id: source, groups: old_groups, mode: source_mode });
+            info!(%source, issi=msg.issi, mode=source_mode.as_str(), "subscriber registered");
+            if source_mode == crate::state::ClientMode::Terminal { ms_reg_event = Some("register"); }
         }
         SUB_DEREGISTER => {
             if let Some(sub) = inner.subscribers.remove(&msg.issi) {
@@ -386,14 +474,15 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
                         let still_present = inner.subscribers.values().any(|other| other.client_id == source && other.groups.contains(&gssi));
                         if !still_present { if let Some(clients) = inner.group_clients.get_mut(&gssi) { clients.remove(&source); } }
                     }
-                    info!(%source, issi=msg.issi, "subscriber deregistered");
+                    info!(%source, issi=msg.issi, mode=sub.mode.as_str(), "subscriber deregistered");
+                    if sub.mode == crate::state::ClientMode::Terminal { ms_reg_event = Some("deregister"); }
                 } else { inner.subscribers.insert(msg.issi, sub); }
             }
         }
         SUB_AFFILIATE => {
             let owner = inner.subscribers.get(&msg.issi).map(|s| s.client_id);
             if let Some(owner) = owner { if owner != source { warn!(%source, issi=msg.issi, "affiliation from non-owner"); return; } }
-            else { inner.subscribers.insert(msg.issi, Subscriber { client_id: source, groups: HashSet::new() }); }
+            else { inner.subscribers.insert(msg.issi, Subscriber { client_id: source, groups: HashSet::new(), mode: source_mode }); }
             for gssi in msg.groups {
                 if let Some(sub) = inner.subscribers.get_mut(&msg.issi) { sub.groups.insert(gssi); }
                 inner.group_clients.entry(gssi).or_default().insert(source);
@@ -411,13 +500,20 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
         }
         _ => debug!(%source, msg_type=msg.msg_type, "unknown subscriber message"),
     }
+    drop(inner);
+    // Log Terminal-mode (actual MS) registration lifecycle events to the same
+    // dashboard registration log Basestation telemetry registrations use, so
+    // an MS registering directly over the Brew protocol is visible there too.
+    if let Some(kind) = ms_reg_event {
+        state.telemetry.write().await.record_brew_registration(msg.issi, kind);
+    }
 }
 
 #[cfg(test)]
 mod position_tests {
     use super::extract_sds_position;
 
-    // Real LIP beacon captured from FlowStation (ISSI 90), Athens.
+    // Real LIP beacon captured from Basestation (ISSI 90), Athens.
     const LIP: [u8; 11] = [0x0a, 0x01, 0x0e, 0x62, 0x39, 0xb0, 0x43, 0x9a, 0xff, 0xe0, 0x20];
 
     fn framed(payload: &[u8]) -> Vec<u8> {
@@ -470,5 +566,45 @@ mod position_tests {
         let raw = framed(b"\x0144.4353, 26.1092");
         let (lat, lon, _) = extract_sds_position(&raw).expect("text decode");
         assert!((lat - 44.4353).abs() < 0.01 && (lon - 26.1092).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod call_duration_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn call(started_at: std::time::Instant, kind: CallKind) -> ActiveCall {
+        ActiveCall {
+            kind,
+            owner: uuid::Uuid::new_v4(),
+            source_issi: 1001,
+            destination: 90,
+            priority: 0,
+            peers: HashSet::new(),
+            started_at,
+        }
+    }
+
+    #[test]
+    fn finds_only_calls_at_or_past_the_limit() {
+        let now = std::time::Instant::now();
+        let mut calls = HashMap::new();
+        let old_id = uuid::Uuid::new_v4();
+        calls.insert(old_id, call(now - Duration::from_secs(120), CallKind::Private));
+        let fresh_id = uuid::Uuid::new_v4();
+        calls.insert(fresh_id, call(now - Duration::from_secs(5), CallKind::Group));
+
+        let expired = expired_calls(&calls, Duration::from_secs(60));
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, old_id);
+    }
+
+    #[test]
+    fn empty_when_nothing_exceeds_limit() {
+        let now = std::time::Instant::now();
+        let mut calls = HashMap::new();
+        calls.insert(uuid::Uuid::new_v4(), call(now, CallKind::Private));
+        assert!(expired_calls(&calls, Duration::from_secs(60)).is_empty());
     }
 }

@@ -1,4 +1,5 @@
 use crate::{
+    config,
     control::{self, ControlCommand, SendError},
     state::AppState,
     telemetry::TelemetryBts,
@@ -16,6 +17,9 @@ use axum::extract::Request;
 use base64::Engine;
 use std::{collections::HashMap, sync::Arc};
 
+/// Server version shown under the "Live" indicator in every page header.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Runs the monitoring dashboard on its own listener (separate from the Brew
 /// API). Gated behind optional HTTP Basic auth and optional TLS via the
 /// `[dashboard]` config section. Returns immediately if disabled.
@@ -30,13 +34,28 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/calls", get(calls_page))
         .route("/sds", get(sds_page))
         .route("/telemetry-sds", get(telemetry_sds_page))
+        .route("/registrations", get(registrations_page))
+        .route("/connections", get(connections_page))
         .route("/map", get(map_page))
         .route("/api/status", get(snapshot))
         .route("/api/live", get(live))
         .route("/api/telemetry", get(telemetry_snapshot))
+        .route("/api/registrations", get(registration_log))
+        .route("/api/connections", get(connections_snapshot))
         .route("/api/positions", get(positions_snapshot))
         .route("/api/control", get(control_list))
         .route("/api/control/{id}", axum::routing::post(control_command))
+        .route("/sip", get(sip_page))
+        .route("/sip-config", get(sip_config_page))
+        .route("/api/sip", get(sip_snapshot))
+        .route("/api/sip/config", get(sip_config))
+        .route("/settings", get(settings_page))
+        .route("/api/config/raw", get(config_raw_get).put(config_raw_put))
+        .route("/api/config/sip/full", get(sip_config_full))
+        .route("/api/config/sip/extensions/{user}", axum::routing::post(upsert_sip_extension).delete(delete_sip_extension))
+        .route("/api/config/sip/trunks/{name}", axum::routing::post(upsert_sip_trunk).delete(delete_sip_trunk))
+        .route("/api/config/sip/routes", axum::routing::post(upsert_sip_route))
+        .route("/api/config/sip/routes/{name}", axum::routing::delete(delete_sip_route))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_basic))
         .with_state(state.clone());
 
@@ -97,7 +116,7 @@ fn basic_challenge(realm: &str) -> Response {
 /// The main dashboard HTML with the shared stylesheet substituted in, built
 /// once on first access.
 static INDEX_HTML: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| HTML.replace("__STYLE__", STYLE));
+    std::sync::LazyLock::new(|| HTML.replace("__STYLE__", STYLE).replace("__VERSION__", VERSION));
 
 pub async fn index() -> Html<&'static str> { Html(INDEX_HTML.as_str()) }
 
@@ -108,7 +127,7 @@ pub async fn index() -> Html<&'static str> { Html(INDEX_HTML.as_str()) }
 fn log_page(title: &str, endpoint: &str, extract_js: &str, row_js: &str, columns: &[&str], per_page: usize, empty_msg: &str) -> String {
     let headers: String = columns.iter().map(|c| format!("<th>{c}</th>")).collect();
     let colspan = columns.len();
-    format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{title} - TETRA Network</title>{style}</head><body><header><h1>{title}</h1><div><span class=live></span><span id=status>Live</span></div></header><main class=wrap>
+    format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{title} - TETRA Network</title>{style}</head><body><header><h1>{title}</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=ver>v{ver}</div></div></header><main class=wrap>
 <p><a class=backlink href="/">&larr; Back to dashboard</a></p>
 <section class=panel><table><thead><tr>{headers}</tr></thead><tbody id=log></tbody></table><div class=pager id=log-pager></div></section>
 </main><script>
@@ -139,7 +158,7 @@ function draw(){{renderPaged('log',last,x=>{row_js},{per_page},{colspan},'{empty
 async function load(){{try{{const d=await(await fetch('{endpoint}')).json();last={extract_js};draw();$('status').textContent='Live';}}catch(e){{$('status').textContent='Disconnected';}}}}
 load();setInterval(load,2000);
 </script></body></html>"#,
-        title = title, style = STYLE, headers = headers, colspan = colspan,
+        title = title, style = STYLE, ver = VERSION, headers = headers, colspan = colspan,
         row_js = row_js, per_page = per_page, empty_msg = empty_msg,
         endpoint = endpoint, extract_js = extract_js,
     )
@@ -164,6 +183,13 @@ static TELEMETRY_SDS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::ne
     &["Time", "BTS", "Dir", "From", "To", "Type", "Text"], 5, "No telemetry SDS yet",
 ));
 
+static REGISTRATIONS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| log_page(
+    "Mobile Station Registrations", "/api/registrations",
+    "d",
+    "`<tr><td>${dt(x.at_ms)}</td><td>${esc(x.bts)}</td><td>${x.issi}</td><td>${x.kind==='register'?'<span class=\"badge badge-reg-in\">Registered</span>':x.kind==='deregister'?'<span class=\"badge badge-reg-out\">Deregistered</span>':'<span class=\"badge badge-reg-timeout\">Timed out</span>'}</td></tr>`",
+    &["Time", "BTS", "ISSI", "Event"], 15, "No registration events yet",
+));
+
 /// Standalone map page. Plots the latest decoded MS positions on an
 /// OpenStreetMap base layer using Leaflet (loaded from unpkg CDN). Positions
 /// come only from *textual* beacons; the page explains that binary LIP is not
@@ -172,7 +198,7 @@ static MAP_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| forma
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 {style}
 <style>#map{{height:70vh;border:1px solid #203047;border-radius:12px}}.map-note{{font-size:12px;color:#8fa2b8;margin-top:10px}}.leaflet-popup-content{{color:#0d1826}}</style>
-</head><body><header><h1>MS MAP</h1><div><span class=live></span><span id=status>Live</span></div></header><main class=wrap>
+</head><body><header><h1>MS MAP</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=ver>v{ver}</div></div></header><main class=wrap>
 <p><a class=backlink href="/">&larr; Back to dashboard</a></p>
 <section class=panel><h2>Mobile station positions</h2><div id=map></div>
 <div class=map-note id=note>Loading positions&hellip;</div>
@@ -219,12 +245,232 @@ async function load(){{
   }}catch(e){{}}
 }}
 load();setInterval(load,3000);
-</script></body></html>"#, style = STYLE));
+</script></body></html>"#, style = STYLE, ver = VERSION));
+
+/// SIP live panel: registrations, trunks and active calls, polled from
+/// /api/sip every 2s. Renders a clear "disabled" notice when SIP is off.
+static SIP_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>SIP / VoIP - TETRA Network</title>{style}</head><body><header><h1>SIP / VoIP</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=ver>v{ver}</div></div></header><main class=wrap>
+<p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/sip-config">SIP configuration &rarr;</a></p>
+<div class=banner id=disabled-banner>SIP subsystem is disabled. Enable it in the <code>[sip]</code> section of the config file.</div>
+<section class=cards>
+<div class=card><div class=muted>Listen</div><div class=n id=listen style="font-size:16px">-</div></div>
+<div class=card><div class=muted>Registrations</div><div class=n id=nreg>-</div></div>
+<div class=card><div class=muted>Trunks up</div><div class=n id=ntrunk>-</div></div>
+<div class=card><div class=muted>Active calls</div><div class=n id=nactive>-</div></div>
+<div class=card><div class=muted>Total calls</div><div class=n id=ntotal>-</div></div>
+<div class=card><div class=muted>Realm</div><div class=n id=realm style="font-size:16px">-</div></div>
+</section>
+<section class=panel><h2>Extension registrations</h2><table><thead><tr><th>AOR</th><th>Contact</th><th>Source</th><th>User-Agent</th><th>Auth</th><th>Expires in</th></tr></thead><tbody id=regs></tbody></table></section>
+<section class=panel><h2>Trunks</h2><table><thead><tr><th>Name</th><th>Direction</th><th>Remote</th><th>Status</th><th>Peer</th><th>Detail</th><th>Calls</th></tr></thead><tbody id=trunks></tbody></table></section>
+<section class=panel><h2>Active calls</h2><table><thead><tr><th>From</th><th>To</th><th>State</th><th>Duration</th><th>RTP A/B</th><th>Call-ID</th></tr></thead><tbody id=calls></tbody></table></section>
+</main><script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c]));
+const now=()=>Date.now();
+const dur=(a,b)=>{{if(!a)return'-';return Math.max(0,Math.floor(((b||now())-a)/1000))+'s';}};
+const legName=e=>{{if(!e)return'-';switch(e.type){{case'sip_extension':return'ext '+esc(e.aor);case'sip_trunk':return'trunk '+esc(e.trunk)+(e.number?(' /'+esc(e.number)):'');case'brew_private':return'ISSI '+e.issi;case'brew_group':return'GSSI '+e.gssi;case'sip_external':return esc(e.uri);default:return esc(JSON.stringify(e));}}}};
+function badge(s){{const m={{up:'health-ok',registering:'health-degraded',failed:'health-critical',down:'health-unknown'}};return`<span class="pill ${{m[s]||'health-unknown'}}">${{esc(s)}}</span>`;}}
+async function load(){{
+  try{{
+    const d=await(await fetch('/api/sip')).json();
+    $('status').textContent='Live';
+    $('disabled-banner').style.display=d.enabled?'none':'block';
+    $('listen').textContent=d.listen||'-';
+    $('realm').textContent=d.realm||'-';
+    $('nreg').textContent=d.registrations.length;
+    $('ntrunk').textContent=d.trunks.filter(t=>t.status==='up').length+'/'+d.trunks.length;
+    $('nactive').textContent=d.active_calls.length;
+    $('ntotal').textContent=d.total_calls;
+    $('regs').innerHTML=d.registrations.map(r=>`<tr><td>${{esc(r.aor)}}</td><td class=muted>${{esc(r.contact)}}</td><td>${{esc(r.source)}}</td><td class=muted>${{esc(r.user_agent)}}</td><td>${{r.authenticated?'<span class="pill health-ok">yes</span>':'<span class="pill health-unknown">no</span>'}}</td><td>${{Math.max(0,Math.floor((r.expires_at_ms-now())/1000))}}s</td></tr>`).join('')||'<tr><td colspan=6 class=muted>No registrations</td></tr>';
+    $('trunks').innerHTML=d.trunks.map(t=>`<tr><td>${{esc(t.name)}}</td><td>${{esc(t.direction)}}</td><td>${{esc(t.remote_host)}}</td><td>${{badge(t.status)}}</td><td class=muted>${{esc(t.peer_addr||'-')}}</td><td class=muted>${{esc(t.detail)}}</td><td>${{t.active_calls}}</td></tr>`).join('')||'<tr><td colspan=7 class=muted>No trunks provisioned</td></tr>';
+    $('calls').innerHTML=d.active_calls.map(c=>`<tr><td>${{legName(c.from)}}</td><td>${{legName(c.to)}}</td><td>${{esc(c.state)}}</td><td>${{dur(c.answered_at_ms||c.started_at_ms)}}</td><td class=muted>${{c.rtp_a_port||'-'}}/${{c.rtp_b_port||'-'}}</td><td class=muted>${{esc(String(c.call_id).slice(0,18))}}</td></tr>`).join('')||'<tr><td colspan=6 class=muted>No active calls</td></tr>';
+  }}catch(e){{$('status').textContent='Disconnected';}}
+}}
+load();setInterval(load,2000);
+</script></body></html>"#, style = STYLE, ver = VERSION));
+
+/// SIP configuration screen: a read-only view of the provisioned extensions,
+/// trunks and voice routes from the config file, plus an inline explanation
+/// that edits are made in the TOML (which the server hot-reloads).
+static SIP_CONFIG_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>SIP Config - TETRA Network</title>{style}</head><body><header><h1>SIP CONFIGURATION</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=ver>v{ver}</div></div></header><main class=wrap>
+<p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/sip">SIP live panel &rarr;</a></p>
+<div class=banner id=disabled-banner>SIP subsystem is disabled. Set <code>enabled = true</code> under <code>[sip]</code>.</div>
+<section class=panel><h2>General</h2><table><tbody id=general></tbody></table>
+<p class=map-note style="color:#8fa2b8;font-size:12px">This screen is read-only. Edit extensions, trunks and routes on the <a class=backlink href="/settings">Settings</a> page, or directly in the server's TOML config file (the running process watches the file and restarts to apply changes). Passwords are never shown here.</p>
+</section>
+<section class=panel><h2>Extensions</h2><table><thead><tr><th>User</th><th>Display name</th><th>ISSI</th><th>Outbound</th><th>Password</th></tr></thead><tbody id=exts></tbody></table></section>
+<section class=panel><h2>Trunks</h2><table><thead><tr><th>Name</th><th>Direction</th><th>Remote host</th><th>Username</th><th>Realm</th><th>Reg interval</th><th>Enabled</th><th>Password</th></tr></thead><tbody id=trunks></tbody></table></section>
+<section class=panel><h2>Voice routes</h2><table><thead><tr><th>#</th><th>Name</th><th>Match</th><th>Strip prefix</th><th>From</th><th>To</th><th>Enabled</th></tr></thead><tbody id=routes></tbody></table>
+<p class=map-note style="color:#8fa2b8;font-size:12px">Routes are evaluated top to bottom; the first enabled route whose match pattern (and optional <em>from</em> restriction) matches the dialled destination wins. Endpoints: <code>ext:USER</code>, <code>trunk:NAME[/NUMBER]</code>, <code>issi:N</code> (Brew private), <code>group:N</code> (Brew group). <code>strip_prefix</code> removes a leading literal from the dialled string before it reaches an empty-number trunk destination (e.g. a "9" outside-line prefix).</p>
+</section>
+<style>#general td:first-child{{color:#8fa2b8;width:220px}}</style>
+</main><script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c]));
+const yn=b=>b?'<span class="pill health-ok">yes</span>':'<span class="pill health-unknown">no</span>';
+const pw=b=>b?'<span class="pill health-ok">set</span>':'<span class="pill health-critical">none</span>';
+async function load(){{
+  try{{
+    const d=await(await fetch('/api/sip/config')).json();
+    $('status').textContent='Live';
+    $('disabled-banner').style.display=d.enabled?'none':'block';
+    $('general').innerHTML=[
+      ['Enabled',yn(d.enabled)],
+      ['Listen',esc(d.listen)],
+      ['Advertised host',esc(d.advertised_host||'(socket local address)')],
+      ['Realm',esc(d.realm)],
+      ['RTP port range',esc(d.rtp_port_min)+' - '+esc(d.rtp_port_max)],
+      ['Registration TTL',esc(d.registration_ttl_seconds)+'s'],
+    ].map(r=>`<tr><td>${{r[0]}}</td><td>${{r[1]}}</td></tr>`).join('');
+    $('exts').innerHTML=d.extensions.map(e=>`<tr><td>${{esc(e.user)}}</td><td>${{esc(e.display_name||'-')}}</td><td>${{e.issi||'-'}}</td><td>${{yn(e.allow_outbound)}}</td><td>${{pw(e.has_password)}}</td></tr>`).join('')||'<tr><td colspan=5 class=muted>No extensions provisioned</td></tr>';
+    $('trunks').innerHTML=d.trunks.map(t=>`<tr><td>${{esc(t.name)}}</td><td>${{esc(t.direction)}}</td><td>${{esc(t.remote_host||'-')}}</td><td>${{esc(t.username)}}</td><td class=muted>${{esc(t.realm||'-')}}</td><td>${{esc(t.register_interval_seconds)}}s</td><td>${{yn(t.enabled)}}</td><td>${{pw(t.has_password)}}</td></tr>`).join('')||'<tr><td colspan=8 class=muted>No trunks provisioned</td></tr>';
+    $('routes').innerHTML=d.routes.map((r,i)=>`<tr><td class=muted>${{i+1}}</td><td>${{esc(r.name||'-')}}</td><td><code>${{esc(r.match_pattern)}}</code></td><td class=muted>${{r.strip_prefix?esc(r.strip_prefix):'-'}}</td><td>${{esc(r.from||'any')}}</td><td>${{esc(r.to||'-')}}</td><td>${{yn(r.enabled)}}</td></tr>`).join('')||'<tr><td colspan=7 class=muted>No routes configured</td></tr>';
+  }}catch(e){{$('status').textContent='Disconnected';}}
+}}
+load();setInterval(load,5000);
+</script></body></html>"#, style = STYLE, ver = VERSION));
+
+/// Live "who's connected now" page: Brew connections, registered mobile
+/// stations, and SIP registrations/trunks. Distinct from `/registrations`,
+/// which is a historical event log (registers/deregisters over time), not a
+/// current-state snapshot.
+static CONNECTIONS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Connections - TETRA Network</title>{style}</head><body><header><h1>LIVE CONNECTIONS</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=ver>v{ver}</div></div></header><main class=wrap>
+<p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/registrations">Registration event log &rarr;</a></p>
+<p class=map-note style="color:#8fa2b8;font-size:12px">Who is connected and registered right now, not a history of events. Refreshes every 5s.</p>
+
+<section class=panel><h2>Brew Connections<span class=backlink id=bc-count></span></h2><table><thead><tr><th>ID</th><th>Mode</th><th>Version</th><th>Remote address</th><th>Connected</th><th>Registered ISSIs</th></tr></thead><tbody id=brew-clients></tbody></table></section>
+
+<section class=panel><h2>Registered Subscribers<span class=backlink id=ms-count></span></h2><table><thead><tr><th>ISSI</th><th>Registered via</th><th>Basestation</th><th>Basestation address</th><th>Groups</th></tr></thead><tbody id=mobile-stations></tbody></table></section>
+
+<section class=panel><h2>SIP Registrations<span class=backlink id=sip-count></span></h2><div class=banner id=sip-disabled-banner>SIP subsystem is disabled.</div><table><thead><tr><th>AOR</th><th>Contact</th><th>Source</th><th>User-Agent</th><th>Registered</th><th>Expires</th><th>Auth</th></tr></thead><tbody id=sip-regs></tbody></table></section>
+
+<section class=panel><h2>SIP Trunks</h2><table><thead><tr><th>Name</th><th>Direction</th><th>Status</th><th>Remote host</th><th>Active calls</th></tr></thead><tbody id=sip-trunks></tbody></table></section>
+</main><script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c]));
+const yn=b=>b?'<span class="pill health-ok">yes</span>':'<span class="pill health-unknown">no</span>';
+const dt=x=>x?new Date(x).toLocaleString():'-';
+const ago=x=>{{if(!x)return '-';const s=Math.max(0,Math.floor((Date.now()-x)/1000));if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m ago';}};
+async function load(){{
+  try{{
+    const d=await(await fetch('/api/connections')).json();
+    $('status').textContent='Live';
+    $('bc-count').textContent=' ('+d.brew_clients.length+')';
+    $('ms-count').textContent=' ('+d.mobile_stations.length+')';
+    $('brew-clients').innerHTML=d.brew_clients.map(c=>`<tr><td class=muted>${{esc(c.id).slice(0,8)}}</td><td>${{esc(c.mode)}}</td><td>${{c.version}}</td><td>${{esc(c.remote_addr||'-')}}</td><td>${{ago(c.connected_at_ms)}}</td><td>${{c.registered_issis}}</td></tr>`).join('')||'<tr><td colspan=6 class=muted>No Brew connections</td></tr>';
+    $('mobile-stations').innerHTML=d.mobile_stations.map(m=>`<tr><td>${{m.issi}}</td><td>${{esc(m.mode)}}</td><td class=muted>${{esc(m.basestation_id).slice(0,8)}}</td><td>${{esc(m.basestation_addr||'-')}}</td><td>${{(m.groups||[]).join(', ')||'-'}}</td></tr>`).join('')||'<tr><td colspan=5 class=muted>No registered subscribers</td></tr>';
+    $('sip-disabled-banner').style.display=d.sip.enabled?'none':'block';
+    $('sip-count').textContent=' ('+d.sip.registrations.length+')';
+    $('sip-regs').innerHTML=d.sip.registrations.map(r=>`<tr><td>${{esc(r.aor)}}</td><td class=muted>${{esc(r.contact)}}</td><td>${{esc(r.source)}}</td><td class=muted>${{esc(r.user_agent||'-')}}</td><td>${{dt(r.registered_at_ms)}}</td><td>${{dt(r.expires_at_ms)}}</td><td>${{yn(r.authenticated)}}</td></tr>`).join('')||'<tr><td colspan=7 class=muted>No SIP registrations</td></tr>';
+    $('sip-trunks').innerHTML=d.sip.trunks.map(t=>`<tr><td>${{esc(t.name)}}</td><td>${{esc(t.direction)}}</td><td>${{esc(t.status)}}</td><td class=muted>${{esc(t.remote_host||'-')}}</td><td>${{t.active_calls}}</td></tr>`).join('')||'<tr><td colspan=5 class=muted>No SIP trunks configured</td></tr>';
+  }}catch(e){{$('status').textContent='Disconnected';}}
+}}
+load();setInterval(load,5000);
+</script></body></html>"#, style = STYLE, ver = VERSION));
+
+static SETTINGS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Settings - TETRA Network</title>{style}</head><body><header><h1>SETTINGS</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=ver>v{ver}</div></div></header><main class=wrap>
+<p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/sip-config">SIP Config (read-only view) &rarr;</a></p>
+<div class=banner id=save-banner></div>
+<p class=map-note style="color:#8fa2b8;font-size:12px">Every save here writes the server's TOML config file and the process restarts within a couple seconds to apply it (the same mechanism as hand-editing the file). A brief connection drop across the restart is expected.</p>
+
+<section class=panel><h2>SIP Extensions</h2><table><thead><tr><th>User (AOR)</th><th>Display name</th><th>ISSI</th><th>Password</th><th>Outbound</th><th></th></tr></thead><tbody id=exts></tbody></table>
+<div class=ctl-row><input id=ext-user placeholder="user (e.g. 1001)"><input id=ext-name placeholder="display name"><input id=ext-issi placeholder="ISSI" type=number><input id=ext-pass placeholder="password"><label><input id=ext-out type=checkbox checked> outbound</label><button onclick="saveExt()">Add / Update</button></div>
+</section>
+
+<section class=panel><h2>SIP Trunks</h2><table><thead><tr><th>Name</th><th>Direction</th><th>Remote host</th><th>Username</th><th>Password</th><th>Realm</th><th>Reg interval</th><th>Enabled</th><th></th></tr></thead><tbody id=trunks></tbody></table>
+<div class=ctl-row><input id=tr-name placeholder="name"><select id=tr-dir><option value=outbound>outbound</option><option value=inbound>inbound</option><option value=peer>peer</option></select><input id=tr-host placeholder="remote host:port"><input id=tr-user placeholder="username"><input id=tr-pass placeholder="password"><input id=tr-realm placeholder="realm"><input id=tr-interval placeholder="reg interval s" type=number value=300><label><input id=tr-en type=checkbox checked> enabled</label><button onclick="saveTrunk()">Add / Update</button></div>
+</section>
+
+<section class=panel><h2>Voice routes</h2><table><thead><tr><th>Name</th><th>Match</th><th>Strip prefix</th><th>From</th><th>To</th><th>Enabled</th><th></th></tr></thead><tbody id=routes></tbody></table>
+<div class=ctl-row><input id=rt-name placeholder="name"><input id=rt-match placeholder="match pattern, e.g. 9*"><input id=rt-strip placeholder="strip prefix, e.g. 9" style="width:110px"><input id=rt-from placeholder="from (optional): ext:USER | trunk:NAME | issi:N | group:N"><input id=rt-to placeholder="to: ext:USER | trunk:NAME[/NUMBER] | issi:N | group:N"><label><input id=rt-en type=checkbox checked> enabled</label><button onclick="saveRoute()">Add / Update</button></div>
+<p class=map-note style="color:#8fa2b8;font-size:12px">Endpoint shorthand: <code>ext:USER</code>, <code>trunk:NAME</code> or <code>trunk:NAME/NUMBER</code>, <code>issi:N</code> (Brew private), <code>group:N</code> (Brew group). Matching runs against the full dialled string (e.g. a PSTN call from a mobile terminal dialling "9" + 10 digits arrives as dialled string "9XXXXXXXXXX"); <code>strip_prefix</code> removes a leading literal (e.g. "9") only from what's handed to an empty-number <code>trunk:NAME</code> destination, so the trunk dials the bare 10 digits. Updating a route matches by name and keeps its position; a new name appends to the end (reorder via the raw editor below).</p>
+</section>
+
+<section class=panel><h2>Full configuration (raw TOML)</h2>
+<p class=map-note style="color:#8fa2b8;font-size:12px">Every setting lives here, including ones with no form above (listen addresses, TLS, dashboard/auth/telemetry/control users, storage, call-routing flags). Loads the live config; Save validates it before writing anything.</p>
+<textarea id=raw style="width:100%;min-height:420px;background:#0d1826;color:#e7edf5;border:1px solid #203047;border-radius:8px;padding:12px;font-family:ui-monospace,monospace;font-size:12px"></textarea>
+<div class=ctl-row><button onclick="loadRaw()">Reload from server</button><button onclick="saveRaw()">Save</button><span id=raw-result class=ctl-result></span></div>
+</section>
+</main><script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c]));
+const yn=b=>b?'<span class="pill health-ok">yes</span>':'<span class="pill health-unknown">no</span>';
+function banner(ok,msg){{const b=$('save-banner');b.style.display='block';b.style.background=ok?'#173822':'#3a1414';b.style.borderColor=ok?'#245c37':'#f2545b';b.style.color=ok?'#52d273':'#ffb4b8';b.textContent=msg;setTimeout(()=>{{b.style.display='none'}},6000);}}
+async function api(method,url,body){{
+  const r=await fetch(url,{{method,headers:body!==undefined?{{'Content-Type':'application/json'}}:undefined,body:body!==undefined?JSON.stringify(body):undefined}});
+  const t=await r.text();
+  if(!r.ok){{banner(false,'Failed: '+t);throw new Error(t);}}
+  banner(true,'Saved. Restarting to apply…');
+  return t;
+}}
+function endpoint(s){{
+  if(!s)return null;
+  const [kind,rest]=s.split(':');
+  if(kind==='ext')return {{kind:'sip_extension',user:rest}};
+  if(kind==='trunk'){{const[trunk,number]=rest.split('/');return {{kind:'sip_trunk',trunk,number:number||''}};}}
+  if(kind==='issi')return {{kind:'brew_private',issi:parseInt(rest,10)}};
+  if(kind==='group')return {{kind:'brew_group',gssi:parseInt(rest,10)}};
+  return null;
+}}
+function describe(ep){{
+  if(!ep)return '';
+  if(ep.kind==='sip_extension')return 'ext:'+ep.user;
+  if(ep.kind==='sip_trunk')return ep.number?`trunk:${{ep.trunk}}/${{ep.number}}`:'trunk:'+ep.trunk;
+  if(ep.kind==='brew_private')return 'issi:'+ep.issi;
+  if(ep.kind==='brew_group')return 'group:'+ep.gssi;
+  return '';
+}}
+async function loadSip(){{
+  const d=await(await fetch('/api/config/sip/full')).json();
+  $('exts').innerHTML=Object.entries(d.extensions).map(([user,e])=>`<tr><td>${{esc(user)}}</td><td>${{esc(e.display_name||'-')}}</td><td>${{e.issi||'-'}}</td><td class=muted>${{e.password?'•'.repeat(8):'(none)'}}</td><td>${{yn(e.allow_outbound)}}</td><td><button onclick="delExt('${{esc(user)}}')">Delete</button></td></tr>`).join('')||'<tr><td colspan=6 class=muted>No extensions provisioned</td></tr>';
+  $('trunks').innerHTML=Object.entries(d.trunks).map(([name,t])=>`<tr><td>${{esc(name)}}</td><td>${{esc(t.direction)}}</td><td>${{esc(t.remote_host||'-')}}</td><td>${{esc(t.username)}}</td><td class=muted>${{t.password?'•'.repeat(8):'(none)'}}</td><td class=muted>${{esc(t.realm||'-')}}</td><td>${{esc(t.register_interval_seconds)}}s</td><td>${{yn(t.enabled)}}</td><td><button onclick="delTrunk('${{esc(name)}}')">Delete</button></td></tr>`).join('')||'<tr><td colspan=9 class=muted>No trunks provisioned</td></tr>';
+  $('routes').innerHTML=d.routes.map(r=>`<tr><td>${{esc(r.name||'-')}}</td><td><code>${{esc(r.match_pattern)}}</code></td><td class=muted>${{r.strip_prefix?esc(r.strip_prefix):'-'}}</td><td>${{esc(describe(r.from))||'any'}}</td><td>${{esc(describe(r.to))}}</td><td>${{yn(r.enabled)}}</td><td><button onclick="delRoute('${{esc(r.name)}}')">Delete</button></td></tr>`).join('')||'<tr><td colspan=7 class=muted>No routes configured</td></tr>';
+}}
+async function saveExt(){{
+  const user=$('ext-user').value.trim(); if(!user)return;
+  await api('POST',`/api/config/sip/extensions/${{encodeURIComponent(user)}}`,{{
+    password:$('ext-pass').value, display_name:$('ext-name').value,
+    issi:parseInt($('ext-issi').value,10)||0, allow_outbound:$('ext-out').checked,
+  }});
+  loadSip();
+}}
+async function delExt(user){{ await api('DELETE',`/api/config/sip/extensions/${{encodeURIComponent(user)}}`); loadSip(); }}
+async function saveTrunk(){{
+  const name=$('tr-name').value.trim(); if(!name)return;
+  await api('POST',`/api/config/sip/trunks/${{encodeURIComponent(name)}}`,{{
+    direction:$('tr-dir').value, remote_host:$('tr-host').value, username:$('tr-user').value,
+    password:$('tr-pass').value, realm:$('tr-realm').value,
+    register_interval_seconds:parseInt($('tr-interval').value,10)||300, enabled:$('tr-en').checked,
+  }});
+  loadSip();
+}}
+async function delTrunk(name){{ await api('DELETE',`/api/config/sip/trunks/${{encodeURIComponent(name)}}`); loadSip(); }}
+async function saveRoute(){{
+  const name=$('rt-name').value.trim(); if(!name)return;
+  await api('POST','/api/config/sip/routes',{{
+    name, match_pattern:$('rt-match').value||'*', strip_prefix:$('rt-strip').value.trim(),
+    from:endpoint($('rt-from').value.trim()), to:endpoint($('rt-to').value.trim()),
+    enabled:$('rt-en').checked,
+  }});
+  loadSip();
+}}
+async function delRoute(name){{ await api('DELETE',`/api/config/sip/routes/${{encodeURIComponent(name)}}`); loadSip(); }}
+async function loadRaw(){{ $('raw').value=await(await fetch('/api/config/raw')).text(); }}
+async function saveRaw(){{
+  const r=await fetch('/api/config/raw',{{method:'PUT',body:$('raw').value}});
+  const t=await r.text();
+  if(!r.ok){{banner(false,'Failed: '+t);return;}}
+  banner(true,'Saved. Restarting to apply…');
+}}
+loadSip();loadRaw();
+</script></body></html>"#, style = STYLE, ver = VERSION));
 
 pub async fn calls_page() -> Html<&'static str> { Html(CALLS_HTML.as_str()) }
 pub async fn sds_page() -> Html<&'static str> { Html(SDS_HTML.as_str()) }
 pub async fn telemetry_sds_page() -> Html<&'static str> { Html(TELEMETRY_SDS_HTML.as_str()) }
-pub async fn snapshot(State(state): State<Arc<AppState>>) -> Json<crate::monitor::Snapshot> { let i=state.inner.read().await; let counts=(i.clients.len(),i.subscribers.len(),i.group_clients.len()); drop(i); Json(state.monitor.snapshot(counts.0,counts.1,counts.2).await) }
+pub async fn registrations_page() -> Html<&'static str> { Html(REGISTRATIONS_HTML.as_str()) }
+pub async fn connections_page() -> Html<&'static str> { Html(CONNECTIONS_HTML.as_str()) }
+pub async fn snapshot(State(state): State<Arc<AppState>>) -> Json<crate::monitor::Snapshot> { let i=state.inner.read().await; let counts=(i.basestation_count(),i.ms_registration_count(),i.group_clients.len()); drop(i); Json(state.monitor.snapshot(counts.0,counts.1,counts.2).await) }
 pub async fn live(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> impl IntoResponse { ws.on_upgrade(move |s| live_socket(state,s)) }
 async fn live_socket(state: Arc<AppState>, mut socket: WebSocket) { let mut rx=state.monitor.subscribe(); while let Ok(ev)=rx.recv().await { if socket.send(Message::Text(serde_json::to_string(&ev).unwrap().into())).await.is_err(){break;} } }
 
@@ -232,11 +478,260 @@ pub async fn telemetry_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<
     Json(state.telemetry.read().await.snapshot())
 }
 
+pub async fn registration_log(State(state): State<Arc<AppState>>) -> Json<Vec<crate::telemetry::RegLogRow>> {
+    Json(state.telemetry.read().await.registration_log())
+}
+
 pub async fn positions_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<crate::telemetry::PositionFix>> {
     Json(state.telemetry.read().await.positions())
 }
 
 pub async fn map_page() -> Html<&'static str> { Html(MAP_HTML.as_str()) }
+
+/// JSON snapshot of the SIP subsystem for the live panel. Returns an object
+/// with `enabled=false` when SIP is not running, so the page can render a clear
+/// disabled state rather than erroring.
+/// Live "who's connected right now" snapshot: Brew connections (Basestations
+/// and any direct Terminal/brew mobile clients), registered subscribers
+/// (every ISSI in `inner.subscribers`, whether registered directly by a
+/// Terminal-mode MS or on its behalf by a Basestation gateway -- matches
+/// what the main dashboard's "Registered Subscribers" panel shows), and SIP
+/// registrations/trunks. Unlike `/api/registrations` (a historical event
+/// log), this reflects only what is connected/registered at this instant.
+pub async fn connections_snapshot(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let (brew_clients, mobile_stations) = {
+        let inner = state.inner.read().await;
+        let brew_clients: Vec<_> = inner.clients.iter().map(|(id, c)| {
+            let issi_count = inner.subscribers.values().filter(|s| s.client_id == *id).count();
+            serde_json::json!({
+                "id": id.to_string(),
+                "mode": c.mode.as_str(),
+                "version": c.version.as_u8(),
+                "remote_addr": c.remote_addr.map(|a| a.to_string()),
+                "connected_at_ms": c.connected_at_ms,
+                "registered_issis": issi_count,
+            })
+        }).collect();
+        let mobile_stations: Vec<_> = inner.subscribers.iter()
+            .map(|(issi, s)| {
+                let basestation = inner.clients.get(&s.client_id);
+                serde_json::json!({
+                    "issi": issi,
+                    "mode": s.mode.as_str(),
+                    "basestation_id": s.client_id.to_string(),
+                    "basestation_addr": basestation.and_then(|c| c.remote_addr).map(|a| a.to_string()),
+                    "groups": s.groups.iter().copied().collect::<Vec<_>>(),
+                })
+            }).collect();
+        (brew_clients, mobile_stations)
+    };
+
+    let sip = match state.sip_snapshot().await {
+        Some(snap) => serde_json::json!({
+            "enabled": snap.enabled,
+            "registrations": snap.registrations,
+            "trunks": snap.trunks,
+        }),
+        None => serde_json::json!({ "enabled": false, "registrations": [], "trunks": [] }),
+    };
+
+    Json(serde_json::json!({
+        "brew_clients": brew_clients,
+        "mobile_stations": mobile_stations,
+        "sip": sip,
+    }))
+}
+
+pub async fn sip_snapshot(State(state): State<Arc<AppState>>) -> Response {
+    match state.sip_snapshot().await {
+        Some(snap) => Json(snap).into_response(),
+        None => Json(serde_json::json!({
+            "enabled": false,
+            "listen": "",
+            "realm": "",
+            "registrations": [],
+            "trunks": [],
+            "active_calls": [],
+            "total_calls": 0,
+            "total_registrations": 0,
+        })).into_response(),
+    }
+}
+
+/// JSON view of the *provisioned* SIP configuration (extensions, trunks,
+/// routes) as loaded from the config file. Passwords are redacted. This backs
+/// the read-only config screen; edits are made in the TOML file, which the
+/// running process watches and reloads.
+pub async fn sip_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let sip = &state.config.sip;
+    let extensions: Vec<_> = sip.extensions.iter().map(|(user, e)| serde_json::json!({
+        "user": user,
+        "display_name": e.display_name,
+        "issi": e.issi,
+        "allow_outbound": e.allow_outbound,
+        "has_password": !e.password.is_empty(),
+    })).collect();
+    let trunks: Vec<_> = sip.trunks.iter().map(|(name, t)| serde_json::json!({
+        "name": name,
+        "direction": format!("{:?}", t.direction).to_lowercase(),
+        "remote_host": t.remote_host,
+        "username": if t.username.is_empty() { name.clone() } else { t.username.clone() },
+        "realm": t.realm,
+        "register_interval_seconds": t.register_interval_seconds,
+        "enabled": t.enabled,
+        "has_password": !t.password.is_empty(),
+    })).collect();
+    let routes: Vec<_> = sip.routes.iter().map(|r| serde_json::json!({
+        "name": r.name,
+        "match_pattern": r.match_pattern,
+        "strip_prefix": r.strip_prefix,
+        "from": r.from.as_ref().map(describe_endpoint),
+        "to": r.to.as_ref().map(describe_endpoint),
+        "enabled": r.enabled,
+    })).collect();
+    Json(serde_json::json!({
+        "enabled": sip.enabled,
+        "listen": sip.listen.to_string(),
+        "advertised_host": sip.advertised_host,
+        "realm": sip.realm,
+        "rtp_port_min": sip.rtp_port_min,
+        "rtp_port_max": sip.rtp_port_max,
+        "registration_ttl_seconds": sip.registration_ttl_seconds,
+        "extensions": extensions,
+        "trunks": trunks,
+        "routes": routes,
+    }))
+}
+
+/// Renders a route endpoint config as a short human string for the config page.
+fn describe_endpoint(ep: &crate::config::RouteEndpoint) -> String {
+    use crate::config::RouteEndpoint::*;
+    match ep {
+        SipExtension { user } => format!("ext:{user}"),
+        SipTrunk { trunk, number } if number.is_empty() => format!("trunk:{trunk}"),
+        SipTrunk { trunk, number } => format!("trunk:{trunk}/{number}"),
+        BrewPrivate { issi } => format!("issi:{issi}"),
+        BrewGroup { gssi } => format!("group:{gssi}"),
+    }
+}
+
+pub async fn sip_page() -> Html<&'static str> { Html(SIP_HTML.as_str()) }
+pub async fn sip_config_page() -> Html<&'static str> { Html(SIP_CONFIG_HTML.as_str()) }
+pub async fn settings_page() -> Html<&'static str> { Html(SETTINGS_HTML.as_str()) }
+
+/// Re-serializes `cfg` to TOML, round-trip-validates it by parsing it back
+/// (belt and braces: catches anything `to_toml_pretty` itself can't express),
+/// and writes it to the process's config file. The already-running
+/// `config_watcher` picks up the mtime change within ~2s and restarts the
+/// process so the new config takes effect; this function does not restart
+/// anything itself.
+async fn save_config(state: &Arc<AppState>, cfg: &config::Config) -> anyhow::Result<()> {
+    let text = cfg.to_toml_pretty()?;
+    config::Config::parse(&text)?;
+    config::Config::save_atomic(&state.config_path, &text)?;
+    Ok(())
+}
+
+/// Applies `edit` to a clone of the live config and saves it. Used by every
+/// structured (non-raw-editor) settings endpoint below so they share one
+/// clone/edit/validate/write/report path.
+async fn mutate_and_save(
+    state: &Arc<AppState>,
+    edit: impl FnOnce(&mut config::Config),
+) -> Response {
+    let mut cfg = state.config.clone();
+    edit(&mut cfg);
+    match save_config(state, &cfg).await {
+        Ok(()) => Json(serde_json::json!({
+            "saved": true,
+            "note": "written to the config file; the process restarts within a couple seconds to apply it",
+        })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+/// Unredacted JSON view of `[sip]` (real passwords included, unlike
+/// `sip_config`'s summary), so the settings editor can prefill edit forms
+/// with actual current values instead of a "set/none" placeholder. Safe here
+/// for the same reason `config_raw_get` is: every route on this router sits
+/// behind `require_basic`.
+pub async fn sip_config_full(State(state): State<Arc<AppState>>) -> Json<crate::config::SipConfig> {
+    Json(state.config.sip.clone())
+}
+
+/// Full config as TOML text, for the raw editor. Unlike `sip_config`'s
+/// redacted summary, this includes real secrets (trunk/extension passwords,
+/// dashboard/auth user passwords) — acceptable because every route on this
+/// router already sits behind `require_basic`, the same gate protecting the
+/// rest of the admin surface.
+pub async fn config_raw_get(State(state): State<Arc<AppState>>) -> Response {
+    match state.config.to_toml_pretty() {
+        Ok(text) => (StatusCode::OK, text).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Validates and saves a full replacement config submitted as raw TOML text
+/// (the editor's "Save" button). This is the only path that can touch every
+/// setting, including ones with no dedicated form (listen addresses, TLS,
+/// dashboard/auth/telemetry/control users, storage, call-routing flags).
+pub async fn config_raw_put(State(state): State<Arc<AppState>>, body: String) -> Response {
+    let cfg = match config::Config::parse(&body) {
+        Ok(cfg) => cfg,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid config: {e}")).into_response(),
+    };
+    match save_config(&state, &cfg).await {
+        Ok(()) => Json(serde_json::json!({
+            "saved": true,
+            "note": "written to the config file; the process restarts within a couple seconds to apply it",
+        })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+pub async fn upsert_sip_extension(
+    State(state): State<Arc<AppState>>,
+    Path(user): Path<String>,
+    Json(ext): Json<crate::config::SipExtensionConfig>,
+) -> Response {
+    mutate_and_save(&state, |cfg| { cfg.sip.extensions.insert(user, ext); }).await
+}
+
+pub async fn delete_sip_extension(State(state): State<Arc<AppState>>, Path(user): Path<String>) -> Response {
+    mutate_and_save(&state, |cfg| { cfg.sip.extensions.remove(&user); }).await
+}
+
+pub async fn upsert_sip_trunk(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(trunk): Json<crate::config::SipTrunkConfig>,
+) -> Response {
+    mutate_and_save(&state, |cfg| { cfg.sip.trunks.insert(name, trunk); }).await
+}
+
+pub async fn delete_sip_trunk(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    mutate_and_save(&state, |cfg| { cfg.sip.trunks.remove(&name); }).await
+}
+
+/// Adds or replaces (matched by `name`) a voice route. Routes are order-
+/// sensitive (`SipConfig::routes` is evaluated top to bottom), so an update
+/// keeps the existing position and only a new name appends at the end;
+/// reordering is left to the raw editor.
+pub async fn upsert_sip_route(
+    State(state): State<Arc<AppState>>,
+    Json(route): Json<crate::config::VoiceRouteConfig>,
+) -> Response {
+    mutate_and_save(&state, |cfg| {
+        match cfg.sip.routes.iter_mut().find(|r| r.name == route.name) {
+            Some(existing) => *existing = route,
+            None => cfg.sip.routes.push(route),
+        }
+    }).await
+}
+
+pub async fn delete_sip_route(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    mutate_and_save(&state, |cfg| { cfg.sip.routes.retain(|r| r.name != name); }).await
+}
 
 pub async fn control_list(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
     Json(state.control.read().await.connected_ids())
@@ -257,7 +752,7 @@ pub async fn control_command(
 /// Shared CSS for the dashboard and its sub-pages, so the standalone log pages
 /// match the main dashboard exactly.
 const STYLE: &str = r#"<style>
-:root{font-family:Inter,system-ui,sans-serif;color:#e7edf5;background:#09111c}*{box-sizing:border-box}body{margin:0}header{padding:22px 28px;border-bottom:1px solid #203047;display:flex;justify-content:space-between;align-items:center}h1{font-size:20px;margin:0}.muted{color:#8fa2b8}.wrap{padding:24px;max-width:1500px;margin:auto}.cards{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}.card,.panel{background:#101b2a;border:1px solid #203047;border-radius:12px}.card{padding:16px}.n{font-size:28px;font-weight:700;margin-top:6px}.panel{margin-top:16px;padding:18px}h2{font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:#8fa2b8;margin:0 0 14px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px;border-bottom:1px solid #1c2a3c;font-size:13px}th{color:#8fa2b8}.pill{padding:3px 8px;border-radius:99px;background:#203047}.live{display:inline-block;width:8px;height:8px;border-radius:50%;background:#52d273;margin-right:7px}@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.wrap{padding:12px}}
+:root{font-family:Inter,system-ui,sans-serif;color:#e7edf5;background:#09111c}*{box-sizing:border-box}body{margin:0}header{padding:22px 28px;border-bottom:1px solid #203047;display:flex;justify-content:space-between;align-items:center}h1{font-size:20px;margin:0}.muted{color:#8fa2b8}.wrap{padding:24px;max-width:1500px;margin:auto}.cards{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}.card,.panel{background:#101b2a;border:1px solid #203047;border-radius:12px}.card{padding:16px}.n{font-size:28px;font-weight:700;margin-top:6px}.panel{margin-top:16px;padding:18px}h2{font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:#8fa2b8;margin:0 0 14px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px;border-bottom:1px solid #1c2a3c;font-size:13px}th{color:#8fa2b8}.pill{padding:3px 8px;border-radius:99px;background:#203047}.live{display:inline-block;width:8px;height:8px;border-radius:50%;background:#52d273;margin-right:7px}.hdr-status{display:flex;flex-direction:column;align-items:flex-end;gap:2px}.ver{font-size:11px;color:#8fa2b8}@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.wrap{padding:12px}}
 .health-ok{background:#173822;color:#52d273}.health-degraded{background:#3a2f12;color:#e8b93d}.health-critical{background:#3a1414;color:#f2545b}.health-unknown{background:#203047;color:#8fa2b8}
 .bts-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}.bts-card{background:#0d1826;border:1px solid #203047;border-radius:10px;padding:14px}.bts-card h3{margin:0;font-size:15px}.bts-meta{font-size:12px;margin-top:4px}.bts-card table{margin-top:10px}.bts-card th,.bts-card td{padding:6px;font-size:12px}
 .banner{display:none;background:#3a1414;border:1px solid #f2545b;color:#ffb4b8;padding:12px 18px;border-radius:10px;margin-bottom:16px;font-weight:600}
@@ -267,21 +762,23 @@ const STYLE: &str = r#"<style>
 .reg-list{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}.reg-issi{background:#0d1826;border:1px solid #203047;border-radius:5px;padding:3px 7px;font-size:12px;font-family:ui-monospace,monospace;color:#cfe0f2}.reg-count{font-size:12px;color:#8fa2b8}
 .navlinks{display:flex;gap:12px;flex-wrap:wrap}.navlink{display:block;background:#0d1826;border:1px solid #203047;border-radius:10px;padding:14px 18px;color:#cfe0f2;text-decoration:none;font-size:14px;font-weight:600;transition:background .1s}.navlink:hover{background:#16273c;border-color:#2c405c}.navlink .sub{display:block;font-size:12px;font-weight:400;color:#8fa2b8;margin-top:4px}
 .backlink{color:#8fa2b8;text-decoration:none;font-size:13px}.backlink:hover{color:#cfe0f2}
+h2 .backlink{text-transform:none;letter-spacing:normal;margin-left:8px}
 .badge{display:inline-block;padding:2px 7px;border-radius:99px;font-size:11px;font-weight:600}.badge-pos{background:#123047;color:#5cc0f2;border:1px solid #1d4a66}.badge-sds{background:#203047;color:#8fa2b8}.pos-undec{color:#8fa2b8;font-style:italic}
+.badge-reg-in{background:#173822;color:#52d273;border:1px solid #245c37}.badge-reg-out{background:#203047;color:#8fa2b8;border:1px solid #2c405c}.badge-reg-timeout{background:#3a2f12;color:#e8b93d;border:1px solid #5c4a1d}
 </style>"#;
 
-const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><header><h1>TETRA NETWORK MONITOR</h1><div><span class=live></span><span id=status>Live</span></div></header><main class=wrap>
+const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><header><h1>TETRA NETWORK MONITOR</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=ver>v__VERSION__</div></div></header><main class=wrap>
 <div class=banner id=emergency-banner></div>
-<section class=cards><div class=card><div class=muted>BlueStations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Logs</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-FlowStation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a></div></section>
-<section class=panel><h2>FlowStation Telemetry</h2><div class=bts-grid id=telemetry-stations></div></section>
-<section class=panel><h2>Registered Subscribers</h2><div class=bts-grid id=registrations></div></section>
-<section class=panel><h2>FlowStation Control</h2><div class=bts-grid id=control-stations></div></section>
+<section class=cards><div class=card><div class=muted>Basestations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Menu</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-Basestation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/connections">Live Connections<span class=sub>Who's connected now: Brew, MS &amp; SIP</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a><a class=navlink href="/settings">Settings<span class=sub>Edit &amp; save server configuration</span></a></div></section>
+<section class=panel><h2>Basestation Telemetry</h2><div class=bts-grid id=telemetry-stations></div></section>
+<section class=panel><h2>Registered Subscribers <a class=backlink href="/registrations">(view registration log &rarr;)</a></h2><div class=bts-grid id=registrations></div></section>
+<section class=panel><h2>Basestation Control</h2><div class=bts-grid id=control-stations></div></section>
 </main><script>
 let snap=null;let tsnap=null;const $=id=>document.getElementById(id);const dt=x=>new Date(x).toLocaleTimeString();const dur=(a,b)=>Math.max(0,Math.floor(((b||Date.now())-a)/1000))+'s';const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-function render(s){snap=s;$('bs').textContent=s.connected_bluestations;$('subs').textContent=s.subscribers;$('groups').textContent=s.groups;$('active').textContent=s.active_calls.length;$('calls').textContent=s.total_calls;$('sds').textContent=s.total_sds;
+function render(s){snap=s;$('bs').textContent=s.connected_basestations;$('subs').textContent=s.subscribers;$('groups').textContent=s.groups;$('active').textContent=s.active_calls.length;$('calls').textContent=s.total_calls;$('sds').textContent=s.total_sds;
 // Build an ISSI -> RSSI (dBFS) lookup from the latest telemetry snapshot so each
 // live call can show its mobile station's received signal strength. RSSI is not
-// SNR; it is the real per-MS metric FlowStation reports.
+// SNR; it is the real per-MS metric Basestation reports.
 const rssiByIssi={};(tsnap||[]).forEach(st=>(st.ms_rssi_out||[]).forEach(([issi,dbfs])=>{rssiByIssi[issi]=dbfs;}));
 const rssiCell=issi=>rssiByIssi[issi]!=null?`${rssiByIssi[issi].toFixed(1)} dBFS`:'<span class=muted>&ndash;</span>';
 $('livecalls').innerHTML=s.active_calls.map(c=>`<tr><td><span class=pill>${c.kind}</span></td><td>${c.source}</td><td>${c.destination}</td><td>${c.priority}</td><td>${dur(c.started_at_ms)}</td><td>${c.voice_frames}</td><td>${rssiCell(c.source)}</td><td class=muted>${c.uuid.slice(0,8)}</td></tr>`).join('')||'<tr><td colspan=8 class=muted>No active calls</td></tr>';}
@@ -337,14 +834,14 @@ function renderTelemetry(stations){
       ${calls.length?`<table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Carrier/TS</th><th>Pri</th></tr></thead><tbody>${calls.map(c=>`<tr><td>${c.is_group?'Group':'Private'}</td><td>${c.source_issi}</td><td>${c.gssi_or_called}</td><td>${c.carrier_num}/${c.ts}</td><td>${c.priority}</td></tr>`).join('')}</tbody></table>`:''}
       ${tsGrid(calls)}
     </div>`;
-  }).join(''):'<div class=muted>No FlowStation telemetry connections</div>';
-  // Registered subscribers, grouped by FlowStation. Shows which ISSIs are
+  }).join(''):'<div class=muted>No Basestation telemetry connections</div>';
+  // Registered subscribers, grouped by Basestation. Shows which ISSIs are
   // currently registered on each connected station.
   $('registrations').innerHTML=stations.length?stations.map(s=>{
     const issis=s.registrations_list||[];
     const chips=issis.length?`<div class=reg-list>${issis.map(i=>`<span class=reg-issi>${esc(String(i))}</span>`).join('')}</div>`:'<div class="bts-meta muted" style="margin-top:8px">No subscribers registered</div>';
     return `<div class=bts-card><div style="display:flex;justify-content:space-between;align-items:center"><h3>${esc(s.id)}</h3><span class=reg-count>${issis.length} registered</span></div>${chips}</div>`;
-  }).join(''):'<div class=muted>No FlowStation telemetry connections</div>';
+  }).join(''):'<div class=muted>No Basestation telemetry connections</div>';
 }
 async function refreshTelemetry(){try{renderTelemetry(await(await fetch('/api/telemetry')).json())}catch(e){}}
 function ctlSafeId(id){return 'ctl_'+id.replace(/[^a-zA-Z0-9_-]/g,'_');}
@@ -366,7 +863,7 @@ function ctlCardHtml(id){
 function renderControl(ids){
   const host=$('control-stations');
   const wanted=new Set(ids);
-  if(!ids.length){host.innerHTML='<div class="muted ctl-empty">No FlowStation control connections</div>';return;}
+  if(!ids.length){host.innerHTML='<div class="muted ctl-empty">No Basestation control connections</div>';return;}
   // Clear the "no connections" placeholder before adding the first real card.
   const ph=host.querySelector('.ctl-empty');
   if(ph)ph.remove();
@@ -400,8 +897,8 @@ function ctlDgna(id,s){ctlSend(id,{action:'Dgna',issi:Number($(s+'_dgna_issi').v
 function ctlAddLiveSds(id,s){ctlSend(id,{action:'AddLiveSds',text:$(s+'_sds_text').value,protocol_id:10,source_issi:Number($(s+'_sds_issi').value||0),repeat_count:Number($(s+'_sds_repeat').value||0)},s+'_result');}
 function ctlClearLiveSds(id,s){ctlSend(id,{action:'ClearLiveSds'},s+'_result');}
 function ctlSendSds(id,s){const payload=hexToBytes($(s+'_raw_hex').value);ctlSend(id,{action:'SendSds',source_ssi:Number($(s+'_raw_src').value||0),dest_ssi:Number($(s+'_raw_dest').value||0),dest_is_group:$(s+'_raw_grp').checked,len_bits:Number($(s+'_raw_len').value||payload.length*8),payload},s+'_result');}
-function ctlRestart(id){if(confirm('Restart FlowStation service on '+id+'? This disconnects it.'))ctlSend(id,{action:'RestartService'},null);}
-function ctlShutdown(id){if(confirm('Shutdown FlowStation service on '+id+'? This stops the BTS process.'))ctlSend(id,{action:'ShutdownService'},null);}
+function ctlRestart(id){if(confirm('Restart Basestation service on '+id+'? This disconnects it.'))ctlSend(id,{action:'RestartService'},null);}
+function ctlShutdown(id){if(confirm('Shutdown Basestation service on '+id+'? This stops the BTS process.'))ctlSend(id,{action:'ShutdownService'},null);}
 refresh();refreshTelemetry();refreshControl();setInterval(refresh,2000);setInterval(refreshTelemetry,2000);setInterval(refreshControl,3000);
 // Keep a live WebSocket for push updates, but never reload the page on drop:
 // a reload would wipe anything the operator is typing in the control panel.
@@ -429,6 +926,7 @@ mod tests {
         assert!(h.contains("href=\"/calls\""));
         assert!(h.contains("href=\"/sds\""));
         assert!(h.contains("href=\"/telemetry-sds\""));
+        assert!(h.contains("href=\"/registrations\""));
         // the three moved tables must be gone from the main page
         assert!(!h.contains("id=sdstable"), "recent SDS table removed from index");
         assert!(!h.contains("id=history"), "recent calls table removed from index");
@@ -441,6 +939,7 @@ mod tests {
             ("calls", CALLS_HTML.as_str(), "/api/status"),
             ("sds", SDS_HTML.as_str(), "/api/status"),
             ("telemetry", TELEMETRY_SDS_HTML.as_str(), "/api/telemetry"),
+            ("registrations", REGISTRATIONS_HTML.as_str(), "/api/registrations"),
         ] {
             assert!(!html.contains("__STYLE__"), "{name}: style substituted");
             assert!(html.contains("id=log"), "{name}: log table body present");

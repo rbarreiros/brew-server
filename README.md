@@ -1,12 +1,77 @@
 # brew-server
 
-Experimental Rust Brew core for linking two or more MidnightBlue BlueStation or Flowstation TETRA base stations.
+Experimental Rust Brew core for linking two or more MidnightBlue Basestation TETRA base stations.
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 1.0 adds:
+
+- **ACELP<->G.711 media transcoder for SIP<->Brew calls.** SIP legs are
+  steered to G.711 (PCMU/PCMA); Brew traffic frames carry ACELP. A new
+  `transcode` module vendors the ETSI EN 300 395-2 reference TETRA codec
+  (`third_party/tetra-codec/`, compiled via `build.rs`) alongside a pure-Rust
+  G.711 implementation, and a bidirectional pump (`transcode::task`) bridges
+  RTP and Brew traffic frames in both directions, so PSTN/SIP calls to and
+  from a mobile terminal actually carry audio, not just signalling.
+- **Complete Brew<->SIP private-call accept/ring/answer handshake.**
+  Previously the bridge answered SIP `INVITE`s with `200 OK` immediately and
+  never reacted to the ISSI's `SETUP_ACCEPT`/`ALERT`/`CONNECT_REQUEST` —
+  callers got no ringback, and pressing accept on a mobile terminal did
+  nothing. Now: `SETUP_ACCEPT`/`ALERT` -> SIP `180 Ringing`; `CONNECT_REQUEST`
+  (accept pressed) -> `CALL_CONNECT_CONFIRM` back to the ISSI *and* SIP
+  `200 OK` together; `SETUP_REJECT`/`RELEASE` before answer -> SIP `486` and
+  teardown. The reverse direction (Brew->SIP) sends `CALL_SETUP_ACCEPT`
+  immediately and drives `CALL_ALERT`/`CALL_CONNECT_CONFIRM` from Asterisk's
+  own `180`/`200` responses, plus the SIP `ACK` a `200 OK` to our own
+  outbound `INVITE` requires (previously missing — Asterisk would keep
+  retransmitting the `200` and drop the dialog). Fixed along the way:
+  `CALL_CONNECT_CONFIRM` needs a 2-byte grant/permission payload, not an
+  empty one (real clients reject it outright otherwise); and the three
+  pre-built SIP responses (`180`/`200`/`486`) now share one dialog `To`-tag
+  instead of each independently generating its own, which previously caused
+  a `BYE` built from the wrong tag to get `481`'d by the peer.
+- **Route a mobile terminal's PSTN-style dialled number to SIP.** A terminal
+  dialling a non-ISSI number (e.g. "9" + a 10-digit PSTN number) arrives with
+  `destination = 0` and the digits in the Brew `CircularCall`'s ASCII
+  `number` field, not `destination` — previously ignored entirely. That field
+  is now used as the dialled string for `[[sip.routes]]` matching when
+  present, and a new `strip_prefix` route field removes a leading literal
+  (e.g. the outside-line "9") before it reaches an empty-`number` SIP trunk
+  destination.
+- **Dashboard settings editor.** A new `/settings` page can add/update/delete
+  SIP extensions, trunks and voice routes, plus a raw-TOML editor covering
+  every other setting. Saves validate then write atomically to the running
+  process's config file, reusing the existing config-watcher restart-to-apply
+  mechanism — no new hot-reload path needed.
+- **Live connections page.** `/connections` (JSON at `/api/connections`)
+  shows who is connected/registered *right now*: Brew connections (mode,
+  protocol version, remote address, connect time), registered subscribers
+  (both Terminal-mode MS and Basestation-gateway registrations, matching the
+  main dashboard's panel), and SIP registrations/trunks. Distinct from
+  `/registrations`, which is a historical event log.
+- **Max call duration limits.** New `max_call_duration_seconds` (Brew
+  station/private/group calls) and `sip.max_call_duration_seconds` (SIP
+  calls) config settings force-end a call once it has run too long, the same
+  way a normal hangup would (`CALL_RELEASE`/`CALL_GROUP_IDLE` or a SIP `BYE`,
+  not a silent kill). Default 4 hours; `0` disables.
+- **Server version shown on every dashboard page**, under the live-status
+  indicator.
+- Renamed `BlueStation`/`FlowStation` references throughout (code, UI, docs)
+  to a single consistent `Basestation`/`Basestations`, matching the existing
+  `ClientMode::Basestation`. The two WebSocket subprotocol identifiers real
+  hardware negotiates with (`bluestation-control-v1`,
+  `bluestation-telemetry-v2`) are deliberately left unchanged — they're wire
+  compatibility strings, not display text. Also renamed the main dashboard's
+  "Logs" panel to "Menu".
+- **Fixed a misconfigured `sip.advertised_host` producing malformed SDP.** If
+  `advertised_host` is accidentally set to `host:port` instead of a bare
+  host (it's written verbatim into the SDP `c=`/`o=` lines, which never
+  carry a port), the port is now stripped with a warning instead of silently
+  emitting SDP that peers like Asterisk reject.
+
 Version 0.8 adds:
 
-- **Persistent telemetry SDS log.** SDS entries observed on a FlowStation
+- **Persistent telemetry SDS log.** SDS entries observed on a Basestation
   Telemetry channel (`SdsLog`) are now also appended to the same append-only
   history log used for calls/SDS, tagged with the reporting station, so the
   Telemetry SDS Log survives a server restart instead of resetting with the
@@ -29,7 +94,7 @@ Version 0.7 adds:
   OpenStreetMap); a `/api/positions` endpoint exposes the latest fixes. Two
   sources are supported: **binary TETRA LIP** short location reports (ETSI TS
   100 392-18), decoded from the raw SDS relayed over the Brew channel, and
-  **textual** beacons (APRS, decimal degrees, Maidenhead). No FlowStation change
+  **textual** beacons (APRS, decimal degrees, Maidenhead). No Basestation change
   is required — the LIP payload is decoded in `handle_sds_transfer` from the SDS
   that the Brew channel already relays. See "Position mapping" below.
 
@@ -38,23 +103,23 @@ Version 0.6 adds:
 - **Brew protocol version 1 support.** The server advertises and negotiates the
   protocol version via the `X-Brew-Version` header on the discovery GET
   (responding `426 Upgrade Required` for versions it does not implement). Because
-  real clients (e.g. FlowStation) send no version header on the WebSocket
+  real clients (e.g. Basestation) send no version header on the WebSocket
   handshake, the version is tracked **per connection** and resolved *lazily from
   message content*, defaulting to v0 and promoting to v1 once a v1-shaped
   call-control message is seen. The v1 SS-TPI `mnemonic[34]` talking-party name
   is parsed on `GROUP_TX`/`SETUP_REQUEST` (ETSI EN 300 392-9), and the
   `X-Brew-Mode` header (`Terminal`/`Basestation`) is tracked per client.
-- **Dashboard control-panel fix.** The FlowStation Control panel no longer wipes
+- **Dashboard control-panel fix.** The Basestation Control panel no longer wipes
   operator input: it reconciles station cards incrementally instead of rebuilding
   the DOM on every refresh, and reconnects its WebSocket in the background rather
   than reloading the page.
 - **Paginated logs.** Recent calls, Recent SDS and the Telemetry SDS Log are
   paginated (10, 10 and 5 rows per page respectively) and have moved off the main
   dashboard onto their own linked pages: `/calls`, `/sds`, and `/telemetry-sds`.
-- **Timeslot occupancy graphic.** Each FlowStation telemetry card shows a small
+- **Timeslot occupancy graphic.** Each Basestation telemetry card shows a small
   per-carrier TS1-TS4 grid indicating which timeslots are busy vs. available.
 - **Registered-subscribers frame.** A dashboard panel lists which subscriber
-  ISSIs are registered on each connected FlowStation.
+  ISSIs are registered on each connected Basestation.
 
 Version 0.5 adds:
 
@@ -67,10 +132,10 @@ Version 0.5 adds:
 
 Version 0.4 adds:
 
-- Optional FlowStation Telemetry ingestion channel (registrations, calls with
+- Optional Basestation Telemetry ingestion channel (registrations, calls with
   carrier/timeslot, RF/DSP quality, SDR/host health, SDS log, emergency alarms),
   surfaced on the dashboard with an emergency-alarm banner.
-- Optional FlowStation Control channel (Kick MS, DGNA assign/deassign, live SDS
+- Optional Basestation Control channel (Kick MS, DGNA assign/deassign, live SDS
   add/delete/clear, clear emergency, restart/stop the service), with a per-station
   command panel on the dashboard.
 
@@ -80,7 +145,7 @@ Version 0.3 adds:
 
 Version 0.2 adds:
 
-- HTTP Digest authentication compatible with BlueStation's current WebSocket transport (MD5 + qop=auth).
+- HTTP Digest authentication compatible with Basestation's current WebSocket transport (MD5 + qop=auth).
 - Single-use authenticated WebSocket session URLs returned by the discovery GET.
 - Subscriber registration and talkgroup affiliation routing.
 - Group speech routing with priority-based floor pre-emption.
@@ -89,7 +154,7 @@ Version 0.2 adds:
 
 ## Important compatibility note
 
-The current BlueStation source defines private/simplex state constants, but its Brew parser keeps most of those payloads as raw bytes and its worker currently exposes group voice/SDS commands rather than private-call commands. As of v0.6 this server parses private `SETUP_REQUEST`/`CONNECT_REQUEST` payloads into a structured `BrewCircularCall` (source ISSI, destination ISSI, dialled number, priority, and the v1 `mnemonic`), and routes subsequent control/traffic packets by UUID. For any peer whose payload cannot be fully structured it falls back to the earlier conservative behaviour: the first two little-endian `u32` values are interpreted as source and destination ISSI. Validate this against captures/specification before production use.
+The current Basestation source defines private/simplex state constants, but its Brew parser keeps most of those payloads as raw bytes and its worker currently exposes group voice/SDS commands rather than private-call commands. As of v0.6 this server parses private `SETUP_REQUEST`/`CONNECT_REQUEST` payloads into a structured `BrewCircularCall` (source ISSI, destination ISSI, dialled number, priority, and the v1 `mnemonic`), and routes subsequent control/traffic packets by UUID. For any peer whose payload cannot be fully structured it falls back to the earlier conservative behaviour: the first two little-endian `u32` values are interpreted as source and destination ISSI. Validate this against captures/specification before production use.
 
 ## Build and run
 
@@ -131,6 +196,7 @@ route_without_affiliations = true
 allow_multiple_calls_per_group = true
 higher_priority_number_wins = true
 preempt_cause = 1
+max_call_duration_seconds = 14400 # force-end a Brew call (station or SIP-bridged) past this; 0 disables
 
 [tls]
 enabled = false
@@ -163,11 +229,11 @@ key_path = "tls/dashboard-key.pem"
 
 The `[dashboard]` block controls the monitoring UI on its own port, separate
 from the Brew API above — see "Web monitoring dashboard" below for auth and TLS
-details. Use a different username/password for each BlueStation. The Brew username is an HTTP Digest identity that must be **numeric and at most 7 digits** (a connection presenting a longer or non-numeric username is refused); it does not have to equal a radio ISSI, though a numeric site identity is convenient.
+details. Use a different username/password for each Basestation. The Brew username is an HTTP Digest identity that must be **numeric and at most 7 digits** (a connection presenting a longer or non-numeric username is refused); it does not have to equal a radio ISSI, though a numeric site identity is convenient.
 
 ## TLS
 
-Brew can terminate TLS natively so BlueStations connect over `wss://` / `https://` without a reverse proxy. Enable it in `[tls]`:
+Brew can terminate TLS natively so Basestations connect over `wss://` / `https://` without a reverse proxy. Enable it in `[tls]`:
 
 ```toml
 [tls]
@@ -188,15 +254,15 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 
 For Docker, mount the certs (the provided `docker-compose.yml` mounts `./tls` to `/etc/brew-server/tls`) and set the paths accordingly.
 
-## BlueStation side
+## Basestation side
 
-Configure each BlueStation's Brew transport to point at the server host/port, use endpoint `/brew` (or `/brew/`), subprotocol `brew`, and set the matching Digest username/password. With Digest credentials configured, current BlueStation performs:
+Configure each Basestation's Brew transport to point at the server host/port, use endpoint `/brew` (or `/brew/`), subprotocol `brew`, and set the matching Digest username/password. With Digest credentials configured, current Basestation performs:
 
 1. `GET /brew/` without credentials.
 2. Server returns `401` with a Digest challenge.
-3. BlueStation retries with `Authorization: Digest ...`.
+3. Basestation retries with `Authorization: Digest ...`.
 4. Server returns a one-time path such as `/brew/session/<token>`.
-5. BlueStation upgrades that path to WebSocket with subprotocol `brew`.
+5. Basestation upgrades that path to WebSocket with subprotocol `brew`.
 
 ## Protocol version negotiation
 
@@ -212,9 +278,9 @@ version they speak with an `X-Brew-Version` header on the discovery `GET`:
 Because the WebSocket handshake itself carries no version header, the version is
 a **per-connection** property that starts at v0 and is *promoted lazily* to v1
 the first time a v1-shaped call-control message (one carrying the `mnemonic[34]`
-tail) is observed. This mirrors how FlowStation resolves the version and is
+tail) is observed. This mirrors how Basestation resolves the version and is
 logged once per connection (`Brew connection version promoted from message
-content`). If a FlowStation reports it stays on v0, that is a client-side choice;
+content`). If a Basestation reports it stays on v0, that is a client-side choice;
 the server interoperates correctly at both v0 and v1.
 
 The v1 additions this server understands are the SS-TPI talking-party
@@ -225,14 +291,14 @@ registration pushes.
 
 ## SDS routing
 
-BlueStation sends SDS as two Brew packets with the same UUID:
+Basestation sends SDS as two Brew packets with the same UUID:
 
 ```text
 CALL_SHORT_TRANSFER(uuid, source ISSI, destination ISSI)
 FRAME_SDS_TRANSFER(uuid, payload)
 ```
 
-The server resolves the destination to the BlueStation currently owning that ISSI, forwards both packets, then routes `FRAME_SDS_REPORT(uuid, status)` back to the originating BlueStation. If the destination number is a currently affiliated GSSI instead, the SDS is multicast to the affiliated cells and reports are returned until the route expires.
+The server resolves the destination to the Basestation currently owning that ISSI, forwards both packets, then routes `FRAME_SDS_REPORT(uuid, status)` back to the originating Basestation. If the destination number is a currently affiliated GSSI instead, the SDS is multicast to the affiliated cells and reports are returned until the route expires.
 
 SDS transaction state expires after 60 seconds.
 
@@ -261,34 +327,36 @@ The following Brew call states are recognized and routed by call UUID:
 - 12 SIMPLEX_GRANTED
 - 13 SIMPLEX_IDLE
 
-`SETUP_REQUEST` establishes the route from the structured `BrewCircularCall` payload (source ISSI, destination ISSI, dialled number, priority, and — on v1 — the talking-party `mnemonic`); for payloads that cannot be fully structured it falls back to the first 8 bytes (`source_issi:u32 LE`, `destination_issi:u32 LE`). The destination must currently be registered on another BlueStation. Thereafter control messages and traffic-channel frames may flow in either direction between the two participating cells until `CALL_RELEASE`.
+`SETUP_REQUEST` establishes the route from the structured `BrewCircularCall` payload (source ISSI, destination ISSI, dialled number, priority, and — on v1 — the talking-party `mnemonic`); for payloads that cannot be fully structured it falls back to the first 8 bytes (`source_issi:u32 LE`, `destination_issi:u32 LE`). If the destination ISSI is registered on another Basestation, the call stays on the Brew side; thereafter control messages and traffic-channel frames may flow in either direction between the two participating cells until `CALL_RELEASE`.
 
-Because current upstream BlueStation does not yet expose a complete private-call Brew command path, this feature should be considered server-ready/experimental rather than end-to-end validated.
+If the destination ISSI is *not* a registered subscriber, the call is offered to the SIP subsystem (Brew -> SIP) instead of being rejected outright: `[[sip.routes]]` entries are matched against a dialled string, which is the `BrewCircularCall`'s ASCII `number` field when the caller set one, falling back to the destination ISSI rendered as decimal otherwise. This is how a mobile terminal dialling an outside-line-style number (e.g. "9" + a 10-digit PSTN number) reaches a SIP trunk: the terminal sends `destination = 0` with the dialled digits in `number` (this is how FlowStation encodes a PBX/phone call — see its `cc_bs/procedures/setup.rs`), a route like `match_pattern = "9*"` selects it, and an optional `strip_prefix = "9"` on the route removes the leading digit before it reaches an empty-`number` `sip_trunk` destination, so the trunk dials the bare 10 digits. See `[[sip.routes]]` in Configuration above.
+
+Because current upstream Basestation does not yet expose a complete private-call Brew command path, this feature should be considered server-ready/experimental rather than end-to-end validated.
 
 ## Scope and security
 
 This is a lab/experimental core, not a production TETRA SwMI. Digest authentication protects credentials from being sent directly but MD5 Digest is legacy authentication; enable the built-in `[tls]` support (or deploy behind a TLS-terminating proxy) or run on a trusted private network. The server currently has no persistent subscriber database, ACL policy, rate limiting, or HA state replication.
 
-The dashboard is a separate listener with its own auth (`[dashboard.users]`, HTTP Basic) and TLS (`[dashboard.tls]`). Basic auth transmits credentials as reversible base64, so only enable `[dashboard.users]` together with `[dashboard.tls]` (or behind a trusted network) — never run dashboard auth over plain HTTP. Note the dashboard's Control panel can kick subscribers and restart/stop a FlowStation BTS, so treat dashboard access as privileged. With no users configured the dashboard is open to anyone who can reach the port.
+The dashboard is a separate listener with its own auth (`[dashboard.users]`, HTTP Basic) and TLS (`[dashboard.tls]`). Basic auth transmits credentials as reversible base64, so only enable `[dashboard.users]` together with `[dashboard.tls]` (or behind a trusted network) — never run dashboard auth over plain HTTP. Note the dashboard's Control panel can kick subscribers and restart/stop a Basestation BTS, so treat dashboard access as privileged. With no users configured the dashboard is open to anyone who can reach the port.
 
-## BlueStation connected/registered but no inter-BS calls
+## Basestation connected/registered but no inter-BS calls
 
 A subscriber `REGISTER` is not the same thing as a talk-group `AFFILIATE`. If the
 server log contains `subscriber registered` but no `subscriber affiliated ... gssi=...`,
 there is no affiliation table to route by. v0.2.1 therefore defaults
 `fallback_broadcast_when_no_affiliations = true`: when a `GROUP_TX` arrives for a
-GSSI with no recorded affiliations, it is sent to every other connected BlueStation.
+GSSI with no recorded affiliations, it is sent to every other connected Basestation.
 Once `AFFILIATE` messages are present, selective GSSI routing is used again.
 
 If pressing PTT still produces no `routed GROUP_TX` line at the server, the problem is
-upstream of the server: BlueStation has not emitted the Brew `GROUP_TX`. Enable DEBUG
-logging for BlueStation's Brew entity/worker and look for `forwarding local call to
-TetraPack` / `sent GROUP_TX`. SDS also requires BlueStation's Brew SDS feature to be
-enabled; otherwise BlueStation intentionally ignores `SendSds`.
+upstream of the server: Basestation has not emitted the Brew `GROUP_TX`. Enable DEBUG
+logging for Basestation's Brew entity/worker and look for `forwarding local call to
+TetraPack` / `sent GROUP_TX`. SDS also requires Basestation's Brew SDS feature to be
+enabled; otherwise Basestation intentionally ignores `SendSds`.
 
-## FlowStation Telemetry (experimental)
+## Basestation Telemetry (experimental)
 
-In addition to the Brew link, FlowStation-based BlueStations can optionally push a
+In addition to the Brew link, Basestation-based Basestations can optionally push a
 one-way **Telemetry** stream (registrations, calls with carrier/timeslot, RF/DSP
 quality, SDR/host health, SDS log, emergency alarms) over a second, BTS-initiated
 WebSocket. This is a separate listener from Brew because the handshake shape
@@ -310,23 +378,23 @@ enabled = false
 ```
 
 Leave `[telemetry.users]` empty to accept connections without auth. Point each
-FlowStation BlueStation's `[telemetry]` config section at
+Basestation Basestation's `[telemetry]` config section at
 `ws://<this server>:9001/` (or `wss://` with `telemetry.tls.enabled = true`).
 
 Connected stations, their health, active calls (with carrier + timeslot), RF
 quality, and telemetry-sourced SDS traffic appear on the dashboard below.
 Active emergency alarms are surfaced as a banner at the top of the page.
 
-Reverse-engineered from FlowStation v0.4.0 source, not a published spec —
-re-verify against whatever FlowStation version you actually deploy.
+Reverse-engineered from Basestation v0.4.0 source, not a published spec —
+re-verify against whatever Basestation version you actually deploy.
 
-## FlowStation Control (experimental)
+## Basestation Control (experimental)
 
 The **Control** channel is the bidirectional counterpart to Telemetry: the BTS
 still initiates the WebSocket connection (subprotocol `bluestation-control-v1`),
 but once connected an operator can push commands down it (kick a subscriber,
 DGNA assign/deassign, inject/manage live SDS, clear an emergency, restart or
-stop the BlueStation service) and read back responses for the few command
+stop the Basestation service) and read back responses for the few command
 types that define one (`SendSds`, `CommandA`, `KickMs`).
 
 Enable it in `brew-server.toml`:
@@ -343,7 +411,7 @@ listen = "0.0.0.0:9002"
 enabled = false
 ```
 
-Point each FlowStation BlueStation's `[command]` config section at
+Point each Basestation Basestation's `[command]` config section at
 `ws://<this server>:9002/`. Connected control-capable stations appear on the
 dashboard with a command panel: Kick MS, DGNA assign/deassign, Clear
 Emergency, live-SDS add/delete/clear, and Restart/Shutdown (both ask for
@@ -351,8 +419,122 @@ confirmation client-side, since they end the BTS process). `SendSds` /
 `SendRawSdsType4` / `TestCmdB` take a raw hex-encoded payload — this server
 does not encode SDS-TL PDUs for you.
 
-Like Telemetry, this is reverse-engineered from FlowStation v0.4.0 source;
+Like Telemetry, this is reverse-engineered from Basestation v0.4.0 source;
 re-verify against your deployed version.
+
+## SIP / VoIP
+
+This build adds a **SIP subsystem** alongside the Brew/TETRA core. It lets SIP
+clients and SIP trunks connect, and bridges voice between SIP and the TETRA side
+(brew mobile clients and basestation mobile stations). It is off by default;
+enable it in `[sip]`:
+
+```toml
+[sip]
+enabled = true
+listen = "0.0.0.0:5060"          # UDP SIP signalling
+advertised_host = ""             # public/reachable IP when behind NAT (empty = socket local addr)
+rtp_port_min = 16000             # RTP relay media port pool
+rtp_port_max = 17000
+realm = "brew-server"
+registration_ttl_seconds = 3600
+max_call_duration_seconds = 14400 # force-end a SIP call (and its Brew leg, if bridged) past this; 0 disables
+```
+
+The subsystem provides:
+
+- **SIP extensions** — user/pass accounts that REGISTER to this server. Digest
+  (MD5) authentication is enforced on REGISTER and on INVITE. Provision them
+  under `[sip.extensions.<user>]`:
+
+  ```toml
+  [sip.extensions.1001]
+  password = "change-me-1001"
+  display_name = "Reception"
+  issi = 1001            # optional: map to a TETRA subscriber ISSI
+  allow_outbound = true
+  ```
+
+- **SIP trunks** — peer VoIP gateways (Asterisk, an ITSP, another PBX). Three
+  directions are supported: `outbound` (we REGISTER to the peer), `inbound` (the
+  peer REGISTERs to us), and `peer` (static IP-authenticated, no registration).
+  Outbound trunks answer the peer's 401/407 challenge automatically and
+  re-register on the configured interval.
+
+  ```toml
+  [sip.trunks.asterisk]
+  direction = "outbound"
+  remote_host = "192.0.2.10:5060"
+  username = "brew-trunk"
+  password = "change-me-trunk"
+  register_interval_seconds = 300
+  enabled = true
+  ```
+
+- **Voice routes** — bridge calls between any two endpoints: SIP extension, SIP
+  trunk, Brew private subscriber (ISSI), or Brew group (GSSI). Routes are
+  evaluated top to bottom; the first enabled route whose `match_pattern` (and
+  optional `from` restriction) matches the dialled destination wins.
+  `match_pattern` is `*` (any), a trailing-`*` prefix, or an exact string.
+  Matching always runs against the full dialled string; an optional
+  `strip_prefix` then removes a leading literal before the string reaches an
+  empty-`number` `sip_trunk` destination (an outside-line prefix like "9").
+  This also covers a mobile terminal dialling a non-ISSI (PSTN) number: it
+  arrives with `destination = 0` and the digits in the Brew `number` field,
+  which is used as the dialled string for routing in that case.
+
+  ```toml
+  # Extensions, or a mobile terminal, dial 9 + number to break out via the
+  # Asterisk trunk; strip_prefix drops the "9" so the trunk dials 10 digits.
+  [[sip.routes]]
+  name = "outbound-via-asterisk"
+  match_pattern = "9*"
+  strip_prefix = "9"
+  to = { kind = "sip_trunk", trunk = "asterisk" }
+  enabled = true
+
+  # Calls in from the trunk are patched into TETRA group 1001.
+  [[sip.routes]]
+  name = "asterisk-to-tetra-group"
+  match_pattern = "*"
+  from = { kind = "sip_trunk", trunk = "asterisk" }
+  to = { kind = "brew_group", gssi = 1001 }
+  enabled = true
+
+  # Dial 7 + ISSI from a SIP extension to reach a TETRA subscriber privately.
+  [[sip.routes]]
+  name = "ext-to-tetra-private"
+  match_pattern = "7*"
+  from = { kind = "sip_extension", user = "1001" }
+  to = { kind = "brew_private", issi = 90 }
+  enabled = true
+  ```
+
+Endpoint kinds for `to`/`from`: `{ kind = "sip_extension", user = "..." }`,
+`{ kind = "sip_trunk", trunk = "...", number = "..." }` (number optional; the
+dialled digits — after `strip_prefix`, if set — are used when omitted),
+`{ kind = "brew_private", issi = N }`, `{ kind = "brew_group", gssi = N }`.
+`strip_prefix` (default: none) is a route-level field, not part of the
+endpoint, so it applies regardless of which `to` kind is used.
+
+**Dashboard.** Two pages, linked from the main dashboard:
+
+- `/sip` — live panel: extension registrations, trunk status (up / registering /
+  failed / down) with active call counts, and active calls. JSON at `/api/sip`.
+- `/sip-config` — read-only view of the provisioned extensions, trunks and
+  routes (passwords are never shown). JSON at `/api/sip/config`. Edit the
+  `[sip]` section of the config file to change provisioning; the server watches
+  the file and restarts to apply.
+
+**Media / codecs.** SIP legs are negotiated to G.711 (PCMU/PCMA) and relayed by
+a built-in symmetric-RTP forwarder that latches each peer's real source address
+(NAT-safe). SIP↔SIP trunking works end to end. For **SIP↔TETRA audio**, note
+that TETRA carries ACELP voice inside Brew traffic frames: the signalling bridge
+and the SIP-side RTP relay are fully implemented, and the code marks the exact
+points where an ACELP↔PCM transcoder attaches, but transcoding itself is not
+included in this server. SIP↔TETRA is therefore signalling-complete; end-to-end
+media additionally requires that transcoder (or a Brew-side gateway that already
+delivers a SIP-compatible codec).
 
 ## Web monitoring dashboard
 
@@ -376,13 +558,21 @@ enabled = false
 - Dashboard: `http://<server>:9003/`
 - MS map (linked from the dashboard): `/map` — plots decoded MS positions;
   JSON at `/api/positions`
+- **Live connections** (linked from the dashboard): `/connections` — who is
+  connected/registered *right now*: Brew connections (Basestations and any
+  direct Terminal/mobile clients, with remote address and how long they've
+  been connected), registered mobile stations (Terminal-mode subscribers —
+  actual MS, cross-referenced to the Basestation they're on), and SIP
+  registrations/trunks. JSON at `/api/connections`. This is a live snapshot,
+  distinct from `/registrations` below, which is a historical event log.
 - Log pages (linked from the dashboard): `/calls` (recent calls, 10/page),
-  `/sds` (recent SDS, 10/page), `/telemetry-sds` (telemetry SDS log, 5/page)
+  `/sds` (recent SDS, 10/page), `/telemetry-sds` (telemetry SDS log, 5/page),
+  `/registrations` (register/deregister/timeout event log)
 - JSON snapshot: `/api/status`
 - Live event WebSocket: `/api/live`
-- FlowStation telemetry snapshot: `/api/telemetry` (empty unless the `[telemetry]`
+- Basestation telemetry snapshot: `/api/telemetry` (empty unless the `[telemetry]`
   listener is enabled)
-- FlowStation control: `/api/control` (connected station IDs) and
+- Basestation control: `/api/control` (connected station IDs) and
   `/api/control/{id}` (POST a command; empty/404 unless `[control]` is enabled)
 
 All dashboard routes sit behind optional HTTP **Basic** auth: add entries to
@@ -395,7 +585,7 @@ the dashboard is no longer mounted there.
 
 The `/map` page plots the latest known position of each mobile station, from two
 sources, both decoded on the Brew SDS channel (`handle_sds_transfer`) — the SDS
-that FlowStation relays for delivery, not the lossy telemetry `SdsLog`:
+that Basestation relays for delivery, not the lossy telemetry `SdsLog`:
 
 - **Binary TETRA LIP** (ETSI TS 100 392-18) short location reports, SDS protocol
   id `0x0A`. The frame is scanned for the `0x0A` PID and the bit-packed PDU is
@@ -408,7 +598,7 @@ that FlowStation relays for delivery, not the lossy telemetry `SdsLog`:
   ASCII in the SDS body.
 
 The decoded fix is stored per subscriber ISSI (attributed via the SDS route's
-source ISSI) and served at `/api/positions`. **No FlowStation change is
+source ISSI) and served at `/api/positions`. **No Basestation change is
 required.** Position-beacon SDS rows are also labelled in the Telemetry SDS Log.
 
 Note: this depends on the SDS (with its LIP payload) being relayed over the Brew
@@ -455,19 +645,39 @@ network); do not run auth over plain HTTP in production. `cert_path` is a PEM
 chain (leaf first) and `key_path` the matching PKCS#8/RSA key, same format as
 the Brew `[tls]` block.
 
-The dashboard shows connected BlueStations, registered subscribers, groups, and
-active/live group and private calls with durations and voice-frame counts.
+The dashboard shows connected Basestations, registered subscribers, groups, and
+active/live group and private calls with durations and voice-frame counts. The
+**Basestations** count reflects only `Basestation`-mode connections (actual
+Basestation gateways); a `Terminal`-mode connection (a mobile station
+registering directly over the Brew protocol) is not a Basestation and is
+excluded from this count — it is counted instead by **Subscribers**. The
+**Subscribers** count reflects only `Terminal`-mode registrations (actual
+mobile stations); a `Basestation` (Basestation gateway) can also hold a
+subscriber registration on a client's behalf, but is not itself an MS and is
+excluded from this count.
 Recent calls, recent SDS, and the telemetry SDS log have moved to their own
 paginated pages, linked from the "Logs" panel (`/calls`, `/sds`,
-`/telemetry-sds`). When the FlowStation Telemetry channel is enabled, it also
+`/telemetry-sds`). When the Basestation Telemetry channel is enabled, it also
 shows per-station health, active calls with **carrier + timeslot**, a small
 per-carrier **TS1-TS4 timeslot occupancy grid** (busy vs. available), RF
 quality, and a **Registered Subscribers** panel listing which ISSIs are
 registered on each station; active emergency alarms appear as a banner — see
-"FlowStation Telemetry" above, which is where the carrier-timeslot data comes
-from. When Control is enabled, each connected station gets a command panel (Kick
-MS, DGNA, live SDS, clear emergency, restart/shutdown) — see "FlowStation
+"Basestation Telemetry" above, which is where the carrier-timeslot data comes
+from. A **Mobile Station Registrations** log (`/registrations`, linked from
+both the "Logs" panel and the Registered Subscribers panel) lists individual
+registration lifecycle events — register, deregister, and timeout-drop —
+across all connected Basestations, newest first, so registration churn (a
+subscriber repeatedly registering/dropping) is visible over time rather than
+only as the current registered set. It also includes register/deregister
+events seen directly on the Brew protocol channel (a `Terminal`-mode client
+registering/deregistering an ISSI with this server, independent of any
+Basestation), tagged with the source `brew` so they're told apart from
+Basestation-reported events. This log is a rolling in-memory buffer (last 50
+events per source) and is not persisted across restarts. When
+Control is enabled, each connected station gets a command panel (Kick
+MS, DGNA, live SDS, clear emergency, restart/shutdown) — see "Basestation
 Control" above. Live per-station state (health, active calls, RF quality,
-registrations) is in-memory and resets when the BTS's telemetry/control
-connection restarts; calls, SDS, and the Telemetry SDS Log survive a server
-restart when `[storage]` is enabled (see "Persistent history" above).
+registrations, the registration event log) is in-memory and resets when the
+BTS's telemetry/control connection restarts; calls, SDS, and the Telemetry SDS
+Log survive a server restart when `[storage]` is enabled (see "Persistent
+history" above).

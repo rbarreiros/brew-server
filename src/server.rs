@@ -4,7 +4,7 @@ use anyhow::Context;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        FromRequestParts, Path, State,
+        ConnectInfo, FromRequestParts, Path, State,
     },
     http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     response::{IntoResponse, Response},
@@ -12,7 +12,7 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -44,12 +44,12 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         })?;
         info!(listen=%state.config.listen, websocket_path=%base, auth=state.config.auth.enabled, tls=true, "Brew server listening (TLS)");
         axum_server::bind_rustls(state.config.listen, rustls_config)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(state.config.listen).await?;
         info!(listen=%state.config.listen, websocket_path=%base, auth=state.config.auth.enabled, tls=false, "Brew server listening");
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     }
     Ok(())
 }
@@ -103,7 +103,11 @@ fn check_brew_version(headers: &HeaderMap) -> Result<ConnVersion, Response> {
     }
 }
 
-async fn brew_discovery(State(state): State<Arc<AppState>>, request: Request<axum::body::Body>) -> Response {
+async fn brew_discovery(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    request: Request<axum::body::Body>,
+) -> Response {
     state.purge_ephemeral().await;
     let (mut parts, _body) = request.into_parts();
     let request_uri = parts.uri.path().to_string();
@@ -120,7 +124,7 @@ async fn brew_discovery(State(state): State<Arc<AppState>>, request: Request<axu
 
     // Direct WS mode remains available only when Digest is disabled.
     if is_upgrade && !state.config.auth.enabled {
-        return upgrade_from_parts(state, &mut parts, mode, seed_version).await;
+        return upgrade_from_parts(state, &mut parts, mode, seed_version, remote_addr).await;
     }
 
     if state.config.auth.enabled {
@@ -162,6 +166,7 @@ fn version_header_value() -> &'static str {
 async fn brew_session_endpoint(
     State(state): State<Arc<AppState>>,
     Path(token): Path<String>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     request: Request<axum::body::Body>,
 ) -> Response {
     state.purge_ephemeral().await;
@@ -181,16 +186,16 @@ async fn brew_session_endpoint(
     let (mode, seed_version) = state.inner.write().await.auth_sessions.remove(&token)
         .map(|(_, mode, ver)| (mode, ver))
         .unwrap_or_default();
-    upgrade_from_parts(state, &mut parts, mode, seed_version).await
+    upgrade_from_parts(state, &mut parts, mode, seed_version, remote_addr).await
 }
 
-async fn upgrade_from_parts(state: Arc<AppState>, parts: &mut axum::http::request::Parts, mode: ClientMode, seed_version: ConnVersion) -> Response {
+async fn upgrade_from_parts(state: Arc<AppState>, parts: &mut axum::http::request::Parts, mode: ClientMode, seed_version: ConnVersion, remote_addr: SocketAddr) -> Response {
     match WebSocketUpgrade::from_request_parts(parts, &state).await {
         Ok(ws) => {
             let requested = parts.headers.get(header::SEC_WEBSOCKET_PROTOCOL).and_then(|v| v.to_str().ok()).unwrap_or_default();
             debug!(requested_subprotocol=requested, mode=mode.as_str(), seed_version=seed_version.as_u8(), "WebSocket upgrade request");
             let protocol = state.config.websocket_subprotocol.clone();
-            ws.protocols([protocol]).on_upgrade(move |socket| client_session(state, socket, mode, seed_version)).into_response()
+            ws.protocols([protocol]).on_upgrade(move |socket| client_session(state, socket, mode, seed_version, remote_addr)).into_response()
         }
         Err(rejection) => rejection.into_response(),
     }
@@ -220,7 +225,7 @@ fn parse_digest(header_value: &str) -> HashMap<String, String> {
     out
 }
 
-/// Maximum number of digits allowed in a Brew (BlueStation) username. TETRA
+/// Maximum number of digits allowed in a Brew (Basestation) username. TETRA
 /// subscriber identities used as Brew usernames are constrained to at most 7
 /// decimal digits.
 const MAX_BREW_USERNAME_DIGITS: usize = 7;
@@ -265,12 +270,13 @@ async fn verify_digest(state: &Arc<AppState>, headers: &HeaderMap, method: &str,
     ok
 }
 
-async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMode, seed_version: ConnVersion) {
+async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMode, seed_version: ConnVersion, remote_addr: SocketAddr) {
     let id = Uuid::new_v4();
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    state.inner.write().await.clients.insert(id, Client { tx, mode, version: seed_version });
-    info!(%id, mode=mode.as_str(), version=seed_version.as_u8(), "BlueStation connected");
+    let connected_at_ms = crate::telemetry::now_ms();
+    state.inner.write().await.clients.insert(id, Client { tx, mode, version: seed_version, remote_addr: Some(remote_addr), connected_at_ms });
+    info!(%id, mode=mode.as_str(), version=seed_version.as_u8(), %remote_addr, "Basestation connected");
 
     let writer = tokio::spawn(async move {
         while let Some(packet) = rx.recv().await {
@@ -291,7 +297,7 @@ async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMod
 
     writer.abort();
     state.cleanup_client(id).await;
-    info!(%id, "BlueStation disconnected");
+    info!(%id, "Basestation disconnected");
 }
 
 #[cfg(test)]

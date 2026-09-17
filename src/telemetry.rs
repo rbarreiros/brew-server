@@ -1,6 +1,6 @@
-//! FlowStation Telemetry channel: one-way BTS -> collector push of live
+//! Basestation Telemetry channel: one-way BTS -> collector push of live
 //! station state over a BTS-initiated WebSocket (subprotocol
-//! `bluestation-telemetry-v2`). See flowstation-telemetry-control-api.md.
+//! `basestation-telemetry-v2`). See basestation-telemetry-control-api.md.
 use crate::{fsnet, state::AppState};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::StreamExt;
@@ -174,6 +174,19 @@ pub struct TelemetryCall {
     pub started_at_ms: u64,
 }
 
+/// One subscriber registration lifecycle event (register / deregister /
+/// timeout-drop) on a Basestation, kept as a rolling log so the dashboard can
+/// show registration activity over time rather than only the current
+/// registered set (see `registrations_list`).
+#[derive(Debug, Clone, Serialize)]
+pub struct RegLogEntry {
+    pub at_ms: u64,
+    pub issi: u32,
+    /// "register", "deregister", or "timeout" (a silent drop after the
+    /// subscriber stopped renewing its registration).
+    pub kind: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SdsLogEntry {
     pub at_ms: u64,
@@ -214,13 +227,13 @@ impl SdsTelemetryRecord {
     }
 }
 
-/// Live, in-memory picture of one connected FlowStation BTS derived from its
+/// Live, in-memory picture of one connected Basestation BTS derived from its
 /// telemetry stream. Resets when the connection drops (no persistence, mirrors
 /// the rest of this server's dashboard state).
 #[derive(Debug, Clone, Serialize)]
 pub struct TelemetryBts {
     pub id: String,
-    /// Remote IP address of the FlowStation's telemetry connection, e.g.
+    /// Remote IP address of the Basestation's telemetry connection, e.g.
     /// "10.19.144.201". `None` if the peer address could not be determined.
     pub ip: Option<String>,
     pub connected_at_ms: u64,
@@ -234,6 +247,12 @@ pub struct TelemetryBts {
     /// Exposed to the dashboard so it can show who is registered on this station
     /// (the `registrations` HashSet itself is skipped for stable JSON ordering).
     pub registrations_list: Vec<u32>,
+    /// Rolling log of registration lifecycle events (register/deregister/
+    /// timeout) on this station, newest first, capped like `recent_sds`.
+    #[serde(skip)]
+    pub recent_regs: VecDeque<RegLogEntry>,
+    /// Serialized view of `recent_regs` for the dashboard.
+    pub recent_regs_out: Vec<RegLogEntry>,
     pub active_calls: HashMap<u16, TelemetryCall>,
     pub emergencies: HashSet<u32>,
     pub last_tx_quality: Option<TxQuality>,
@@ -306,6 +325,8 @@ impl TelemetryBts {
             registrations: HashSet::new(),
             registration_count: 0,
             registrations_list: Vec::new(),
+            recent_regs: VecDeque::new(),
+            recent_regs_out: Vec::new(),
             active_calls: HashMap::new(),
             emergencies: HashSet::new(),
             last_tx_quality: None,
@@ -386,22 +407,42 @@ impl TelemetryBts {
         list.sort_unstable();
         self.registrations_list = list;
     }
+
+    /// Appends a registration lifecycle event to the rolling log (newest
+    /// first, capped at 50 like `recent_sds`).
+    fn push_reg(&mut self, issi: u32, kind: &'static str) {
+        self.recent_regs.push_front(RegLogEntry { at_ms: now_ms(), issi, kind });
+        while self.recent_regs.len() > 50 {
+            self.recent_regs.pop_back();
+        }
+        self.recent_regs_out = self.recent_regs.iter().cloned().collect();
+    }
 }
 
 #[derive(Default)]
 pub struct TelemetryState {
     pub stations: HashMap<String, TelemetryBts>,
     /// Positions decoded from the Brew SDS channel (LIP binary or text), keyed by
-    /// subscriber ISSI. This is the primary source when FlowStation cannot be
+    /// subscriber ISSI. This is the primary source when Basestation cannot be
     /// modified: the raw SDS (incl. LIP payloads) is relayed over the Brew
     /// protocol and decoded here, independent of the lossy telemetry SdsLog.
     pub sds_positions: HashMap<u32, PositionFix>,
-    /// SDS entries observed on any FlowStation telemetry channel, newest first,
+    /// SDS entries observed on any Basestation telemetry channel, newest first,
     /// persisted to the history store so this survives restarts (unlike the
     /// per-station `recent_sds`, which resets when a BTS reconnects).
     recent_sds: VecDeque<SdsTelemetryRecord>,
     /// Serialized view of `recent_sds` for the dashboard.
     pub recent_sds_out: Vec<SdsTelemetryRecord>,
+    /// Mobile-station registration lifecycle events (register/deregister)
+    /// observed on the Brew protocol channel directly, i.e. a `Terminal`-mode
+    /// client registering/deregistering an ISSI with this server — distinct
+    /// from the per-Basestation telemetry registrations in `stations`. Tagged
+    /// with a synthetic "brew" station id (see `RegLogEntry`/`bts` below) so
+    /// the dashboard's registration log can show both sources together.
+    /// Newest first, capped like the per-station logs; not persisted.
+    recent_brew_regs: VecDeque<RegLogEntry>,
+    /// Serialized view of `recent_brew_regs` for the dashboard.
+    pub recent_brew_regs_out: Vec<RegLogEntry>,
     store: Option<Arc<crate::store::Store>>,
 }
 
@@ -480,6 +521,44 @@ impl TelemetryState {
             }
         }
     }
+
+    /// Records a mobile-station registration lifecycle event seen directly on
+    /// the Brew protocol channel (a `Terminal`-mode client registering or
+    /// deregistering an ISSI with this server), so it appears in the same
+    /// registration log as Basestation telemetry registrations. `kind` is
+    /// "register" or "deregister".
+    pub fn record_brew_registration(&mut self, issi: u32, kind: &'static str) {
+        self.recent_brew_regs.push_front(RegLogEntry { at_ms: now_ms(), issi, kind });
+        while self.recent_brew_regs.len() > 50 {
+            self.recent_brew_regs.pop_back();
+        }
+        self.recent_brew_regs_out = self.recent_brew_regs.iter().cloned().collect();
+    }
+
+    /// Flat, newest-first list of registration lifecycle events across every
+    /// Basestation's telemetry channel *and* the Brew protocol channel
+    /// directly (tagged with the synthetic station id "brew"), for the
+    /// `/registrations` dashboard page. Capped to the most recent 100 entries.
+    pub fn registration_log(&self) -> Vec<RegLogRow> {
+        let mut out: Vec<RegLogRow> = self.stations.values()
+            .flat_map(|s| s.recent_regs_out.iter().map(|e| RegLogRow { bts: s.id.clone(), entry: e.clone() }))
+            .chain(self.recent_brew_regs.iter().map(|e| RegLogRow { bts: "brew".to_string(), entry: e.clone() }))
+            .collect();
+        out.sort_unstable_by(|a, b| b.entry.at_ms.cmp(&a.entry.at_ms));
+        out.truncate(100);
+        out
+    }
+}
+
+/// One row of the combined registration log served to the dashboard: a
+/// registration lifecycle event tagged with the station that reported it
+/// ("brew" for events seen directly on the Brew protocol channel, rather than
+/// via a Basestation's telemetry channel).
+#[derive(Debug, Clone, Serialize)]
+pub struct RegLogRow {
+    pub bts: String,
+    #[serde(flatten)]
+    pub entry: RegLogEntry,
 }
 
 /// A position fix as served to the map, including which station reported it.
@@ -518,7 +597,7 @@ async fn session(state: Arc<AppState>, socket: WebSocket, identity: Option<Strin
         let mut t = state.telemetry.write().await;
         t.stations.insert(id.clone(), TelemetryBts::new(id.clone(), ip.clone()));
     }
-    info!(bts = %id, ip = ip.as_deref().unwrap_or("unknown"), "FlowStation telemetry connected");
+    info!(bts = %id, ip = ip.as_deref().unwrap_or("unknown"), "Basestation telemetry connected");
 
     let (_tx, mut ws_rx) = socket.split();
     while let Some(item) = ws_rx.next().await {
@@ -533,7 +612,7 @@ async fn session(state: Arc<AppState>, socket: WebSocket, identity: Option<Strin
 
     state.telemetry.write().await.stations.remove(&id);
     state.monitor.emit("telemetry_disconnected", serde_json::json!({"id": id}));
-    info!(bts = %id, "FlowStation telemetry disconnected");
+    info!(bts = %id, "Basestation telemetry disconnected");
 }
 
 async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
@@ -559,9 +638,17 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
 
     let mut sds_entry: Option<SdsLogEntry> = None;
     match event {
-        TelemetryEvent::MsRegistration { issi } => { bts.registrations.insert(issi); bts.sync_registrations(); }
-        TelemetryEvent::MsDeregistration { issi } | TelemetryEvent::MsTimeoutDrop { issi } => {
+        TelemetryEvent::MsRegistration { issi } => {
+            bts.registrations.insert(issi); bts.sync_registrations();
+            bts.push_reg(issi, "register");
+        }
+        TelemetryEvent::MsDeregistration { issi } => {
             bts.registrations.remove(&issi); bts.sync_registrations();
+            bts.push_reg(issi, "deregister");
+        }
+        TelemetryEvent::MsTimeoutDrop { issi } => {
+            bts.registrations.remove(&issi); bts.sync_registrations();
+            bts.push_reg(issi, "timeout");
         }
         TelemetryEvent::GroupCallStarted { call_id, gssi, caller_issi, carrier_num, ts, priority } => {
             bts.active_calls.insert(call_id, TelemetryCall {
@@ -696,6 +783,39 @@ mod tests {
     }
 
     #[test]
+    fn push_reg_logs_events_newest_first_and_capped() {
+        let mut bts = TelemetryBts::new("bts-1".to_string(), None);
+        bts.push_reg(1001, "register");
+        bts.push_reg(1002, "register");
+        bts.push_reg(1001, "deregister");
+        assert_eq!(bts.recent_regs_out.len(), 3);
+        assert_eq!(bts.recent_regs_out[0].issi, 1001);
+        assert_eq!(bts.recent_regs_out[0].kind, "deregister");
+        assert_eq!(bts.recent_regs_out[2].kind, "register");
+        for i in 0..60 {
+            bts.push_reg(i, "register");
+        }
+        assert_eq!(bts.recent_regs_out.len(), 50, "log capped at 50 entries");
+    }
+
+    #[test]
+    fn registration_events_recorded_via_handle_event_path() {
+        // Exercises the same transitions handle_event applies, directly on the
+        // TelemetryBts state, to confirm registrations and the event log agree.
+        let mut bts = TelemetryBts::new("bts-1".to_string(), None);
+        bts.registrations.insert(2001);
+        bts.sync_registrations();
+        bts.push_reg(2001, "register");
+        bts.registrations.remove(&2001);
+        bts.sync_registrations();
+        bts.push_reg(2001, "timeout");
+        assert!(bts.registrations_list.is_empty());
+        assert_eq!(bts.recent_regs_out.len(), 2);
+        assert_eq!(bts.recent_regs_out[0].kind, "timeout");
+        assert_eq!(bts.recent_regs_out[1].kind, "register");
+    }
+
+    #[test]
     fn registrations_list_serialized_in_snapshot() {
         let mut bts = TelemetryBts::new("bts-1".to_string(), None);
         bts.registrations.insert(4242);
@@ -792,5 +912,58 @@ mod sds_persist_tests {
         }
         assert_eq!(t.recent_sds_out.len(), 200, "capped at 200");
         assert_eq!(t.recent_sds_out[0].source_issi, 204, "newest first");
+    }
+}
+
+#[cfg(test)]
+mod registration_log_tests {
+    use super::*;
+
+    #[test]
+    fn record_brew_registration_logs_newest_first_and_capped() {
+        let mut t = TelemetryState::default();
+        t.record_brew_registration(1001, "register");
+        t.record_brew_registration(1002, "register");
+        t.record_brew_registration(1001, "deregister");
+        assert_eq!(t.recent_brew_regs_out.len(), 3);
+        assert_eq!(t.recent_brew_regs_out[0].issi, 1001);
+        assert_eq!(t.recent_brew_regs_out[0].kind, "deregister");
+        for i in 0..60 {
+            t.record_brew_registration(i, "register");
+        }
+        assert_eq!(t.recent_brew_regs_out.len(), 50, "log capped at 50 entries");
+    }
+
+    #[test]
+    fn registration_log_merges_and_tags_brew_and_basestation_events() {
+        let mut t = TelemetryState::default();
+        t.stations.insert("bts-1".to_string(), TelemetryBts::new("bts-1".to_string(), None));
+        t.stations.get_mut("bts-1").unwrap().push_reg(2001, "register");
+        // Ensure a distinct, later timestamp so ordering is deterministic
+        // rather than relying on both events landing in the same millisecond.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        t.record_brew_registration(3001, "register");
+
+        let log = t.registration_log();
+        assert_eq!(log.len(), 2);
+        // Newest first: the Brew-channel event was recorded after the
+        // Basestation one, so it must sort first.
+        assert_eq!(log[0].bts, "brew");
+        assert_eq!(log[0].entry.issi, 3001);
+        assert_eq!(log[1].bts, "bts-1");
+        assert_eq!(log[1].entry.issi, 2001);
+    }
+
+    #[test]
+    fn registration_log_caps_at_100_across_all_sources() {
+        let mut t = TelemetryState::default();
+        for i in 0..60u32 {
+            t.record_brew_registration(i, "register");
+        }
+        t.stations.insert("bts-1".to_string(), TelemetryBts::new("bts-1".to_string(), None));
+        for i in 0..60u32 {
+            t.stations.get_mut("bts-1").unwrap().push_reg(i, "register");
+        }
+        assert_eq!(t.registration_log().len(), 100);
     }
 }

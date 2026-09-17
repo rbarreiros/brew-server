@@ -1,4 +1,4 @@
-//! Shared transport for FlowStation's BTS-initiated Telemetry/Control WebSocket
+//! Shared transport for Basestation's BTS-initiated Telemetry/Control WebSocket
 //! channels: single-step RFC 6455 upgrade at `/`, optional HTTP Basic auth,
 //! and a required Sec-WebSocket-Protocol echo (the client aborts if we don't
 //! echo back exactly what it offered).
@@ -61,13 +61,13 @@ where
                 cfg.name
             )
         })?;
-        tracing::info!(listen=%cfg.listen, name=cfg.name, tls=true, "FlowStation listener started");
+        tracing::info!(listen=%cfg.listen, name=cfg.name, tls=true, "Basestation listener started");
         axum_server::bind_rustls(cfg.listen, rustls_config)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
-        tracing::info!(listen=%cfg.listen, name=cfg.name, tls=false, "FlowStation listener started");
+        tracing::info!(listen=%cfg.listen, name=cfg.name, tls=false, "Basestation listener started");
         axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     }
     Ok(())
