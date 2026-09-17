@@ -25,6 +25,7 @@ use crate::sip::transport::SipTransport;
 use crate::state::{ActiveCall, AppState, CallKind, Client, ClientId, ClientMode};
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
@@ -63,6 +64,17 @@ struct BridgedLeg {
     /// (i.e. every case here), so a Brew-initiated hangup can notify the SIP
     /// peer instead of leaving its dialog dangling.
     bye: Option<DialogBye>,
+    /// The real Brew subscriber to signal ringing/answered/rejected toward,
+    /// for a Brew-originated (Brew->SIP) leg placed by `place_outbound`.
+    /// `None` for a SIP-originated leg, where that signalling instead flows
+    /// through the private-call-control task spawned by `sip_to_brew_private`.
+    subscriber: Option<ClientId>,
+    /// Whether CALL_ALERT has already been sent to `subscriber`, so a
+    /// retransmitted SIP 180 doesn't re-trigger it.
+    rang: AtomicBool,
+    /// Whether CALL_CONNECT_CONFIRM/ACK has already been sent/processed, so a
+    /// retransmitted SIP 200 doesn't re-trigger it.
+    connected: AtomicBool,
 }
 
 /// Couples the SIP transport to the Brew core.
@@ -154,6 +166,73 @@ impl BrewBridge {
         info!(%call_id, "Brew hangup: sent SIP BYE");
     }
 
+    /// Drives a Brew-originated (Brew->SIP) private call's ringing/answer
+    /// signalling from the SIP response to our outbound INVITE (see
+    /// `place_outbound`): a provisional response sends CALL_ALERT to the
+    /// originating ISSI, 200 OK sends CALL_CONNECT_CONFIRM (plus the SIP ACK
+    /// this dialog now needs to stay up), and a failure response releases the
+    /// Brew side and cleans up. No-op for a call this bridge did not place as
+    /// a Brew-originated leg (`subscriber` unset), e.g. a plain SIP-SIP relay.
+    pub async fn on_sip_response(&self, call_id: &str, code: u16, to_header: Option<&str>, peer: SocketAddr) {
+        let (subscriber, brew_call_id, already_rang, already_connected, bye) = {
+            let legs = self.legs.read().await;
+            let Some(leg) = legs.get(call_id) else { return };
+            let Some(subscriber) = leg.subscriber else { return };
+            (subscriber, leg.brew_call_id, leg.rang.load(Ordering::Relaxed), leg.connected.load(Ordering::Relaxed), leg.bye.clone())
+        };
+        if already_connected { return; }
+        let tx = {
+            let inner = self.app.inner.read().await;
+            inner.clients.get(&subscriber).map(|c| c.tx.clone())
+        };
+        let Some(tx) = tx else { return };
+
+        match code {
+            180 | 183 => {
+                if !already_rang {
+                    if let Some(leg) = self.legs.read().await.get(call_id) { leg.rang.store(true, Ordering::Relaxed); }
+                    let _ = tx.send(protocol::build_call_control_empty(protocol::CALL_ALERT, &brew_call_id));
+                    info!(%call_id, code, "SIP peer ringing (CALL_ALERT sent to ISSI)");
+                }
+            }
+            200 => {
+                if let Some(leg) = self.legs.read().await.get(call_id) { leg.connected.store(true, Ordering::Relaxed); }
+                let _ = tx.send(protocol::build_call_control_empty(protocol::CALL_CONNECT_CONFIRM, &brew_call_id));
+                self.transport.state.answer_call(call_id).await;
+                if let Some(d) = bye {
+                    self.send_ack(call_id, &d, to_header, peer).await;
+                }
+                info!(%call_id, "SIP peer answered (CALL_CONNECT_CONFIRM sent to ISSI)");
+            }
+            code if code >= 400 => {
+                if let Some(leg) = self.legs.read().await.get(call_id) { leg.connected.store(true, Ordering::Relaxed); }
+                let _ = tx.send(protocol::build_call_cause(protocol::CALL_RELEASE, &brew_call_id, 0));
+                self.teardown(call_id).await;
+                self.transport.state.end_call(call_id).await;
+                warn!(%call_id, code, "SIP peer rejected/failed (CALL_RELEASE sent to ISSI)");
+            }
+            _ => {}
+        }
+    }
+
+    /// Sends the SIP ACK a 200 OK to our own outbound INVITE requires (we are
+    /// the UAC on this leg: without it, the peer keeps retransmitting the 200
+    /// and eventually tears the dialog down). Reuses `place_outbound`'s stored
+    /// Request-URI/From (see `DialogBye`'s note on this bridge's minimal
+    /// dialog tracking) and the peer's own assigned To-tag from the response.
+    async fn send_ack(&self, call_id: &str, d: &DialogBye, to_header: Option<&str>, peer: SocketAddr) {
+        use crate::sip::message::Method;
+        let mut ack = SipMessage::new_request(Method::Ack, d.request_uri.clone());
+        ack.push_header("Via", format!("SIP/2.0/UDP {};branch=z9hG4bK{}",
+            self.transport.advertised_host, uuid::Uuid::new_v4().simple()));
+        ack.push_header("Max-Forwards", "70");
+        ack.push_header("From", d.from.clone());
+        ack.push_header("To", to_header.unwrap_or(&d.to).to_string());
+        ack.push_header("Call-ID", call_id.to_string());
+        ack.push_header("CSeq", "1 ACK");
+        self.transport.send_to(&ack, peer).await;
+    }
+
     /// Answers the SIP caller and sets up a Brew *private* call to `issi`.
     ///
     /// Signalling: we locate the Basestation that owns `issi` (its registered
@@ -224,8 +303,18 @@ impl BrewBridge {
             let _ = tx.send(setup);
         }
         let local_port = leg.local_port;
+        // Pre-build every response this dialog might need, but do not send
+        // the 200 OK yet: sending it immediately (as this used to) answers
+        // the SIP caller before the ISSI has even been told about the call,
+        // so the caller gets no ringback and, if the callee never picks up,
+        // no error either. Instead these are sent by the call-control task
+        // below, driven by the ISSI's actual SETUP_ACCEPT/ALERT/CONNECT_REQUEST.
+        let mut ringing = self.transport.base_response_pub(req, 180, "Ringing");
         let mut ok = self.transport.base_response_pub(req, 200, "OK");
-        ok.push_header("Contact", format!("<sip:brew@{}>", self.transport.advertised_host));
+        let reject = self.transport.base_response_pub(req, 486, "Busy Here");
+        for resp in [&mut ringing, &mut ok] {
+            resp.push_header("Contact", format!("<sip:brew@{}>", self.transport.advertised_host));
+        }
         ok.push_header("Content-Type", "application/sdp");
         ok.body = Sdp::build(&self.transport.advertised_host, local_port, payloads);
         // Capture enough of this dialog (our to-tag, their from-tag) to send
@@ -241,17 +330,25 @@ impl BrewBridge {
         };
 
         let payload_type = Self::transcoder_payload_type(payloads);
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let confirm_tx = target_tx.clone();
         let task = crate::transcode::task::spawn(
             leg, payload_type, brew_call_id, virtual_rx,
-            target_tx.into_iter().collect(),
+            target_tx.into_iter().collect(), control_tx,
         );
         self.legs.write().await.insert(call_id.to_string(), BridgedLeg {
             virtual_client, brew_call_id, group: None, task, bye,
+            subscriber: None, rang: AtomicBool::new(false), connected: AtomicBool::new(false),
         });
 
-        self.transport.send_to(&ok, caller).await;
-        self.transport.state.answer_call(call_id).await;
-        info!(issi, %call_id, "bridged SIP call to Brew private (media: ACELP<->G.711 transcoder active)");
+        // Same instance as `self` (this is how `sip_to_brew_private` is
+        // reached in the first place -- see transport.rs's INVITE handling),
+        // just re-fetched as an Arc so the spawned task can call back into it.
+        if let Some(bridge) = self.transport.bridge.read().await.clone() {
+            let handshake = PrivateCallHandshake { caller, brew_call_id, confirm_tx, ringing, ok, reject };
+            spawn_private_call_control(bridge, call_id.to_string(), handshake, control_rx);
+        }
+        info!(issi, %call_id, "bridged SIP call to Brew private, awaiting ISSI accept/answer (media: ACELP<->G.711 transcoder active)");
     }
 
     /// Answers the SIP caller and sets up a Brew *group* call to `gssi`,
@@ -337,9 +434,16 @@ impl BrewBridge {
         };
 
         let payload_type = Self::transcoder_payload_type(payloads);
-        let task = crate::transcode::task::spawn(leg, payload_type, brew_call_id, virtual_rx, target_txs);
+        // Group calls have no accept/ring/answer handshake in this protocol
+        // (route_private_control only acts on CallKind::Private) -- members
+        // just start receiving as soon as the floor is seized above, so there
+        // is nothing for a control task to react to; the receiver is simply
+        // dropped rather than spawning one that would never see traffic.
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let task = crate::transcode::task::spawn(leg, payload_type, brew_call_id, virtual_rx, target_txs, control_tx);
         self.legs.write().await.insert(call_id.to_string(), BridgedLeg {
             virtual_client, brew_call_id, group: Some(gssi), task, bye,
+            subscriber: None, rang: AtomicBool::new(false), connected: AtomicBool::new(false),
         });
 
         self.transport.send_to(&ok, caller).await;
@@ -435,6 +539,13 @@ impl BrewBridge {
             });
             inner.clients.get(&link.client).map(|c| c.tx.clone())
         };
+        // Acknowledge the setup request so the originating ISSI's UI leaves
+        // "dialling" for "ringing" state instead of waiting on nothing; actual
+        // ringing (CALL_ALERT) and answer (CALL_CONNECT_CONFIRM) follow from
+        // the SIP response in `on_sip_response` below.
+        if let Some(tx) = &brew_target_tx {
+            let _ = tx.send(protocol::build_call_control_empty(protocol::CALL_SETUP_ACCEPT, &link.call_id));
+        }
 
         use crate::sip::message::Method;
         let from_header = format!("<sip:brew@{}>;tag={}", self.transport.advertised_host, uuid::Uuid::new_v4().simple());
@@ -466,17 +577,83 @@ impl BrewBridge {
         // "optimistic answer" note above), so run the transcoder at PCMU (0),
         // the payload type we listed first and most gateways default to.
         let payload_type = 0u8;
+        // Nothing meaningful arrives on this leg's control channel: the real
+        // subscriber is the *caller* here, so it won't send callee-side
+        // messages (SETUP_ACCEPT/ALERT/CONNECT_REQUEST); a CALL_RELEASE mid-
+        // ring is handled separately via router::end_call -> teardown_by_brew_call.
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
         let task = crate::transcode::task::spawn(
             leg, payload_type, link.call_id, virtual_rx,
-            brew_target_tx.into_iter().collect(),
+            brew_target_tx.into_iter().collect(), control_tx,
         );
         self.legs.write().await.insert(call_id.to_string(), BridgedLeg {
             virtual_client, brew_call_id: link.call_id, group: None, task, bye,
+            subscriber: Some(link.client), rang: AtomicBool::new(false), connected: AtomicBool::new(false),
         });
 
         self.transport.send_to(&invite, target_addr).await;
         info!(%call_id, uri = %target_uri, user = ?uri_user(&target_uri), "Brew->SIP INVITE sent (media: ACELP<->G.711 transcoder active)");
     }
+}
+
+/// Everything `spawn_private_call_control` needs to answer the SIP caller,
+/// bundled to keep the spawn function's argument list short.
+struct PrivateCallHandshake {
+    caller: SocketAddr,
+    brew_call_id: uuid::Uuid,
+    /// Sends `CALL_CONNECT_CONFIRM` back to the ISSI once it presses accept.
+    confirm_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    ringing: SipMessage,
+    ok: SipMessage,
+    reject: SipMessage,
+}
+
+/// Drives a SIP-originated private call's accept/ring/answer handshake from
+/// the ISSI's call-control messages (forwarded here by the transcoder task's
+/// `control_tx`, see `transcode::task::spawn`): SETUP_ACCEPT/ALERT sends SIP
+/// 180 Ringing, CONNECT_REQUEST (the callee pressed accept) sends
+/// CALL_CONNECT_CONFIRM back to the ISSI and SIP 200 OK to the caller,
+/// SETUP_REJECT/RELEASE before answer sends SIP 486 and tears the call down.
+/// Runs until one of those terminal outcomes or the channel closes (call
+/// already torn down some other way, e.g. the caller sent BYE/CANCEL first).
+fn spawn_private_call_control(
+    bridge: Arc<BrewBridge>,
+    call_id: String,
+    h: PrivateCallHandshake,
+    mut control_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    tokio::spawn(async move {
+        let mut rang = false;
+        while let Some(raw) = control_rx.recv().await {
+            if raw.len() < 18 || raw[0] != protocol::CLASS_CALL_CONTROL { continue; }
+            match raw[1] {
+                protocol::CALL_SETUP_ACCEPT | protocol::CALL_ALERT => {
+                    if !rang {
+                        rang = true;
+                        bridge.transport.send_to(&h.ringing, h.caller).await;
+                        info!(%call_id, "ISSI ringing (SIP 180 sent)");
+                    }
+                }
+                protocol::CALL_CONNECT_REQUEST => {
+                    if let Some(tx) = &h.confirm_tx {
+                        let _ = tx.send(protocol::build_call_control_empty(protocol::CALL_CONNECT_CONFIRM, &h.brew_call_id));
+                    }
+                    bridge.transport.send_to(&h.ok, h.caller).await;
+                    bridge.transport.state.answer_call(&call_id).await;
+                    info!(%call_id, "ISSI answered (SIP 200 sent)");
+                    return;
+                }
+                protocol::CALL_SETUP_REJECT | protocol::CALL_RELEASE => {
+                    bridge.transport.send_to(&h.reject, h.caller).await;
+                    bridge.teardown(&call_id).await;
+                    bridge.transport.state.end_call(&call_id).await;
+                    warn!(%call_id, "ISSI rejected/released before answer (SIP 486 sent)");
+                    return;
+                }
+                _ => {}
+            }
+        }
+    });
 }
 
 fn now_ms() -> u64 {

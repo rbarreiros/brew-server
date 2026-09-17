@@ -459,6 +459,21 @@ pub fn build_call_cause(call_state: u8, id: &Uuid, cause: u8) -> Vec<u8> {
     out
 }
 
+/// Builds a call-control message with no payload: `CALL_SETUP_ACCEPT` and
+/// `CALL_ALERT` parse this way already (`CallPayload::Empty`); `CALL_CONNECT_CONFIRM`
+/// has no payload defined by this server's parser either (falls through to
+/// `CallPayload::Raw` with zero bytes), so an empty body is the correct wire
+/// shape for all three. Used by the SIP<->Brew bridge to drive a private
+/// call's accept/ring/answer handshake from the server side (there is no
+/// Brew client on the SIP leg to have sent one).
+pub fn build_call_control_empty(call_state: u8, id: &Uuid) -> Vec<u8> {
+    let mut out = Vec::with_capacity(18);
+    out.push(CLASS_CALL_CONTROL);
+    out.push(call_state);
+    out.extend_from_slice(id.as_bytes());
+    out
+}
+
 pub fn raw_peer_pair(payload: &CallPayload) -> Option<(u32, u32)> {
     let CallPayload::Raw(raw) = payload else { return None };
     if raw.len() < 8 { return None; }
@@ -520,6 +535,18 @@ pub fn build_traffic_frame(id: &Uuid, coded: &[u8; ACELP_CODED_FRAME_BYTES]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_call_control_empty_round_trips_as_empty_payload() {
+        let id = Uuid::new_v4();
+        for state in [CALL_SETUP_ACCEPT, CALL_ALERT] {
+            let wire = build_call_control_empty(state, &id);
+            let BrewMessage::CallControl(cc) = parse(&wire).unwrap() else { panic!() };
+            assert_eq!(cc.call_state, state);
+            assert_eq!(cc.identifier, id);
+            assert!(matches!(cc.payload, CallPayload::Empty));
+        }
+    }
 
     #[test]
     fn parses_group_tx() {

@@ -39,6 +39,28 @@ fn rand_hex(n: usize) -> String {
     s
 }
 
+/// `[sip] advertised_host` must be a bare host: it is written verbatim into
+/// the SDP `o=`/`c=` connection-address lines (`c=IN IP4 {addr}`), which per
+/// the SDP spec never carry a port. A common misconfiguration is copying the
+/// `host:port` style used by `listen`/`remote_host` into this field, which
+/// produces malformed SDP that peers like Asterisk reject outright (its
+/// `netsock2.c` logs "Port disallowed in host:port" when asked to parse one
+/// as a bare host). If the configured value parses as `host:port`, strip the
+/// port and warn instead of silently emitting broken SDP.
+fn sanitize_advertised_host(configured: &str) -> String {
+    if let Some((host, port)) = configured.rsplit_once(':') {
+        // Only strip a trailing :port, not an IPv6 literal (which has more
+        // than one colon and isn't valid unbracketed in this field either,
+        // but that's a separate, unrelated limitation of the IP4-only SDP
+        // builder -- not this typo).
+        if !host.contains(':') && port.parse::<u16>().is_ok() {
+            warn!(configured, host, "sip.advertised_host has a port; only a bare host belongs here (it's written into SDP c= lines, which never carry a port) -- stripping the port");
+            return host.to_string();
+        }
+    }
+    configured.to_string()
+}
+
 /// Shared handle used by handlers and by the bridge/dashboard.
 pub struct SipTransport {
     pub sock: Arc<UdpSocket>,
@@ -118,7 +140,7 @@ pub async fn run(app: Arc<crate::state::AppState>) -> anyhow::Result<()> {
     let advertised_host = if cfg.advertised_host.is_empty() {
         local.ip().to_string()
     } else {
-        cfg.advertised_host.clone()
+        sanitize_advertised_host(&cfg.advertised_host)
     };
 
     let state = Arc::new(SipState::new(true, local.to_string(), cfg.realm.clone()));
@@ -579,6 +601,17 @@ async fn handle_response(t: Arc<SipTransport>, peer: SocketAddr, resp: SipMessag
                 c => t.state.update_trunk_status(&trunk, TrunkStatus::Failed, format!("{c}"), Some(peer)).await,
             }
         }
+    } else if method == "INVITE" {
+        // A response to an INVITE *we* sent (place_outbound, Brew->SIP): drive
+        // the originating ISSI's ringing/answer signalling from it. No-op for
+        // a call this bridge didn't place as a Brew-originated leg.
+        if let Some(call_id) = resp.header("call-id") {
+            let call_id = call_id.to_string();
+            let to_header = resp.header("to").map(|s| s.to_string());
+            if let Some(bridge) = t.bridge.read().await.clone() {
+                bridge.on_sip_response(&call_id, code, to_header.as_deref(), peer).await;
+            }
+        }
     }
     debug!(%peer, code, method = %method, "SIP response");
 }
@@ -689,6 +722,26 @@ mod tests {
     fn rand_hex_has_requested_length() {
         assert_eq!(rand_hex(16).len(), 16);
         assert_eq!(rand_hex(40).len(), 40);
+    }
+
+    #[test]
+    fn sanitize_advertised_host_strips_accidental_port() {
+        // The exact misconfiguration that produced malformed SDP c= lines
+        // Asterisk rejected ("Port disallowed in 10.31.175.162:5060").
+        assert_eq!(sanitize_advertised_host("10.31.175.162:5060"), "10.31.175.162");
+    }
+
+    #[test]
+    fn sanitize_advertised_host_leaves_bare_host_alone() {
+        assert_eq!(sanitize_advertised_host("10.31.175.162"), "10.31.175.162");
+        assert_eq!(sanitize_advertised_host("sip.example.com"), "sip.example.com");
+    }
+
+    #[test]
+    fn sanitize_advertised_host_does_not_mangle_ipv6() {
+        // Not a valid value for this field either (the SDP builder is IP4-only),
+        // but it must not be misparsed as host:port and truncated.
+        assert_eq!(sanitize_advertised_host("::1"), "::1");
     }
 
     #[tokio::test]

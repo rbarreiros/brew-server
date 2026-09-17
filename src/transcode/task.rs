@@ -27,12 +27,19 @@ const RTP_SAMPLES_PER_PACKET: usize = 160;
 ///   participant, so the router delivers voice frames to it like any other
 ///   peer) are ACELP-decoded, buffered into 160-sample RTP packets, and sent
 ///   out on `leg`.
+/// - Anything else arriving on `brew_rx` (call-control messages: SETUP_ACCEPT,
+///   ALERT, CONNECT_REQUEST, CONNECT_CONFIRM, RELEASE, ...) is not audio this
+///   task understands, but it is not noise either -- it is routed to the same
+///   virtual client for a reason (accept/ring/answer handshake, hangup). It is
+///   forwarded verbatim to `control_tx` for the bridge's call-control state
+///   machine to act on, rather than silently dropped.
 pub fn spawn(
     leg: RtpLeg,
     payload_type: u8,
     call_id: Uuid,
     mut brew_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     brew_targets: Vec<mpsc::UnboundedSender<Vec<u8>>>,
+    control_tx: mpsc::UnboundedSender<Vec<u8>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut encoder = AcelpEncoder::new();
@@ -70,6 +77,7 @@ pub fn spawn(
                         || raw[0] != CLASS_FRAME
                         || raw[1] != FRAME_TRAFFIC_CHANNEL
                     {
+                        let _ = control_tx.send(raw);
                         continue;
                     }
                     let mut coded = [0u8; ACELP_CODED_FRAME_BYTES];
