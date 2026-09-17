@@ -100,7 +100,7 @@ const MNEMONIC_FIELD_LEN: usize = 34;
 
 /// Negotiated Brew protocol version for a single WebSocket connection.
 ///
-/// Real clients (e.g. FlowStation) do **not** carry `X-Brew-Version` on the
+/// Real clients (e.g. Basestation) do **not** carry `X-Brew-Version` on the
 /// WebSocket handshake — only, optionally, on the preceding HTTP discovery GET.
 /// The version is therefore treated as a per-connection property that starts at
 /// `V0` and is promoted to `V1` either by an explicit discovery header or lazily
@@ -201,7 +201,7 @@ fn u64le(data: &[u8], o: usize) -> u64 {
 ///   - Octet 1: length of the following text in bits
 ///   - Octet 2+: encoded character data
 ///
-/// Only the coding schemes practically used by BlueStation/FlowStation are
+/// Only the coding schemes practically used by Basestation/Basestation are
 /// decoded to text: 0x00 (ISO 8859-1 / 8-bit) and the 7-bit GSM-like packing
 /// (scheme 0x01) described in ETSI EN 300 392-2 clause 29.5.4. Unknown schemes
 /// return the raw bytes rendered as lossy UTF-8 so information is not silently
@@ -278,7 +278,7 @@ pub fn parse(data: &[u8]) -> Result<BrewMessage, ParseError> {
 /// Parses a Brew message in the context of a connection's negotiated version and
 /// reports the version implied by this message. The returned `ConnVersion` is
 /// the max of the input version and any version lazily detected from the
-/// message length (mirroring how FlowStation resolves the version from message
+/// message length (mirroring how Basestation resolves the version from message
 /// content when no `X-Brew-Version` handshake header is present). Callers should
 /// store `max(previous, returned)` as the connection's version.
 pub fn parse_with_version(data: &[u8], version: ConnVersion) -> Result<(BrewMessage, ConnVersion), ParseError> {

@@ -24,7 +24,7 @@ pub enum StoredRecord {
     Sds(SdsRecord),
     /// A delivery report for a previously stored SDS (by uuid).
     SdsReport { uuid: uuid::Uuid },
-    /// An SDS log entry observed on a FlowStation telemetry channel.
+    /// An SDS log entry observed on a Basestation telemetry channel.
     SdsTelemetry(SdsTelemetryRecord),
 }
 

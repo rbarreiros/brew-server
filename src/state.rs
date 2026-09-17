@@ -54,7 +54,7 @@ pub struct Subscriber {
     pub groups: HashSet<u32>,
     /// The connection mode of the client that registered this ISSI (Terminal
     /// or Basestation). Only `Terminal` connections represent an actual mobile
-    /// station; a `Basestation` (BlueStation gateway) registering on a
+    /// station; a `Basestation` (Basestation gateway) registering on a
     /// subscriber's behalf is not itself an MS. Dashboard MS-registration
     /// counts should filter on this.
     pub mode: ClientMode,
@@ -100,18 +100,18 @@ pub struct Inner {
 impl Inner {
     /// Number of registered subscribers that represent an actual mobile
     /// station, i.e. registered by a `Terminal`-mode client. A `Basestation`
-    /// (BlueStation gateway) can also hold a subscriber registration, but it
+    /// (Basestation gateway) can also hold a subscriber registration, but it
     /// is not itself an MS, so it is excluded from MS-registration counts.
     pub fn ms_registration_count(&self) -> usize {
         self.subscribers.values().filter(|s| s.mode == ClientMode::Terminal).count()
     }
 
-    /// Number of connected clients that are actual BlueStation (FlowStation)
+    /// Number of connected clients that are actual Basestation (Basestation)
     /// gateways, i.e. `Basestation`-mode connections. A `Terminal`-mode
     /// connection is a mobile station registering directly over the Brew
-    /// protocol, not a BlueStation, so it is excluded here (it is counted
+    /// protocol, not a Basestation, so it is excluded here (it is counted
     /// instead by `ms_registration_count`).
-    pub fn bluestation_count(&self) -> usize {
+    pub fn basestation_count(&self) -> usize {
         self.clients.values().filter(|c| c.mode == ClientMode::Basestation).count()
     }
 }
@@ -149,7 +149,7 @@ mod ms_registration_tests {
 }
 
 #[cfg(test)]
-mod bluestation_count_tests {
+mod basestation_count_tests {
     use super::*;
 
     fn client(mode: ClientMode) -> Client {
@@ -165,8 +165,8 @@ mod bluestation_count_tests {
         inner.clients.insert(Uuid::new_v4(), client(ClientMode::Terminal));
         inner.clients.insert(Uuid::new_v4(), client(ClientMode::Terminal));
         // Reproduces the reported scenario: 2 Terminal MS + 2 Basestation
-        // (FlowStation) connections must show 2 BlueStations, not 4.
-        assert_eq!(inner.bluestation_count(), 2);
+        // (Basestation) connections must show 2 Basestations, not 4.
+        assert_eq!(inner.basestation_count(), 2);
         assert_eq!(inner.clients.len(), 4, "raw client map still holds every connection");
     }
 
@@ -175,12 +175,12 @@ mod bluestation_count_tests {
         let mut inner = Inner::default();
         inner.clients.insert(Uuid::new_v4(), client(ClientMode::Terminal));
         inner.clients.insert(Uuid::new_v4(), client(ClientMode::Terminal));
-        assert_eq!(inner.bluestation_count(), 0);
+        assert_eq!(inner.basestation_count(), 0);
     }
 
     #[test]
     fn zero_when_no_clients() {
-        assert_eq!(Inner::default().bluestation_count(), 0);
+        assert_eq!(Inner::default().basestation_count(), 0);
     }
 }
 

@@ -220,7 +220,7 @@ fn parse_digest(header_value: &str) -> HashMap<String, String> {
     out
 }
 
-/// Maximum number of digits allowed in a Brew (BlueStation) username. TETRA
+/// Maximum number of digits allowed in a Brew (Basestation) username. TETRA
 /// subscriber identities used as Brew usernames are constrained to at most 7
 /// decimal digits.
 const MAX_BREW_USERNAME_DIGITS: usize = 7;
@@ -270,7 +270,7 @@ async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMod
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     state.inner.write().await.clients.insert(id, Client { tx, mode, version: seed_version });
-    info!(%id, mode=mode.as_str(), version=seed_version.as_u8(), "BlueStation connected");
+    info!(%id, mode=mode.as_str(), version=seed_version.as_u8(), "Basestation connected");
 
     let writer = tokio::spawn(async move {
         while let Some(packet) = rx.recv().await {
@@ -291,7 +291,7 @@ async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMod
 
     writer.abort();
     state.cleanup_client(id).await;
-    info!(%id, "BlueStation disconnected");
+    info!(%id, "Basestation disconnected");
 }
 
 #[cfg(test)]

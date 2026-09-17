@@ -2,7 +2,7 @@
 //!
 //! This is the single place the two subsystems meet. It maps a routed SIP call
 //! onto a Brew call: a SIP->Brew-private call becomes a Brew private
-//! (individual) call setup toward the ISSI's registered BlueStation, and a
+//! (individual) call setup toward the ISSI's registered Basestation, and a
 //! SIP->Brew-group call becomes a group transmission to a GSSI reaching the
 //! affiliated basestation mobile stations and brew mobile clients.
 //!
@@ -156,7 +156,7 @@ impl BrewBridge {
 
     /// Answers the SIP caller and sets up a Brew *private* call to `issi`.
     ///
-    /// Signalling: we locate the BlueStation that owns `issi` (its registered
+    /// Signalling: we locate the Basestation that owns `issi` (its registered
     /// subscriber) and record an active call so the panel shows it. Media: we
     /// allocate one relay leg toward the SIP caller; the Brew side of the media
     /// path is where the ACELP<->PCM transcoder attaches.
@@ -169,7 +169,7 @@ impl BrewBridge {
         payloads: &[u8],
         call_id: &str,
     ) {
-        // Is the target ISSI reachable (registered on some BlueStation)?
+        // Is the target ISSI reachable (registered on some Basestation)?
         let target_client = {
             let inner = self.app.inner.read().await;
             inner.subscribers.get(&issi).map(|s| s.client_id)

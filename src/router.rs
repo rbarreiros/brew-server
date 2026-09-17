@@ -127,7 +127,7 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
         inner.group_clients.get(&gt.destination).cloned().unwrap_or_default()
     };
 
-    // BlueStation can be connected and forwarding calls before an AFFILIATE event
+    // Basestation can be connected and forwarding calls before an AFFILIATE event
     // has reached Brew (for example during startup/resync or while debugging MM
     // group-affiliation propagation). In that case a strict affiliation-only core
     // silently produces target_count=0. For small/private networks we support an
@@ -142,7 +142,7 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
             %source,
             gssi = gt.destination,
             connected_clients = inner.clients.len(),
-            "no Brew affiliations recorded for GSSI; falling back to all connected BlueStations"
+            "no Brew affiliations recorded for GSSI; falling back to all connected Basestations"
         );
     }
     targets.remove(&source);
@@ -217,7 +217,7 @@ async fn handle_sds_transfer(state: &Arc<AppState>, source: ClientId, id: uuid::
     // LIP positions are confirmed decoding on the map.
     info!(uuid=%id, source_issi, bytes=%raw.len(), hex=%hex_dump(&raw), "SDS_TRANSFER raw frame");
 
-    // Position extraction from the relayed SDS. FlowStation cannot be modified,
+    // Position extraction from the relayed SDS. Basestation cannot be modified,
     // but it relays the full SDS (including binary LIP payloads) over the Brew
     // channel, so we decode positions here regardless of deliverability.
     if let Some((lat, lon, note)) = extract_sds_position(&raw) {
@@ -400,7 +400,7 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
     let mut inner = state.inner.write().await;
     // The connecting client's advertised mode (Terminal/Basestation), used to
     // tag the subscriber registration so MS-registration counts can exclude
-    // Basestation (BlueStation gateway) registrations, which are not an MS.
+    // Basestation (Basestation gateway) registrations, which are not an MS.
     let source_mode = inner.clients.get(&source).map(|c| c.mode).unwrap_or_default();
     // Set below when this message is a Terminal-mode register/deregister, so
     // it can be logged to the dashboard's registration log once `inner` is
@@ -457,7 +457,7 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
     }
     drop(inner);
     // Log Terminal-mode (actual MS) registration lifecycle events to the same
-    // dashboard registration log FlowStation telemetry registrations use, so
+    // dashboard registration log Basestation telemetry registrations use, so
     // an MS registering directly over the Brew protocol is visible there too.
     if let Some(kind) = ms_reg_event {
         state.telemetry.write().await.record_brew_registration(msg.issi, kind);
@@ -468,7 +468,7 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
 mod position_tests {
     use super::extract_sds_position;
 
-    // Real LIP beacon captured from FlowStation (ISSI 90), Athens.
+    // Real LIP beacon captured from Basestation (ISSI 90), Athens.
     const LIP: [u8; 11] = [0x0a, 0x01, 0x0e, 0x62, 0x39, 0xb0, 0x43, 0x9a, 0xff, 0xe0, 0x20];
 
     fn framed(payload: &[u8]) -> Vec<u8> {

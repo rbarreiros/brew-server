@@ -429,7 +429,7 @@ pub async fn calls_page() -> Html<&'static str> { Html(CALLS_HTML.as_str()) }
 pub async fn sds_page() -> Html<&'static str> { Html(SDS_HTML.as_str()) }
 pub async fn telemetry_sds_page() -> Html<&'static str> { Html(TELEMETRY_SDS_HTML.as_str()) }
 pub async fn registrations_page() -> Html<&'static str> { Html(REGISTRATIONS_HTML.as_str()) }
-pub async fn snapshot(State(state): State<Arc<AppState>>) -> Json<crate::monitor::Snapshot> { let i=state.inner.read().await; let counts=(i.bluestation_count(),i.ms_registration_count(),i.group_clients.len()); drop(i); Json(state.monitor.snapshot(counts.0,counts.1,counts.2).await) }
+pub async fn snapshot(State(state): State<Arc<AppState>>) -> Json<crate::monitor::Snapshot> { let i=state.inner.read().await; let counts=(i.basestation_count(),i.ms_registration_count(),i.group_clients.len()); drop(i); Json(state.monitor.snapshot(counts.0,counts.1,counts.2).await) }
 pub async fn live(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> impl IntoResponse { ws.on_upgrade(move |s| live_socket(state,s)) }
 async fn live_socket(state: Arc<AppState>, mut socket: WebSocket) { let mut rx=state.monitor.subscribe(); while let Ok(ev)=rx.recv().await { if socket.send(Message::Text(serde_json::to_string(&ev).unwrap().into())).await.is_err(){break;} } }
 
@@ -676,16 +676,16 @@ h2 .backlink{text-transform:none;letter-spacing:normal;margin-left:8px}
 
 const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><header><h1>TETRA NETWORK MONITOR</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=ver>v__VERSION__</div></div></header><main class=wrap>
 <div class=banner id=emergency-banner></div>
-<section class=cards><div class=card><div class=muted>BlueStations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Logs</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-FlowStation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a><a class=navlink href="/settings">Settings<span class=sub>Edit &amp; save server configuration</span></a></div></section>
-<section class=panel><h2>FlowStation Telemetry</h2><div class=bts-grid id=telemetry-stations></div></section>
+<section class=cards><div class=card><div class=muted>Basestations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Logs</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-Basestation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a><a class=navlink href="/settings">Settings<span class=sub>Edit &amp; save server configuration</span></a></div></section>
+<section class=panel><h2>Basestation Telemetry</h2><div class=bts-grid id=telemetry-stations></div></section>
 <section class=panel><h2>Registered Subscribers <a class=backlink href="/registrations">(view registration log &rarr;)</a></h2><div class=bts-grid id=registrations></div></section>
-<section class=panel><h2>FlowStation Control</h2><div class=bts-grid id=control-stations></div></section>
+<section class=panel><h2>Basestation Control</h2><div class=bts-grid id=control-stations></div></section>
 </main><script>
 let snap=null;let tsnap=null;const $=id=>document.getElementById(id);const dt=x=>new Date(x).toLocaleTimeString();const dur=(a,b)=>Math.max(0,Math.floor(((b||Date.now())-a)/1000))+'s';const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-function render(s){snap=s;$('bs').textContent=s.connected_bluestations;$('subs').textContent=s.subscribers;$('groups').textContent=s.groups;$('active').textContent=s.active_calls.length;$('calls').textContent=s.total_calls;$('sds').textContent=s.total_sds;
+function render(s){snap=s;$('bs').textContent=s.connected_basestations;$('subs').textContent=s.subscribers;$('groups').textContent=s.groups;$('active').textContent=s.active_calls.length;$('calls').textContent=s.total_calls;$('sds').textContent=s.total_sds;
 // Build an ISSI -> RSSI (dBFS) lookup from the latest telemetry snapshot so each
 // live call can show its mobile station's received signal strength. RSSI is not
-// SNR; it is the real per-MS metric FlowStation reports.
+// SNR; it is the real per-MS metric Basestation reports.
 const rssiByIssi={};(tsnap||[]).forEach(st=>(st.ms_rssi_out||[]).forEach(([issi,dbfs])=>{rssiByIssi[issi]=dbfs;}));
 const rssiCell=issi=>rssiByIssi[issi]!=null?`${rssiByIssi[issi].toFixed(1)} dBFS`:'<span class=muted>&ndash;</span>';
 $('livecalls').innerHTML=s.active_calls.map(c=>`<tr><td><span class=pill>${c.kind}</span></td><td>${c.source}</td><td>${c.destination}</td><td>${c.priority}</td><td>${dur(c.started_at_ms)}</td><td>${c.voice_frames}</td><td>${rssiCell(c.source)}</td><td class=muted>${c.uuid.slice(0,8)}</td></tr>`).join('')||'<tr><td colspan=8 class=muted>No active calls</td></tr>';}
@@ -741,14 +741,14 @@ function renderTelemetry(stations){
       ${calls.length?`<table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Carrier/TS</th><th>Pri</th></tr></thead><tbody>${calls.map(c=>`<tr><td>${c.is_group?'Group':'Private'}</td><td>${c.source_issi}</td><td>${c.gssi_or_called}</td><td>${c.carrier_num}/${c.ts}</td><td>${c.priority}</td></tr>`).join('')}</tbody></table>`:''}
       ${tsGrid(calls)}
     </div>`;
-  }).join(''):'<div class=muted>No FlowStation telemetry connections</div>';
-  // Registered subscribers, grouped by FlowStation. Shows which ISSIs are
+  }).join(''):'<div class=muted>No Basestation telemetry connections</div>';
+  // Registered subscribers, grouped by Basestation. Shows which ISSIs are
   // currently registered on each connected station.
   $('registrations').innerHTML=stations.length?stations.map(s=>{
     const issis=s.registrations_list||[];
     const chips=issis.length?`<div class=reg-list>${issis.map(i=>`<span class=reg-issi>${esc(String(i))}</span>`).join('')}</div>`:'<div class="bts-meta muted" style="margin-top:8px">No subscribers registered</div>';
     return `<div class=bts-card><div style="display:flex;justify-content:space-between;align-items:center"><h3>${esc(s.id)}</h3><span class=reg-count>${issis.length} registered</span></div>${chips}</div>`;
-  }).join(''):'<div class=muted>No FlowStation telemetry connections</div>';
+  }).join(''):'<div class=muted>No Basestation telemetry connections</div>';
 }
 async function refreshTelemetry(){try{renderTelemetry(await(await fetch('/api/telemetry')).json())}catch(e){}}
 function ctlSafeId(id){return 'ctl_'+id.replace(/[^a-zA-Z0-9_-]/g,'_');}
@@ -770,7 +770,7 @@ function ctlCardHtml(id){
 function renderControl(ids){
   const host=$('control-stations');
   const wanted=new Set(ids);
-  if(!ids.length){host.innerHTML='<div class="muted ctl-empty">No FlowStation control connections</div>';return;}
+  if(!ids.length){host.innerHTML='<div class="muted ctl-empty">No Basestation control connections</div>';return;}
   // Clear the "no connections" placeholder before adding the first real card.
   const ph=host.querySelector('.ctl-empty');
   if(ph)ph.remove();
@@ -804,8 +804,8 @@ function ctlDgna(id,s){ctlSend(id,{action:'Dgna',issi:Number($(s+'_dgna_issi').v
 function ctlAddLiveSds(id,s){ctlSend(id,{action:'AddLiveSds',text:$(s+'_sds_text').value,protocol_id:10,source_issi:Number($(s+'_sds_issi').value||0),repeat_count:Number($(s+'_sds_repeat').value||0)},s+'_result');}
 function ctlClearLiveSds(id,s){ctlSend(id,{action:'ClearLiveSds'},s+'_result');}
 function ctlSendSds(id,s){const payload=hexToBytes($(s+'_raw_hex').value);ctlSend(id,{action:'SendSds',source_ssi:Number($(s+'_raw_src').value||0),dest_ssi:Number($(s+'_raw_dest').value||0),dest_is_group:$(s+'_raw_grp').checked,len_bits:Number($(s+'_raw_len').value||payload.length*8),payload},s+'_result');}
-function ctlRestart(id){if(confirm('Restart FlowStation service on '+id+'? This disconnects it.'))ctlSend(id,{action:'RestartService'},null);}
-function ctlShutdown(id){if(confirm('Shutdown FlowStation service on '+id+'? This stops the BTS process.'))ctlSend(id,{action:'ShutdownService'},null);}
+function ctlRestart(id){if(confirm('Restart Basestation service on '+id+'? This disconnects it.'))ctlSend(id,{action:'RestartService'},null);}
+function ctlShutdown(id){if(confirm('Shutdown Basestation service on '+id+'? This stops the BTS process.'))ctlSend(id,{action:'ShutdownService'},null);}
 refresh();refreshTelemetry();refreshControl();setInterval(refresh,2000);setInterval(refreshTelemetry,2000);setInterval(refreshControl,3000);
 // Keep a live WebSocket for push updates, but never reload the page on drop:
 // a reload would wipe anything the operator is typing in the control panel.

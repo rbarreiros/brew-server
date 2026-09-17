@@ -18,12 +18,12 @@ realm = "brew-server"
 session_ttl_seconds = 300
 
 [auth.users]
-# Brew usernames (BlueStation identities) must be numeric, max 7 digits.
+# Brew usernames (Basestation identities) must be numeric, max 7 digits.
 "1000001" = "change-me-bs1"
 "1000002" = "change-me-bs2"
 
-# Optional: FlowStation's outbound Telemetry channel (BTS -> this server).
-# Off by default. See README.md "FlowStation Telemetry" for details.
+# Optional: Basestation's outbound Telemetry channel (BTS -> this server).
+# Off by default. See README.md "Basestation Telemetry" for details.
 [telemetry]
 enabled = true
 listen = "0.0.0.0:9001"
@@ -37,9 +37,9 @@ enabled = true
 cert_path = "/etc/ssl/brew/server.crt"
 key_path = "/etc/ssl/brew/server.key"
 
-# Optional: FlowStation's inbound Control channel (BTS -> this server, commands
+# Optional: Basestation's inbound Control channel (BTS -> this server, commands
 # pushed back down the same connection). Off by default. See README.md
-# "FlowStation Control" for details.
+# "Basestation Control" for details.
 [control]
 enabled = true
 listen = "0.0.0.0:9002"

@@ -3,7 +3,7 @@ name = "brew-server"
 version = "0.8.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Multi-BlueStation TETRA Brew protocol hub"
+description = "Multi-Basestation TETRA Brew protocol hub"
 
 [dependencies]
 anyhow = "1"

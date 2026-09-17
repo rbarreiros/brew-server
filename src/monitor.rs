@@ -12,7 +12,7 @@ pub struct SdsRecord { pub uuid: Uuid, pub source: u32, pub destination: u32, pu
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveEvent { pub event: String, pub at_ms: u64, pub data: serde_json::Value }
 #[derive(Debug, Clone, Serialize)]
-pub struct Snapshot { pub connected_bluestations: usize, pub subscribers: usize, pub groups: usize, pub active_calls: Vec<CallRecord>, pub recent_calls: Vec<CallRecord>, pub recent_sds: Vec<SdsRecord>, pub total_calls: u64, pub total_sds: u64, pub voice_frames: u64 }
+pub struct Snapshot { pub connected_basestations: usize, pub subscribers: usize, pub groups: usize, pub active_calls: Vec<CallRecord>, pub recent_calls: Vec<CallRecord>, pub recent_sds: Vec<SdsRecord>, pub total_calls: u64, pub total_sds: u64, pub voice_frames: u64 }
 
 #[derive(Default)] struct Inner { active: HashMap<Uuid, CallRecord>, calls: VecDeque<CallRecord>, sds: VecDeque<SdsRecord>, total_calls: u64, total_sds: u64, voice_frames: u64 }
 
@@ -69,7 +69,7 @@ impl Monitor {
     pub async fn voice_frame(&self, uuid: Uuid) { let mut i=self.inner.write().await; i.voice_frames+=1; if let Some(r)=i.active.get_mut(&uuid){r.voice_frames+=1;} }
     pub async fn sds(&self, uuid: Uuid, source: u32, destination: u32) { let r=SdsRecord{uuid,source,destination,at_ms:now_ms(),reports:0}; let mut i=self.inner.write().await; i.total_sds+=1; i.sds.push_front(r.clone()); while i.sds.len()>200{i.sds.pop_back();} drop(i); self.persist(&crate::store::StoredRecord::Sds(r.clone())); self.emit("sds",serde_json::json!(r)); }
     pub async fn sds_report(&self, uuid: Uuid) { let mut i=self.inner.write().await; if let Some(r)=i.sds.iter_mut().find(|r|r.uuid==uuid){r.reports+=1;} drop(i); self.persist(&crate::store::StoredRecord::SdsReport { uuid }); }
-    pub async fn snapshot(&self, clients: usize, subscribers: usize, groups: usize) -> Snapshot { let i=self.inner.read().await; Snapshot{connected_bluestations:clients,subscribers,groups,active_calls:i.active.values().cloned().collect(),recent_calls:i.calls.iter().take(50).cloned().collect(),recent_sds:i.sds.iter().take(50).cloned().collect(),total_calls:i.total_calls,total_sds:i.total_sds,voice_frames:i.voice_frames} }
+    pub async fn snapshot(&self, clients: usize, subscribers: usize, groups: usize) -> Snapshot { let i=self.inner.read().await; Snapshot{connected_basestations:clients,subscribers,groups,active_calls:i.active.values().cloned().collect(),recent_calls:i.calls.iter().take(50).cloned().collect(),recent_sds:i.sds.iter().take(50).cloned().collect(),total_calls:i.total_calls,total_sds:i.total_sds,voice_frames:i.voice_frames} }
 }
 
 #[cfg(test)]

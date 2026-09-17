@@ -4,10 +4,10 @@
 //! or Maidenhead grid locators) can be turned into latitude/longitude here.
 //!
 //! IMPORTANT LIMITATION: binary LIP position beacons (SDS protocol id 0x0A) do
-//! **not** reach this server with their payload intact — the FlowStation decodes
+//! **not** reach this server with their payload intact — the Basestation decodes
 //! SDS text best-effort and emits an empty string for binary LIP, so there are
 //! no coordinate bytes to parse. Only textual beacons are recoverable here. See
-//! the README "Position mapping" section for the FlowStation-side fix needed to
+//! the README "Position mapping" section for the Basestation-side fix needed to
 //! plot binary LIP.
 
 /// A decoded geographic position in decimal degrees (WGS-84).
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn lip_short_report_real_sample() {
-        // Live beacon captured from FlowStation (ISSI 90), known to be in Athens.
+        // Live beacon captured from Basestation (ISSI 90), known to be in Athens.
         let bytes = [0x0a, 0x01, 0x0e, 0x62, 0x39, 0xb0, 0x43, 0x9a, 0xff, 0xe0, 0x20];
         let p = decode_lip(&bytes).expect("should decode short location report");
         assert!(approx(p.lat, 37.9920), "lat={}", p.lat);
