@@ -4,6 +4,71 @@ Experimental Rust Brew core for linking two or more MidnightBlue Basestation TET
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 1.0 adds:
+
+- **ACELP<->G.711 media transcoder for SIP<->Brew calls.** SIP legs are
+  steered to G.711 (PCMU/PCMA); Brew traffic frames carry ACELP. A new
+  `transcode` module vendors the ETSI EN 300 395-2 reference TETRA codec
+  (`third_party/tetra-codec/`, compiled via `build.rs`) alongside a pure-Rust
+  G.711 implementation, and a bidirectional pump (`transcode::task`) bridges
+  RTP and Brew traffic frames in both directions, so PSTN/SIP calls to and
+  from a mobile terminal actually carry audio, not just signalling.
+- **Complete Brew<->SIP private-call accept/ring/answer handshake.**
+  Previously the bridge answered SIP `INVITE`s with `200 OK` immediately and
+  never reacted to the ISSI's `SETUP_ACCEPT`/`ALERT`/`CONNECT_REQUEST` —
+  callers got no ringback, and pressing accept on a mobile terminal did
+  nothing. Now: `SETUP_ACCEPT`/`ALERT` -> SIP `180 Ringing`; `CONNECT_REQUEST`
+  (accept pressed) -> `CALL_CONNECT_CONFIRM` back to the ISSI *and* SIP
+  `200 OK` together; `SETUP_REJECT`/`RELEASE` before answer -> SIP `486` and
+  teardown. The reverse direction (Brew->SIP) sends `CALL_SETUP_ACCEPT`
+  immediately and drives `CALL_ALERT`/`CALL_CONNECT_CONFIRM` from Asterisk's
+  own `180`/`200` responses, plus the SIP `ACK` a `200 OK` to our own
+  outbound `INVITE` requires (previously missing — Asterisk would keep
+  retransmitting the `200` and drop the dialog). Fixed along the way:
+  `CALL_CONNECT_CONFIRM` needs a 2-byte grant/permission payload, not an
+  empty one (real clients reject it outright otherwise); and the three
+  pre-built SIP responses (`180`/`200`/`486`) now share one dialog `To`-tag
+  instead of each independently generating its own, which previously caused
+  a `BYE` built from the wrong tag to get `481`'d by the peer.
+- **Route a mobile terminal's PSTN-style dialled number to SIP.** A terminal
+  dialling a non-ISSI number (e.g. "9" + a 10-digit PSTN number) arrives with
+  `destination = 0` and the digits in the Brew `CircularCall`'s ASCII
+  `number` field, not `destination` — previously ignored entirely. That field
+  is now used as the dialled string for `[[sip.routes]]` matching when
+  present, and a new `strip_prefix` route field removes a leading literal
+  (e.g. the outside-line "9") before it reaches an empty-`number` SIP trunk
+  destination.
+- **Dashboard settings editor.** A new `/settings` page can add/update/delete
+  SIP extensions, trunks and voice routes, plus a raw-TOML editor covering
+  every other setting. Saves validate then write atomically to the running
+  process's config file, reusing the existing config-watcher restart-to-apply
+  mechanism — no new hot-reload path needed.
+- **Live connections page.** `/connections` (JSON at `/api/connections`)
+  shows who is connected/registered *right now*: Brew connections (mode,
+  protocol version, remote address, connect time), registered subscribers
+  (both Terminal-mode MS and Basestation-gateway registrations, matching the
+  main dashboard's panel), and SIP registrations/trunks. Distinct from
+  `/registrations`, which is a historical event log.
+- **Max call duration limits.** New `max_call_duration_seconds` (Brew
+  station/private/group calls) and `sip.max_call_duration_seconds` (SIP
+  calls) config settings force-end a call once it has run too long, the same
+  way a normal hangup would (`CALL_RELEASE`/`CALL_GROUP_IDLE` or a SIP `BYE`,
+  not a silent kill). Default 4 hours; `0` disables.
+- **Server version shown on every dashboard page**, under the live-status
+  indicator.
+- Renamed `BlueStation`/`FlowStation` references throughout (code, UI, docs)
+  to a single consistent `Basestation`/`Basestations`, matching the existing
+  `ClientMode::Basestation`. The two WebSocket subprotocol identifiers real
+  hardware negotiates with (`bluestation-control-v1`,
+  `bluestation-telemetry-v2`) are deliberately left unchanged — they're wire
+  compatibility strings, not display text. Also renamed the main dashboard's
+  "Logs" panel to "Menu".
+- **Fixed a misconfigured `sip.advertised_host` producing malformed SDP.** If
+  `advertised_host` is accidentally set to `host:port` instead of a bare
+  host (it's written verbatim into the SDP `c=`/`o=` lines, which never
+  carry a port), the port is now stripped with a warning instead of silently
+  emitting SDP that peers like Asterisk reject.
+
 Version 0.8 adds:
 
 - **Persistent telemetry SDS log.** SDS entries observed on a Basestation
