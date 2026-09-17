@@ -493,6 +493,24 @@ pub fn build_call_connect_confirm(id: &Uuid, grant: u8, permission: u8) -> Vec<u
     out
 }
 
+/// Builds a `CLASS_SUBSCRIBER` message (`SUB_REGISTER`/`SUB_DEREGISTER`/
+/// `SUB_AFFILIATE`/`SUB_DEAFFILIATE`/...). `timestamp`/`fraction` are left
+/// zero: nothing in this server's own parsing or the federation full-sync
+/// that uses this builder reads them, only the LIP/position decoders on the
+/// SDS side care about a wire timestamp, and those never touch this class.
+pub fn build_subscriber_message(msg_type: u8, issi: u32, groups: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(18 + groups.len() * 4);
+    out.push(CLASS_SUBSCRIBER);
+    out.push(msg_type);
+    out.extend_from_slice(&issi.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+    out.extend_from_slice(&0u32.to_le_bytes()); // fraction
+    for g in groups {
+        out.extend_from_slice(&g.to_le_bytes());
+    }
+    out
+}
+
 pub fn raw_peer_pair(payload: &CallPayload) -> Option<(u32, u32)> {
     let CallPayload::Raw(raw) = payload else { return None };
     if raw.len() < 8 { return None; }
@@ -578,6 +596,15 @@ mod tests {
         let wire = build_call_connect_confirm(&id, 1, 2);
         assert_eq!(wire.len(), 20, "18-byte header + 2-byte grant/permission");
         assert_eq!(&wire[18..20], &[1, 2]);
+    }
+
+    #[test]
+    fn build_subscriber_message_round_trips() {
+        let wire = build_subscriber_message(SUB_REGISTER, 4013, &[1001, 1002]);
+        let BrewMessage::Subscriber(msg) = parse(&wire).unwrap() else { panic!() };
+        assert_eq!(msg.msg_type, SUB_REGISTER);
+        assert_eq!(msg.issi, 4013);
+        assert_eq!(msg.groups, vec![1001, 1002]);
     }
 
     #[test]

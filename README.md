@@ -4,6 +4,25 @@ Experimental Rust Brew core for linking two or more MidnightBlue Basestation TET
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 1.1 adds:
+
+- **Server-to-server federation.** Multiple brew-server instances can now be
+  linked (chain or star topology) so calls, SDS and subscriber/group
+  registrations reach a remote site's Basestations and mobile stations. A
+  peer link connects and authenticates exactly like a Basestation does, over
+  the same Brew WebSocket protocol, tagged `X-Brew-Mode: Peer` (new
+  `[[federation.peers]]` config, dialled outbound with reconnect; an inbound
+  link needs no matching config, just Basestation-style auth). Registrations
+  propagate peer to peer automatically — each server relays what it learns to
+  its *other* peers (split-horizon, safe for any loop-free topology) — so
+  private/group call routing and SDS forwarding across servers need no
+  federation-specific routing code at all: they already resolve a
+  destination via the same `inner.subscribers`/`inner.group_clients` tables
+  used for local routing, which now include remote entries. A newly
+  (re)connected peer gets a full snapshot of everything this server currently
+  knows, in both directions, so it isn't blind to registrations that predate
+  the link.
+
 Version 1.0 adds:
 
 - **ACELP<->G.711 media transcoder for SIP<->Brew calls.** SIP legs are
@@ -528,13 +547,65 @@ endpoint, so it applies regardless of which `to` kind is used.
 
 **Media / codecs.** SIP legs are negotiated to G.711 (PCMU/PCMA) and relayed by
 a built-in symmetric-RTP forwarder that latches each peer's real source address
-(NAT-safe). SIP↔SIP trunking works end to end. For **SIP↔TETRA audio**, note
-that TETRA carries ACELP voice inside Brew traffic frames: the signalling bridge
-and the SIP-side RTP relay are fully implemented, and the code marks the exact
-points where an ACELP↔PCM transcoder attaches, but transcoding itself is not
-included in this server. SIP↔TETRA is therefore signalling-complete; end-to-end
-media additionally requires that transcoder (or a Brew-side gateway that already
-delivers a SIP-compatible codec).
+(NAT-safe). SIP↔SIP trunking works end to end. For **SIP↔TETRA audio**, TETRA
+carries ACELP voice inside Brew traffic frames; this server includes an
+ACELP↔G.711 transcoder (vendoring the ETSI EN 300 395-2 reference codec, see
+`third_party/tetra-codec/`) so a SIP↔TETRA call carries real audio in both
+directions, not just signalling.
+
+## Federation (server-to-server)
+
+Multiple brew-server instances can be linked together so calls, SDS and
+subscriber/group registrations reach a remote site's Basestations and mobile
+stations -- e.g. a chain (A-B-C) or a star (a hub with several spokes). A peer
+link connects and authenticates exactly like a Basestation does, over the same
+Brew WebSocket protocol, just tagged `X-Brew-Mode: Peer`. Enable it in
+`[federation]`:
+
+```toml
+[federation]
+enabled = true
+
+[[federation.peers]]
+name = "site-b"
+remote_host = "10.0.0.20:9000"   # the peer's Brew listener, same port a Basestation uses
+path = "/brew"
+username = "9000001"             # only needed if the peer has [auth] enabled
+password = "change-me-federation"
+reconnect_interval_seconds = 15
+enabled = true
+```
+
+Each `[[federation.peers]]` entry is one **outbound** link this server dials
+(with reconnect on failure/drop). The far end needs no matching peer entry to
+*accept* a connection -- an inbound link just authenticates like a Basestation
+would (HTTP Digest if `[auth]` is enabled there) and is recognized as a peer
+from the `X-Brew-Mode: Peer` header, same as any other Brew connection.
+
+**How routing works.** There is no separate federation routing table to
+configure (which ISSI/GSSI lives behind which peer): registrations propagate
+peer to peer automatically. When a subscriber registers or affiliates to a
+group anywhere in the topology, every server relays what it learns to its
+*other* peers (never back out the link it arrived on), so the whole tree
+converges on a shared picture of who is reachable where -- similar in spirit
+to distance-vector routing. A private/group call or SDS to a destination not
+registered locally then routes to whichever peer link that destination was
+learned through, the same way it already routes to any other connected
+client; there is no federation-specific call/SDS handling at all, hop to hop
+it just resolves the destination and forwards. A newly (re)connected peer is
+sent a full snapshot of everything this server currently knows so it isn't
+blind to registrations that predate the link.
+
+**Topology.** This propagation is correct for any loop-free topology -- a
+chain or a star, i.e. any tree of peer links. A topology with a cycle (e.g. a
+full mesh, or two independent paths between the same two servers) is **not**
+safe with the split-horizon relaying implemented here: it can loop
+indefinitely. Stick to a tree.
+
+**Scope.** This covers private/group call routing and SDS forwarding across
+peers. Basestation telemetry (RF/DSP health, per-station registration lists)
+is not relayed across federation links in this version -- each server's
+dashboard only shows telemetry for Basestations connected directly to it.
 
 ## Web monitoring dashboard
 
@@ -559,12 +630,14 @@ enabled = false
 - MS map (linked from the dashboard): `/map` — plots decoded MS positions;
   JSON at `/api/positions`
 - **Live connections** (linked from the dashboard): `/connections` — who is
-  connected/registered *right now*: Brew connections (Basestations and any
-  direct Terminal/mobile clients, with remote address and how long they've
-  been connected), registered mobile stations (Terminal-mode subscribers —
-  actual MS, cross-referenced to the Basestation they're on), and SIP
-  registrations/trunks. JSON at `/api/connections`. This is a live snapshot,
-  distinct from `/registrations` below, which is a historical event log.
+  connected/registered *right now*: Brew connections (Basestations, direct
+  Terminal/mobile clients, and federation peer links, with remote address and
+  how long they've been connected), registered subscribers (every ISSI in
+  `inner.subscribers` — whether registered by a Terminal-mode MS, on its
+  behalf by a Basestation, or reachable through a federation peer — tagged
+  with which of those it came via), and SIP registrations/trunks. JSON at
+  `/api/connections`. This is a live snapshot, distinct from `/registrations`
+  below, which is a historical event log.
 - Log pages (linked from the dashboard): `/calls` (recent calls, 10/page),
   `/sds` (recent SDS, 10/page), `/telemetry-sds` (telemetry SDS log, 5/page),
   `/registrations` (register/deregister/timeout event log)

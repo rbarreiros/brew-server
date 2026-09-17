@@ -1,6 +1,7 @@
 mod config;
 mod control;
 mod dashboard;
+mod federation;
 mod fsnet;
 mod monitor;
 mod position;
@@ -36,6 +37,8 @@ async fn main() -> anyhow::Result<()> {
     if state.config.max_call_duration_seconds > 0 {
         tokio::spawn(router::run_call_duration_sweep(state.clone()));
     }
+
+    tokio::spawn(federation::run(state.clone()));
 
     tokio::try_join!(
         server::run(state.clone()),

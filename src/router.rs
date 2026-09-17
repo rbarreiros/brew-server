@@ -452,6 +452,9 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
     // released (mirrors how position decoding logs via `state.telemetry`
     // outside of the `inner` lock elsewhere in this module).
     let mut ms_reg_event: Option<&'static str> = None;
+    // Captured before the match below (which may consume `msg.groups`), for
+    // the federation relay after it.
+    let relay_groups = msg.groups.clone();
     match msg.msg_type {
         SUB_REGISTER | SUB_REREGISTER => {
             let previous = inner.subscribers.get(&msg.issi).map(|s| (s.client_id, s.groups.clone()));
@@ -500,7 +503,28 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
         }
         _ => debug!(%source, msg_type=msg.msg_type, "unknown subscriber message"),
     }
+    // Federation: relay this registration/affiliation event to every *other*
+    // connected peer (split-horizon -- never echo it back out the peer link
+    // it arrived on). Works for a message that originated locally (source is
+    // a real client) and for one already relayed in from another peer (this
+    // server is then a transit hop, propagating it further out); either way
+    // this is what makes a remote ISSI/GSSI's registration reachable from
+    // this server, and from here on call/SDS routing needs no federation-
+    // specific code at all -- it already resolves via `inner.subscribers`/
+    // `inner.group_clients`, which now includes this entry.
+    let relay_targets: Vec<_> = if matches!(msg.msg_type, SUB_REGISTER | SUB_REREGISTER | SUB_DEREGISTER | SUB_AFFILIATE | SUB_DEAFFILIATE) {
+        inner.clients.iter()
+            .filter(|(cid, c)| c.mode == crate::state::ClientMode::Peer && **cid != source)
+            .map(|(_, c)| c.tx.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     drop(inner);
+    if !relay_targets.is_empty() {
+        let relay = protocol::build_subscriber_message(msg.msg_type, msg.issi, &relay_groups);
+        for tx in relay_targets { let _ = tx.send(relay.clone()); }
+    }
     // Log Terminal-mode (actual MS) registration lifecycle events to the same
     // dashboard registration log Basestation telemetry registrations use, so
     // an MS registering directly over the Brew protocol is visible there too.

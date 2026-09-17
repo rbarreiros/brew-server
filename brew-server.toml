@@ -164,3 +164,27 @@ match_pattern = "7*"
 from = { kind = "sip_extension", user = "1001" }
 to = { kind = "brew_private", issi = 90 }
 enabled = true
+
+# Federation: connects this brew-server to other brew-server instances over
+# the same Brew WebSocket protocol Basestations use (a peer link connects
+# and authenticates exactly like a Basestation, just tagged Peer), so calls,
+# SDS and subscriber/group registrations can reach a remote site's stations.
+# Registrations propagate peer to peer automatically (each server relays
+# what it learns to its *other* peers) -- no per-ISSI/GSSI config needed
+# here, only which servers to link to. Safe for a chain or star (any
+# loop-free topology); a topology with a cycle (full mesh) is not supported.
+[federation]
+enabled = false
+
+# We dial out to this peer; it needs no matching config for us; an inbound
+# connection just authenticates like a Basestation would (with Peer mode).
+[[federation.peers]]
+name = "site-b"
+remote_host = "10.0.0.20:9000"
+path = "/brew"
+# Only needed if the peer has [auth] enabled -- same numeric-username rule
+# as a Basestation's Brew digest identity.
+username = "9000001"
+password = "change-me-federation"
+reconnect_interval_seconds = 15
+enabled = true
