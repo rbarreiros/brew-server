@@ -11,6 +11,7 @@ mod sip;
 mod state;
 mod store;
 mod telemetry;
+mod transcode;
 
 use config::Config;
 use state::AppState;

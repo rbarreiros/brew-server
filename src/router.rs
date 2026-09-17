@@ -318,7 +318,8 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
                 Some(h) => {
                     if let Some(bridge) = h.transport.bridge.read().await.clone() {
                         let origin = crate::sip::routing::CallOrigin::BrewPrivate(source_issi);
-                        bridge.brew_to_sip(origin, &destination.to_string()).await
+                        let link = crate::sip::bridge::BrewCallLink { call_id: id, client: source };
+                        bridge.brew_to_sip(origin, &destination.to_string(), link).await
                     } else { false }
                 }
                 None => false,
@@ -384,6 +385,15 @@ async fn end_call(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: 
     for tx in txs { let _ = tx.send(raw.clone()); }
     state.monitor.call_ended(id).await;
     info!(%source, uuid=%id, kind=?call.kind, "routed call end");
+
+    // If this call was bridged to SIP (Brew subscriber calling out), the Brew
+    // side just ended it first: tell the SIP peer too, instead of leaving its
+    // dialog dangling with a dead RTP stream.
+    if let Some(h) = state.sip.read().await.as_ref() {
+        if let Some(bridge) = h.transport.bridge.read().await.clone() {
+            bridge.teardown_by_brew_call(id).await;
+        }
+    }
 }
 
 async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: SubscriberMessage) {

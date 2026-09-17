@@ -465,6 +465,58 @@ pub fn raw_peer_pair(payload: &CallPayload) -> Option<(u32, u32)> {
     Some((u32le(raw, 0), u32le(raw, 4)))
 }
 
+/// Bit count of one ACELP-coded TETRA speech frame (30ms @ 8kHz), per
+/// ETSI EN 300 395-2. Packed big-endian-bit into `ACELP_CODED_FRAME_BYTES`.
+pub const ACELP_CODED_FRAME_BITS: u16 = 137;
+/// `ceil(ACELP_CODED_FRAME_BITS / 8)`.
+pub const ACELP_CODED_FRAME_BYTES: usize = 18;
+/// PCM samples per ACELP frame (30ms @ 8kHz).
+pub const ACELP_PCM_SAMPLES: usize = 240;
+
+/// Builds a server-originated `CALL_SETUP_REQUEST` toward a registered Brew
+/// subscriber, used to originate a call from the SIP side (there is no Brew
+/// client on that leg to have sent one). `number`/the trailing single-byte
+/// fields are left zeroed: only source/destination/priority are meaningful
+/// for this bridge, and `CircularCall` parsing ignores the rest.
+pub fn build_circular_call_setup(id: &Uuid, source: u32, destination: u32, priority: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + 16 + CIRCULAR_CALL_BASE_LEN);
+    out.push(CLASS_CALL_CONTROL);
+    out.push(CALL_SETUP_REQUEST);
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&source.to_le_bytes());
+    out.extend_from_slice(&destination.to_le_bytes());
+    out.extend_from_slice(&[0u8; 32]); // number[32]: unused for a SIP-originated call
+    out.push(priority);
+    out.extend_from_slice(&[0u8; 10]); // service, mode, duplex, method, communication, grant, permission, timeout, ownership, queued
+    out
+}
+
+/// Builds a server-originated `CALL_GROUP_TX`, used to seize the group floor
+/// on behalf of a SIP caller bridged into a Brew group call.
+pub fn build_group_tx(id: &Uuid, source: u32, destination: u32, priority: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + 16 + GROUP_TX_BASE_LEN);
+    out.push(CLASS_CALL_CONTROL);
+    out.push(CALL_GROUP_TX);
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&source.to_le_bytes());
+    out.extend_from_slice(&destination.to_le_bytes());
+    out.push(priority);
+    out.push(0); // access
+    out.extend_from_slice(&0u16.to_le_bytes()); // service
+    out
+}
+
+/// Builds a `FRAME_TRAFFIC_CHANNEL` carrying one ACELP-coded speech frame.
+pub fn build_traffic_frame(id: &Uuid, coded: &[u8; ACELP_CODED_FRAME_BYTES]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20 + ACELP_CODED_FRAME_BYTES);
+    out.push(CLASS_FRAME);
+    out.push(FRAME_TRAFFIC_CHANNEL);
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&ACELP_CODED_FRAME_BITS.to_le_bytes());
+    out.extend_from_slice(coded);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

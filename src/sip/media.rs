@@ -110,6 +110,24 @@ impl RtpLeg {
     pub async fn set_remote(&self, addr: SocketAddr) {
         *self.remote.write().await = Some(addr);
     }
+
+    /// Receives one datagram, latching the sender as the remote (symmetric-RTP
+    /// NAT traversal), same as `bridge()` does. Used by a transcoder that owns
+    /// this leg directly instead of relaying it verbatim to another leg.
+    pub async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let (n, from) = self.socket.recv_from(buf).await?;
+        *self.remote.write().await = Some(from);
+        Ok(n)
+    }
+
+    /// Sends a datagram to the latched remote, if any (no-op otherwise: we
+    /// have not heard from the peer yet).
+    pub async fn send(&self, data: &[u8]) -> std::io::Result<()> {
+        if let Some(dst) = *self.remote.read().await {
+            self.socket.send_to(data, dst).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Manages RTP port allocation and spawns relay tasks. One instance per server.

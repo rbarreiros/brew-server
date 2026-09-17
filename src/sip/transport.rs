@@ -543,6 +543,9 @@ async fn handle_bye(t: Arc<SipTransport>, peer: SocketAddr, req: SipMessage) {
     if let Some(handle) = t.relay_tasks.lock().await.remove(&call_id) {
         handle.abort();
     }
+    if let Some(bridge) = t.bridge.read().await.clone() {
+        bridge.teardown(&call_id).await;
+    }
     t.state.end_call(&call_id).await;
     let resp = t.base_response(&req, 200, "OK");
     t.send_to(&resp, peer).await;
@@ -553,6 +556,9 @@ async fn handle_cancel(t: Arc<SipTransport>, peer: SocketAddr, req: SipMessage) 
     let call_id = req.call_id().unwrap_or("").to_string();
     if let Some(handle) = t.relay_tasks.lock().await.remove(&call_id) {
         handle.abort();
+    }
+    if let Some(bridge) = t.bridge.read().await.clone() {
+        bridge.teardown(&call_id).await;
     }
     t.state.end_call(&call_id).await;
     let resp = t.base_response(&req, 200, "OK");

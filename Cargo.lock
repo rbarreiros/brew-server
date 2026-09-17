@@ -177,6 +177,7 @@ dependencies = [
  "axum-server",
  "base64",
  "bincode",
+ "cc",
  "futures-util",
  "md5",
  "serde",
