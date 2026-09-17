@@ -460,17 +460,36 @@ pub fn build_call_cause(call_state: u8, id: &Uuid, cause: u8) -> Vec<u8> {
 }
 
 /// Builds a call-control message with no payload: `CALL_SETUP_ACCEPT` and
-/// `CALL_ALERT` parse this way already (`CallPayload::Empty`); `CALL_CONNECT_CONFIRM`
-/// has no payload defined by this server's parser either (falls through to
-/// `CallPayload::Raw` with zero bytes), so an empty body is the correct wire
-/// shape for all three. Used by the SIP<->Brew bridge to drive a private
-/// call's accept/ring/answer handshake from the server side (there is no
-/// Brew client on the SIP leg to have sent one).
+/// `CALL_ALERT` are defined with none (real Brew clients -- see e.g.
+/// FlowStation's `net_brew::protocol::parse_frame` -- special-case these two
+/// as `// No extra payload`). This server's own parser is lenient about
+/// `CALL_CONNECT_CONFIRM`'s shape, but real clients are not (see
+/// `build_call_connect_confirm`) -- do not use this builder for it. Used by
+/// the SIP<->Brew bridge to drive a private call's accept/ring/answer
+/// handshake from the server side (there is no Brew client on the SIP leg to
+/// have sent one).
 pub fn build_call_control_empty(call_state: u8, id: &Uuid) -> Vec<u8> {
     let mut out = Vec::with_capacity(18);
     out.push(CLASS_CALL_CONTROL);
     out.push(call_state);
     out.extend_from_slice(id.as_bytes());
+    out
+}
+
+/// Builds `CALL_CONNECT_CONFIRM`, which -- unlike `CALL_SETUP_ACCEPT`/
+/// `CALL_ALERT` -- is *not* an empty-payload message: it carries a 2-byte
+/// `grant`/`permission` pair (real clients reject anything shorter; see e.g.
+/// FlowStation's `net_brew::protocol::BrewCircularGrant` and its
+/// `CALL_STATE_CONNECT_CONFIRM => if payload_data.len() < 2 { return
+/// Err(TooShort) }`). `0, 0` (no restriction) is the value this bridge sends,
+/// since it has no real grant/permission semantics of its own to convey.
+pub fn build_call_connect_confirm(id: &Uuid, grant: u8, permission: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20);
+    out.push(CLASS_CALL_CONTROL);
+    out.push(CALL_CONNECT_CONFIRM);
+    out.extend_from_slice(id.as_bytes());
+    out.push(grant);
+    out.push(permission);
     out
 }
 
@@ -546,6 +565,19 @@ mod tests {
             assert_eq!(cc.identifier, id);
             assert!(matches!(cc.payload, CallPayload::Empty));
         }
+    }
+
+    /// Real clients (e.g. FlowStation's `net_brew::protocol`) reject
+    /// CALL_CONNECT_CONFIRM outright if it carries fewer than 2 payload
+    /// bytes (grant, permission) -- unlike CALL_SETUP_ACCEPT/CALL_ALERT,
+    /// which are genuinely empty. This pins the wire shape so a future
+    /// change can't quietly regress back to the empty-payload bug.
+    #[test]
+    fn build_call_connect_confirm_carries_grant_and_permission() {
+        let id = Uuid::new_v4();
+        let wire = build_call_connect_confirm(&id, 1, 2);
+        assert_eq!(wire.len(), 20, "18-byte header + 2-byte grant/permission");
+        assert_eq!(&wire[18..20], &[1, 2]);
     }
 
     #[test]

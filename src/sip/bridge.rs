@@ -197,7 +197,7 @@ impl BrewBridge {
             }
             200 => {
                 if let Some(leg) = self.legs.read().await.get(call_id) { leg.connected.store(true, Ordering::Relaxed); }
-                let _ = tx.send(protocol::build_call_control_empty(protocol::CALL_CONNECT_CONFIRM, &brew_call_id));
+                let _ = tx.send(protocol::build_call_connect_confirm(&brew_call_id, 0, 0));
                 self.transport.state.answer_call(call_id).await;
                 if let Some(d) = bye {
                     self.send_ack(call_id, &d, to_header, peer).await;
@@ -636,7 +636,7 @@ fn spawn_private_call_control(
                 }
                 protocol::CALL_CONNECT_REQUEST => {
                     if let Some(tx) = &h.confirm_tx {
-                        let _ = tx.send(protocol::build_call_control_empty(protocol::CALL_CONNECT_CONFIRM, &h.brew_call_id));
+                        let _ = tx.send(protocol::build_call_connect_confirm(&h.brew_call_id, 0, 0));
                     }
                     bridge.transport.send_to(&h.ok, h.caller).await;
                     bridge.transport.state.answer_call(&call_id).await;
