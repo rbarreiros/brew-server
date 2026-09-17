@@ -294,10 +294,10 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
     // Prefer the structured CircularCall payload (parsed per Brew v1). Fall back
     // to the conservative raw source/destination pair for any peer that sends a
     // payload we could not fully structure.
-    let (source_issi, destination, mnemonic) = match &payload {
-        CallPayload::CircularCall(c) => (c.source, c.destination, c.mnemonic.clone()),
+    let (source_issi, destination, number, mnemonic) = match &payload {
+        CallPayload::CircularCall(c) => (c.source, c.destination, c.number.clone(), c.mnemonic.clone()),
         other => match protocol::raw_peer_pair(other) {
-            Some((s, d)) => (s, d, None),
+            Some((s, d)) => (s, d, String::new(), None),
             None => {
                 warn!(%source, uuid=%id, "private SETUP_REQUEST has no routable source/destination pair");
                 return;
@@ -310,8 +310,17 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
         // The destination is not a registered Brew subscriber. Before giving up,
         // offer it to the SIP subsystem: a voice route may bridge this TETRA
         // private call out to a SIP extension or trunk (Brew -> SIP direction).
-        // The dialled number is the destination ISSI rendered as decimal, which
-        // route patterns can match (e.g. "7*" or an exact ISSI string).
+        // The dialled string is the ASCII `number` field when the caller sent
+        // one (a PBX/phone call to a non-ISSI number, e.g. "9" + a 10-digit
+        // PSTN number: destination is 0/unrouted and the actual digits live in
+        // `number`, not `destination` -- see BrewCircularCall), falling back to
+        // the destination ISSI rendered as decimal for ordinary ISSI-to-ISSI
+        // calls that never set `number`. Route patterns can match either shape
+        // (e.g. "9*" for a PSTN prefix, "7*" or an exact ISSI string).
+        let dialled = {
+            let trimmed = number.trim();
+            if trimmed.is_empty() { destination.to_string() } else { trimmed.to_string() }
+        };
         let bridged = {
             let guard = state.sip.read().await;
             match guard.as_ref() {
@@ -319,7 +328,7 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
                     if let Some(bridge) = h.transport.bridge.read().await.clone() {
                         let origin = crate::sip::routing::CallOrigin::BrewPrivate(source_issi);
                         let link = crate::sip::bridge::BrewCallLink { call_id: id, client: source };
-                        bridge.brew_to_sip(origin, &destination.to_string(), link).await
+                        bridge.brew_to_sip(origin, &dialled, link).await
                     } else { false }
                 }
                 None => false,
@@ -327,9 +336,9 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
         };
         if bridged {
             state.monitor.call_started(id, "private", source_issi, destination, 0).await;
-            info!(%source, uuid=%id, source_issi, destination, mnemonic=?mnemonic, "routed private SETUP_REQUEST to SIP");
+            info!(%source, uuid=%id, source_issi, destination, dialled = %dialled, mnemonic=?mnemonic, "routed private SETUP_REQUEST to SIP");
         } else {
-            warn!(%source, uuid=%id, destination, "private call destination not registered (no SIP route)");
+            warn!(%source, uuid=%id, destination, dialled = %dialled, "private call destination not registered (no SIP route)");
         }
         return;
     };

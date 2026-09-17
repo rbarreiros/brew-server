@@ -125,12 +125,18 @@ enabled = true
 #            { kind = "brew_private", issi = 90 },
 #            { kind = "brew_group", gssi = 1001 }.
 # `match_pattern` matches the dialled destination: "*" any, trailing "*" prefix,
-# otherwise exact.
+# otherwise exact. Optional `strip_prefix` removes a leading literal (e.g. an
+# outside-line "9") from the dialled string before it reaches an empty-`number`
+# sip_trunk destination. A mobile terminal dialling a non-ISSI number (e.g.
+# "9" + a 10-digit PSTN number) arrives here too: destination is 0 and the
+# digits are the dialled string, matched the same as a SIP extension's dial.
 
-# Extensions dialling 9 + number go out the Asterisk trunk.
+# Extensions, or a mobile terminal, dialling 9 + number go out the Asterisk
+# trunk; strip_prefix drops the "9" so the trunk dials 10 digits.
 [[sip.routes]]
 name = "outbound-via-asterisk"
 match_pattern = "9*"
+strip_prefix = "9"
 to = { kind = "sip_trunk", trunk = "asterisk" }
 enabled = true
 

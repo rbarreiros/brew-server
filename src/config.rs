@@ -309,6 +309,14 @@ pub struct VoiceRouteConfig {
     pub to: Option<RouteEndpoint>,
     /// Optional restriction: only calls originating from this endpoint match.
     pub from: Option<RouteEndpoint>,
+    /// A literal prefix stripped from the dialled string before it is handed
+    /// to `to` (e.g. `to = { kind = "sip_trunk", trunk = "..." }` with an
+    /// empty `number`, which passes the dialled string through as-is). Useful
+    /// for a PBX-style outside-line prefix: `match_pattern = "9*"` selects
+    /// the route on the leading "9", `strip_prefix = "9"` removes it so the
+    /// trunk dials the bare number. Matching itself always runs against the
+    /// *un-stripped* dialled string. Empty (the default) strips nothing.
+    pub strip_prefix: String,
     pub enabled: bool,
 }
 
@@ -319,6 +327,7 @@ impl Default for VoiceRouteConfig {
             match_pattern: "*".into(),
             to: None,
             from: None,
+            strip_prefix: String::new(),
             enabled: true,
         }
     }
@@ -423,6 +432,7 @@ mod tests {
         cfg.sip.routes.push(VoiceRouteConfig {
             name: "outbound".into(),
             match_pattern: "9*".into(),
+            strip_prefix: "9".into(),
             to: Some(RouteEndpoint::SipTrunk { trunk: "asterisk".into(), number: "".into() }),
             from: Some(RouteEndpoint::BrewPrivate { issi: 42 }),
             enabled: true,

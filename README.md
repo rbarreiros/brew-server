@@ -261,7 +261,9 @@ The following Brew call states are recognized and routed by call UUID:
 - 12 SIMPLEX_GRANTED
 - 13 SIMPLEX_IDLE
 
-`SETUP_REQUEST` establishes the route from the structured `BrewCircularCall` payload (source ISSI, destination ISSI, dialled number, priority, and — on v1 — the talking-party `mnemonic`); for payloads that cannot be fully structured it falls back to the first 8 bytes (`source_issi:u32 LE`, `destination_issi:u32 LE`). The destination must currently be registered on another Basestation. Thereafter control messages and traffic-channel frames may flow in either direction between the two participating cells until `CALL_RELEASE`.
+`SETUP_REQUEST` establishes the route from the structured `BrewCircularCall` payload (source ISSI, destination ISSI, dialled number, priority, and — on v1 — the talking-party `mnemonic`); for payloads that cannot be fully structured it falls back to the first 8 bytes (`source_issi:u32 LE`, `destination_issi:u32 LE`). If the destination ISSI is registered on another Basestation, the call stays on the Brew side; thereafter control messages and traffic-channel frames may flow in either direction between the two participating cells until `CALL_RELEASE`.
+
+If the destination ISSI is *not* a registered subscriber, the call is offered to the SIP subsystem (Brew -> SIP) instead of being rejected outright: `[[sip.routes]]` entries are matched against a dialled string, which is the `BrewCircularCall`'s ASCII `number` field when the caller set one, falling back to the destination ISSI rendered as decimal otherwise. This is how a mobile terminal dialling an outside-line-style number (e.g. "9" + a 10-digit PSTN number) reaches a SIP trunk: the terminal sends `destination = 0` with the dialled digits in `number` (this is how FlowStation encodes a PBX/phone call — see its `cc_bs/procedures/setup.rs`), a route like `match_pattern = "9*"` selects it, and an optional `strip_prefix = "9"` on the route removes the leading digit before it reaches an empty-`number` `sip_trunk` destination, so the trunk dials the bare 10 digits. See `[[sip.routes]]` in Configuration above.
 
 Because current upstream Basestation does not yet expose a complete private-call Brew command path, this feature should be considered server-ready/experimental rather than end-to-end validated.
 
@@ -407,12 +409,20 @@ The subsystem provides:
   evaluated top to bottom; the first enabled route whose `match_pattern` (and
   optional `from` restriction) matches the dialled destination wins.
   `match_pattern` is `*` (any), a trailing-`*` prefix, or an exact string.
+  Matching always runs against the full dialled string; an optional
+  `strip_prefix` then removes a leading literal before the string reaches an
+  empty-`number` `sip_trunk` destination (an outside-line prefix like "9").
+  This also covers a mobile terminal dialling a non-ISSI (PSTN) number: it
+  arrives with `destination = 0` and the digits in the Brew `number` field,
+  which is used as the dialled string for routing in that case.
 
   ```toml
-  # Extensions dial 9 + number to break out via the Asterisk trunk.
+  # Extensions, or a mobile terminal, dial 9 + number to break out via the
+  # Asterisk trunk; strip_prefix drops the "9" so the trunk dials 10 digits.
   [[sip.routes]]
   name = "outbound-via-asterisk"
   match_pattern = "9*"
+  strip_prefix = "9"
   to = { kind = "sip_trunk", trunk = "asterisk" }
   enabled = true
 
@@ -435,8 +445,10 @@ The subsystem provides:
 
 Endpoint kinds for `to`/`from`: `{ kind = "sip_extension", user = "..." }`,
 `{ kind = "sip_trunk", trunk = "...", number = "..." }` (number optional; the
-dialled digits are used when omitted), `{ kind = "brew_private", issi = N }`,
-`{ kind = "brew_group", gssi = N }`.
+dialled digits — after `strip_prefix`, if set — are used when omitted),
+`{ kind = "brew_private", issi = N }`, `{ kind = "brew_group", gssi = N }`.
+`strip_prefix` (default: none) is a route-level field, not part of the
+endpoint, so it applies regardless of which `to` kind is used.
 
 **Dashboard.** Two pages, linked from the main dashboard:
 

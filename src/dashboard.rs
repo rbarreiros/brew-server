@@ -294,12 +294,12 @@ static SIP_CONFIG_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|
 <p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/sip">SIP live panel &rarr;</a></p>
 <div class=banner id=disabled-banner>SIP subsystem is disabled. Set <code>enabled = true</code> under <code>[sip]</code>.</div>
 <section class=panel><h2>General</h2><table><tbody id=general></tbody></table>
-<p class=map-note style="color:#8fa2b8;font-size:12px">This screen is read-only. Provision extensions, trunks and routes by editing the <code>[sip]</code> section of the server's TOML config file; the running process watches the file and restarts to apply changes. Passwords are never shown here.</p>
+<p class=map-note style="color:#8fa2b8;font-size:12px">This screen is read-only. Edit extensions, trunks and routes on the <a class=backlink href="/settings">Settings</a> page, or directly in the server's TOML config file (the running process watches the file and restarts to apply changes). Passwords are never shown here.</p>
 </section>
 <section class=panel><h2>Extensions</h2><table><thead><tr><th>User</th><th>Display name</th><th>ISSI</th><th>Outbound</th><th>Password</th></tr></thead><tbody id=exts></tbody></table></section>
 <section class=panel><h2>Trunks</h2><table><thead><tr><th>Name</th><th>Direction</th><th>Remote host</th><th>Username</th><th>Realm</th><th>Reg interval</th><th>Enabled</th><th>Password</th></tr></thead><tbody id=trunks></tbody></table></section>
-<section class=panel><h2>Voice routes</h2><table><thead><tr><th>#</th><th>Name</th><th>Match</th><th>From</th><th>To</th><th>Enabled</th></tr></thead><tbody id=routes></tbody></table>
-<p class=map-note style="color:#8fa2b8;font-size:12px">Routes are evaluated top to bottom; the first enabled route whose match pattern (and optional <em>from</em> restriction) matches the dialled destination wins. Endpoints: <code>ext:USER</code>, <code>trunk:NAME[/NUMBER]</code>, <code>issi:N</code> (Brew private), <code>group:N</code> (Brew group).</p>
+<section class=panel><h2>Voice routes</h2><table><thead><tr><th>#</th><th>Name</th><th>Match</th><th>Strip prefix</th><th>From</th><th>To</th><th>Enabled</th></tr></thead><tbody id=routes></tbody></table>
+<p class=map-note style="color:#8fa2b8;font-size:12px">Routes are evaluated top to bottom; the first enabled route whose match pattern (and optional <em>from</em> restriction) matches the dialled destination wins. Endpoints: <code>ext:USER</code>, <code>trunk:NAME[/NUMBER]</code>, <code>issi:N</code> (Brew private), <code>group:N</code> (Brew group). <code>strip_prefix</code> removes a leading literal from the dialled string before it reaches an empty-number trunk destination (e.g. a "9" outside-line prefix).</p>
 </section>
 <style>#general td:first-child{{color:#8fa2b8;width:220px}}</style>
 </main><script>
@@ -322,7 +322,7 @@ async function load(){{
     ].map(r=>`<tr><td>${{r[0]}}</td><td>${{r[1]}}</td></tr>`).join('');
     $('exts').innerHTML=d.extensions.map(e=>`<tr><td>${{esc(e.user)}}</td><td>${{esc(e.display_name||'-')}}</td><td>${{e.issi||'-'}}</td><td>${{yn(e.allow_outbound)}}</td><td>${{pw(e.has_password)}}</td></tr>`).join('')||'<tr><td colspan=5 class=muted>No extensions provisioned</td></tr>';
     $('trunks').innerHTML=d.trunks.map(t=>`<tr><td>${{esc(t.name)}}</td><td>${{esc(t.direction)}}</td><td>${{esc(t.remote_host||'-')}}</td><td>${{esc(t.username)}}</td><td class=muted>${{esc(t.realm||'-')}}</td><td>${{esc(t.register_interval_seconds)}}s</td><td>${{yn(t.enabled)}}</td><td>${{pw(t.has_password)}}</td></tr>`).join('')||'<tr><td colspan=8 class=muted>No trunks provisioned</td></tr>';
-    $('routes').innerHTML=d.routes.map((r,i)=>`<tr><td class=muted>${{i+1}}</td><td>${{esc(r.name||'-')}}</td><td><code>${{esc(r.match_pattern)}}</code></td><td>${{esc(r.from||'any')}}</td><td>${{esc(r.to||'-')}}</td><td>${{yn(r.enabled)}}</td></tr>`).join('')||'<tr><td colspan=6 class=muted>No routes configured</td></tr>';
+    $('routes').innerHTML=d.routes.map((r,i)=>`<tr><td class=muted>${{i+1}}</td><td>${{esc(r.name||'-')}}</td><td><code>${{esc(r.match_pattern)}}</code></td><td class=muted>${{r.strip_prefix?esc(r.strip_prefix):'-'}}</td><td>${{esc(r.from||'any')}}</td><td>${{esc(r.to||'-')}}</td><td>${{yn(r.enabled)}}</td></tr>`).join('')||'<tr><td colspan=7 class=muted>No routes configured</td></tr>';
   }}catch(e){{$('status').textContent='Disconnected';}}
 }}
 load();setInterval(load,5000);
@@ -341,9 +341,9 @@ static SETTINGS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
 <div class=ctl-row><input id=tr-name placeholder="name"><select id=tr-dir><option value=outbound>outbound</option><option value=inbound>inbound</option><option value=peer>peer</option></select><input id=tr-host placeholder="remote host:port"><input id=tr-user placeholder="username"><input id=tr-pass placeholder="password"><input id=tr-realm placeholder="realm"><input id=tr-interval placeholder="reg interval s" type=number value=300><label><input id=tr-en type=checkbox checked> enabled</label><button onclick="saveTrunk()">Add / Update</button></div>
 </section>
 
-<section class=panel><h2>Voice routes</h2><table><thead><tr><th>Name</th><th>Match</th><th>From</th><th>To</th><th>Enabled</th><th></th></tr></thead><tbody id=routes></tbody></table>
-<div class=ctl-row><input id=rt-name placeholder="name"><input id=rt-match placeholder="match pattern, e.g. 9*"><input id=rt-from placeholder="from (optional): ext:USER | trunk:NAME | issi:N | group:N"><input id=rt-to placeholder="to: ext:USER | trunk:NAME[/NUMBER] | issi:N | group:N"><label><input id=rt-en type=checkbox checked> enabled</label><button onclick="saveRoute()">Add / Update</button></div>
-<p class=map-note style="color:#8fa2b8;font-size:12px">Endpoint shorthand: <code>ext:USER</code>, <code>trunk:NAME</code> or <code>trunk:NAME/NUMBER</code>, <code>issi:N</code> (Brew private), <code>group:N</code> (Brew group). Updating a route matches by name and keeps its position; a new name appends to the end (reorder via the raw editor below).</p>
+<section class=panel><h2>Voice routes</h2><table><thead><tr><th>Name</th><th>Match</th><th>Strip prefix</th><th>From</th><th>To</th><th>Enabled</th><th></th></tr></thead><tbody id=routes></tbody></table>
+<div class=ctl-row><input id=rt-name placeholder="name"><input id=rt-match placeholder="match pattern, e.g. 9*"><input id=rt-strip placeholder="strip prefix, e.g. 9" style="width:110px"><input id=rt-from placeholder="from (optional): ext:USER | trunk:NAME | issi:N | group:N"><input id=rt-to placeholder="to: ext:USER | trunk:NAME[/NUMBER] | issi:N | group:N"><label><input id=rt-en type=checkbox checked> enabled</label><button onclick="saveRoute()">Add / Update</button></div>
+<p class=map-note style="color:#8fa2b8;font-size:12px">Endpoint shorthand: <code>ext:USER</code>, <code>trunk:NAME</code> or <code>trunk:NAME/NUMBER</code>, <code>issi:N</code> (Brew private), <code>group:N</code> (Brew group). Matching runs against the full dialled string (e.g. a PSTN call from a mobile terminal dialling "9" + 10 digits arrives as dialled string "9XXXXXXXXXX"); <code>strip_prefix</code> removes a leading literal (e.g. "9") only from what's handed to an empty-number <code>trunk:NAME</code> destination, so the trunk dials the bare 10 digits. Updating a route matches by name and keeps its position; a new name appends to the end (reorder via the raw editor below).</p>
 </section>
 
 <section class=panel><h2>Full configuration (raw TOML)</h2>
@@ -384,7 +384,7 @@ async function loadSip(){{
   const d=await(await fetch('/api/config/sip/full')).json();
   $('exts').innerHTML=Object.entries(d.extensions).map(([user,e])=>`<tr><td>${{esc(user)}}</td><td>${{esc(e.display_name||'-')}}</td><td>${{e.issi||'-'}}</td><td class=muted>${{e.password?'•'.repeat(8):'(none)'}}</td><td>${{yn(e.allow_outbound)}}</td><td><button onclick="delExt('${{esc(user)}}')">Delete</button></td></tr>`).join('')||'<tr><td colspan=6 class=muted>No extensions provisioned</td></tr>';
   $('trunks').innerHTML=Object.entries(d.trunks).map(([name,t])=>`<tr><td>${{esc(name)}}</td><td>${{esc(t.direction)}}</td><td>${{esc(t.remote_host||'-')}}</td><td>${{esc(t.username)}}</td><td class=muted>${{t.password?'•'.repeat(8):'(none)'}}</td><td class=muted>${{esc(t.realm||'-')}}</td><td>${{esc(t.register_interval_seconds)}}s</td><td>${{yn(t.enabled)}}</td><td><button onclick="delTrunk('${{esc(name)}}')">Delete</button></td></tr>`).join('')||'<tr><td colspan=9 class=muted>No trunks provisioned</td></tr>';
-  $('routes').innerHTML=d.routes.map(r=>`<tr><td>${{esc(r.name||'-')}}</td><td><code>${{esc(r.match_pattern)}}</code></td><td>${{esc(describe(r.from))||'any'}}</td><td>${{esc(describe(r.to))}}</td><td>${{yn(r.enabled)}}</td><td><button onclick="delRoute('${{esc(r.name)}}')">Delete</button></td></tr>`).join('')||'<tr><td colspan=6 class=muted>No routes configured</td></tr>';
+  $('routes').innerHTML=d.routes.map(r=>`<tr><td>${{esc(r.name||'-')}}</td><td><code>${{esc(r.match_pattern)}}</code></td><td class=muted>${{r.strip_prefix?esc(r.strip_prefix):'-'}}</td><td>${{esc(describe(r.from))||'any'}}</td><td>${{esc(describe(r.to))}}</td><td>${{yn(r.enabled)}}</td><td><button onclick="delRoute('${{esc(r.name)}}')">Delete</button></td></tr>`).join('')||'<tr><td colspan=7 class=muted>No routes configured</td></tr>';
 }}
 async function saveExt(){{
   const user=$('ext-user').value.trim(); if(!user)return;
@@ -408,7 +408,7 @@ async function delTrunk(name){{ await api('DELETE',`/api/config/sip/trunks/${{en
 async function saveRoute(){{
   const name=$('rt-name').value.trim(); if(!name)return;
   await api('POST','/api/config/sip/routes',{{
-    name, match_pattern:$('rt-match').value||'*',
+    name, match_pattern:$('rt-match').value||'*', strip_prefix:$('rt-strip').value.trim(),
     from:endpoint($('rt-from').value.trim()), to:endpoint($('rt-to').value.trim()),
     enabled:$('rt-en').checked,
   }});
@@ -492,6 +492,7 @@ pub async fn sip_config(State(state): State<Arc<AppState>>) -> Json<serde_json::
     let routes: Vec<_> = sip.routes.iter().map(|r| serde_json::json!({
         "name": r.name,
         "match_pattern": r.match_pattern,
+        "strip_prefix": r.strip_prefix,
         "from": r.from.as_ref().map(describe_endpoint),
         "to": r.to.as_ref().map(describe_endpoint),
         "enabled": r.enabled,

@@ -76,7 +76,14 @@ pub fn resolve<'a>(
             if !origin.matches(from) { continue; }
         }
         let Some(to) = &route.to else { continue };
-        return Some((resolve_endpoint(to, dialled), route));
+        // Matching above always runs against the un-stripped dialled string;
+        // only the endpoint we hand off to sees the prefix removed.
+        let stripped = if route.strip_prefix.is_empty() {
+            dialled
+        } else {
+            dialled.strip_prefix(route.strip_prefix.as_str()).unwrap_or(dialled)
+        };
+        return Some((resolve_endpoint(to, stripped), route));
     }
     None
 }
@@ -92,6 +99,7 @@ mod tests {
             match_pattern: pat.into(),
             to: Some(to),
             from,
+            strip_prefix: String::new(),
             enabled: true,
         }
     }
@@ -132,6 +140,38 @@ mod tests {
         // A call from the trunk does.
         let (leg, _) = resolve(&routes, &CallOrigin::SipTrunk("asterisk".into()), "anything").unwrap();
         matches!(leg, LegEndpoint::BrewGroup { gssi: 1001 });
+    }
+
+    #[test]
+    fn strip_prefix_removes_leading_digit_before_reaching_trunk() {
+        let routes = vec![VoiceRouteConfig {
+            strip_prefix: "9".into(),
+            ..route("pstn-outbound", "9*", RouteEndpoint::SipTrunk { trunk: "asterisk".into(), number: String::new() }, None)
+        }];
+        // A mobile terminal dialling "9" + a 10-digit PSTN number arrives as
+        // this exact dialled string (destination=0, digits carried in the
+        // Brew CircularCall's ASCII `number` field, not `destination`).
+        let (leg, r) = resolve(&routes, &CallOrigin::BrewPrivate(1001), "95551234567").unwrap();
+        assert_eq!(r.name, "pstn-outbound");
+        match leg {
+            LegEndpoint::SipTrunk { trunk, number } => {
+                assert_eq!(trunk, "asterisk");
+                assert_eq!(number, "5551234567", "leading 9 must be stripped before reaching the trunk");
+            }
+            _ => panic!("expected trunk leg"),
+        }
+    }
+
+    #[test]
+    fn no_strip_prefix_passes_dialled_string_through_unchanged() {
+        let routes = vec![
+            route("pstn-outbound", "9*", RouteEndpoint::SipTrunk { trunk: "asterisk".into(), number: String::new() }, None),
+        ];
+        let (leg, _) = resolve(&routes, &CallOrigin::BrewPrivate(1001), "95551234567").unwrap();
+        match leg {
+            LegEndpoint::SipTrunk { number, .. } => assert_eq!(number, "95551234567"),
+            _ => panic!("expected trunk leg"),
+        }
     }
 
     #[test]
