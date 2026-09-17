@@ -34,6 +34,18 @@ pub const CALL_SIMPLEX_IDLE: u8 = 13;
 pub const FRAME_TRAFFIC_CHANNEL: u8 = 0;
 pub const FRAME_SDS_TRANSFER: u8 = 1;
 pub const FRAME_SDS_REPORT: u8 = 2;
+/// In-call DTMF: one ASCII digit ('0'-'9', '*', '#', 'A'-'D') per frame,
+/// `length_bits = 8`, 1-byte payload. Not in the original Brew spec this
+/// server was built against, but sent by at least one real client (nexus-bs,
+/// a FlowStation-derived Basestation). The frame header shape is identical
+/// to `FRAME_TRAFFIC_CHANNEL`/`FRAME_SDS_*`, so no new parser is needed --
+/// only routing for this frame type.
+pub const FRAME_DTMF: u8 = 3;
+
+/// `CLASS_SERVICE` type carrying a per-ISSI RSSI report:
+/// `{"issi": N, "rssi_dbfs": F}`. Not in the original Brew spec this server
+/// was built against, but sent by at least one real client (nexus-bs).
+pub const SERVICE_RSSI: u8 = 0x10;
 
 #[derive(Debug, Clone)]
 pub enum BrewMessage {
@@ -569,6 +581,18 @@ pub fn build_traffic_frame(id: &Uuid, coded: &[u8; ACELP_CODED_FRAME_BYTES]) -> 
     out
 }
 
+/// Builds a `FRAME_DTMF` carrying one digit (see `FRAME_DTMF`'s doc comment
+/// for the wire shape this mirrors).
+pub fn build_dtmf_frame(id: &Uuid, digit: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(21);
+    out.push(CLASS_FRAME);
+    out.push(FRAME_DTMF);
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&8u16.to_le_bytes());
+    out.push(digit);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +629,18 @@ mod tests {
         assert_eq!(msg.msg_type, SUB_REGISTER);
         assert_eq!(msg.issi, 4013);
         assert_eq!(msg.groups, vec![1001, 1002]);
+    }
+
+    #[test]
+    fn build_dtmf_frame_round_trips() {
+        let id = Uuid::new_v4();
+        let wire = build_dtmf_frame(&id, b'5');
+        assert_eq!(wire.len(), 21);
+        let BrewMessage::Frame(frame) = parse(&wire).unwrap() else { panic!() };
+        assert_eq!(frame.frame_type, FRAME_DTMF);
+        assert_eq!(frame.identifier, id);
+        assert_eq!(frame.length_bits, 8);
+        assert_eq!(frame.data, vec![b'5']);
     }
 
     #[test]

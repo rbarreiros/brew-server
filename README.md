@@ -22,6 +22,18 @@ Version 1.1 adds:
   (re)connected peer gets a full snapshot of everything this server currently
   knows, in both directions, so it isn't blind to registrations that predate
   the link.
+- **DTMF forwarding.** Some real clients (e.g. nexus-bs, a FlowStation-derived
+  Basestation) send in-call DTMF as a Brew `FRAME_DTMF` frame (one ASCII
+  digit per frame) — outside this server's original protocol coverage, and
+  previously silently dropped. It now routes like a voice frame to every
+  other Brew-side call participant, and for a SIP-bridged call the
+  transcoder converts it to RFC 4733 (formerly 2833) telephone-event RTP
+  instead of dropping it there too.
+- **Per-ISSI RSSI from the main Brew channel.** Some real clients also send
+  `CLASS_SERVICE` type `0x10` (`{"issi":N,"rssi_dbfs":F}`) — previously
+  parsed but unconditionally ignored. It's now stored and exposed at
+  `/api/rssi`, merged into the dashboard's existing "MS RSSI" column
+  alongside the Basestation Telemetry channel's own per-station RSSI.
 
 Version 1.0 adds:
 
