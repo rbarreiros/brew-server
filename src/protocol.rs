@@ -551,7 +551,22 @@ pub fn build_circular_call_setup(id: &Uuid, source: u32, destination: u32, prior
     out.extend_from_slice(&destination.to_le_bytes());
     out.extend_from_slice(&[0u8; 32]); // number[32]: unused for a SIP-originated call
     out.push(priority);
-    out.extend_from_slice(&[0u8; 10]); // service, mode, duplex, method, communication, grant, permission, timeout, ownership, queued
+    // service, mode, duplex, method, communication, grant, permission,
+    // timeout, ownership, queued. `mode`=0 (TchS speech) and
+    // `communication`=0 (P2p individual call, the only variant TETRA CMCE
+    // defines for this -- there is no separate "phone"/"PABX" type) are
+    // correctly zero. `duplex`=0 and `method`=0 are NOT: on real hardware
+    // (confirmed against FlowStation's cc_bs, isi.rs's
+    // fsm_on_network_circuit_setup_request) `duplex=0` presents the call as
+    // simplex with a PTT-style TransmissionGrant, and `method=0` selects
+    // non-hook signalling -- together that's why a SIP-bridged inbound call
+    // could only be picked up by pressing PTT, never the actual accept/green
+    // button, and audio never flowed as a normal duplex phone call once
+    // "answered" that way. `duplex=1` (duplex) and `method=1` (hook
+    // signalling, i.e. this is a phone-style call the user must explicitly
+    // answer) make the terminal present and handle it as a real duplex phone
+    // call instead.
+    out.extend_from_slice(&[0, 0, 1, 1, 0, 0, 0, 0, 0, 0]);
     out
 }
 
@@ -641,6 +656,31 @@ mod tests {
         assert_eq!(frame.identifier, id);
         assert_eq!(frame.length_bits, 8);
         assert_eq!(frame.data, vec![b'5']);
+    }
+
+    /// Pins the fix for a real-world bug: an inbound SIP-bridged call could
+    /// only be picked up via PTT, never the terminal's actual accept/green
+    /// button, and had no working duplex audio once "answered" that way.
+    /// Root cause (confirmed against FlowStation's cc_bs): `duplex=0`
+    /// presents the call as simplex with a PTT-style TransmissionGrant, and
+    /// `method=0` selects non-hook signalling. Both must be 1.
+    #[test]
+    fn build_circular_call_setup_sends_duplex_and_hook_signalling() {
+        let id = Uuid::new_v4();
+        let wire = build_circular_call_setup(&id, 1001, 4013, 0);
+        // Trailer starts right after header(18) + source(4) + destination(4)
+        // + number[32] + priority(1).
+        let trailer = 18 + 4 + 4 + 32 + 1;
+        assert_eq!(wire[trailer], 0, "service");
+        assert_eq!(wire[trailer + 1], 0, "mode (TchS speech)");
+        assert_eq!(wire[trailer + 2], 1, "duplex must be 1 (duplex, not simplex/PTT)");
+        assert_eq!(wire[trailer + 3], 1, "method must be 1 (hook signalling: requires explicit answer)");
+        assert_eq!(wire[trailer + 4], 0, "communication (P2p, the only individual-call variant TETRA defines)");
+
+        let BrewMessage::CallControl(cc) = parse(&wire).unwrap() else { panic!() };
+        let CallPayload::CircularCall(c) = cc.payload else { panic!() };
+        assert_eq!(c.source, 1001);
+        assert_eq!(c.destination, 4013);
     }
 
     #[test]
