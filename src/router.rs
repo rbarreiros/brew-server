@@ -355,7 +355,7 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
                 Some(h) => {
                     if let Some(bridge) = h.transport.bridge.read().await.clone() {
                         let origin = crate::sip::routing::CallOrigin::BrewPrivate(source_issi);
-                        let link = crate::sip::bridge::BrewCallLink { call_id: id, client: source };
+                        let link = crate::sip::bridge::BrewCallLink { call_id: id, client: source, source_issi };
                         bridge.brew_to_sip(origin, &dialled, link).await
                     } else { false }
                 }

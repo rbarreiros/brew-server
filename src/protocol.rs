@@ -543,29 +543,42 @@ pub const ACELP_PCM_SAMPLES: usize = 240;
 /// fields are left zeroed: only source/destination/priority are meaningful
 /// for this bridge, and `CircularCall` parsing ignores the rest.
 pub fn build_circular_call_setup(id: &Uuid, source: u32, destination: u32, priority: u8) -> Vec<u8> {
+    build_circular_call(CALL_SETUP_REQUEST, id, source, destination, priority)
+}
+
+/// Builds a server-originated `CALL_CONNECT_REQUEST`: what this bridge sends
+/// to the originating ISSI of a Brew-originated (MS-calling-out) call once
+/// the SIP/PSTN side answers (see `sip::bridge::on_sip_response`'s `200`
+/// case). This is *not* `CALL_CONNECT_CONFIRM` -- confirmed against
+/// FlowStation's cc_bs: `CALL_CONNECT_CONFIRM` is explicitly ignored for a
+/// call where the MS is the calling party
+/// (`fsm_on_network_circuit_connect_confirm` checks `calling_over_brew` and
+/// returns early otherwise); `CALL_CONNECT_REQUEST` is what
+/// `fsm_on_network_circuit_connect_request` expects for exactly this
+/// direction, and is what actually builds and sends the over-the-air
+/// D-CONNECT that flips the MS's UI out of "calling...".
+pub fn build_circular_connect_request(id: &Uuid, source: u32, destination: u32, priority: u8) -> Vec<u8> {
+    build_circular_call(CALL_CONNECT_REQUEST, id, source, destination, priority)
+}
+
+/// Shared builder for the two server-originated `CircularCall`-payload
+/// messages above. `duplex`=1 and `method`=1 (full duplex, hook signalling)
+/// on both: real hardware (confirmed against FlowStation's cc_bs) presents
+/// `duplex=0`/`method=0` as a simplex PTT-style call with no real accept
+/// gesture or working duplex audio, not a normal phone call. `mode`=0 (TchS
+/// speech) and `communication`=0 (P2p -- the only individual-call variant
+/// TETRA CMCE defines; there is no separate "phone"/"PABX" type) are
+/// correctly zero.
+fn build_circular_call(call_state: u8, id: &Uuid, source: u32, destination: u32, priority: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + 16 + CIRCULAR_CALL_BASE_LEN);
     out.push(CLASS_CALL_CONTROL);
-    out.push(CALL_SETUP_REQUEST);
+    out.push(call_state);
     out.extend_from_slice(id.as_bytes());
     out.extend_from_slice(&source.to_le_bytes());
     out.extend_from_slice(&destination.to_le_bytes());
     out.extend_from_slice(&[0u8; 32]); // number[32]: unused for a SIP-originated call
     out.push(priority);
-    // service, mode, duplex, method, communication, grant, permission,
-    // timeout, ownership, queued. `mode`=0 (TchS speech) and
-    // `communication`=0 (P2p individual call, the only variant TETRA CMCE
-    // defines for this -- there is no separate "phone"/"PABX" type) are
-    // correctly zero. `duplex`=0 and `method`=0 are NOT: on real hardware
-    // (confirmed against FlowStation's cc_bs, isi.rs's
-    // fsm_on_network_circuit_setup_request) `duplex=0` presents the call as
-    // simplex with a PTT-style TransmissionGrant, and `method=0` selects
-    // non-hook signalling -- together that's why a SIP-bridged inbound call
-    // could only be picked up by pressing PTT, never the actual accept/green
-    // button, and audio never flowed as a normal duplex phone call once
-    // "answered" that way. `duplex=1` (duplex) and `method=1` (hook
-    // signalling, i.e. this is a phone-style call the user must explicitly
-    // answer) make the terminal present and handle it as a real duplex phone
-    // call instead.
+    // service, mode, duplex, method, communication, grant, permission, timeout, ownership, queued
     out.extend_from_slice(&[0, 0, 1, 1, 0, 0, 0, 0, 0, 0]);
     out
 }
@@ -681,6 +694,26 @@ mod tests {
         let CallPayload::CircularCall(c) = cc.payload else { panic!() };
         assert_eq!(c.source, 1001);
         assert_eq!(c.destination, 4013);
+    }
+
+    /// Pins the fix for a real-world bug: an MS-originated call bridged out
+    /// to SIP stayed stuck in "calling..." even after the PSTN side answered.
+    /// Root cause (confirmed against FlowStation's cc_bs): CALL_CONNECT_CONFIRM
+    /// is explicitly ignored for a call where the MS is the calling party;
+    /// CALL_CONNECT_REQUEST is what actually drives the MS's D-CONNECT.
+    #[test]
+    fn build_circular_connect_request_has_correct_call_state_and_duplex() {
+        let id = Uuid::new_v4();
+        let wire = build_circular_connect_request(&id, 0, 4013, 0);
+        assert_eq!(wire[1], CALL_CONNECT_REQUEST, "must be CONNECT_REQUEST, not CONNECT_CONFIRM");
+        let trailer = 18 + 4 + 4 + 32 + 1;
+        assert_eq!(wire[trailer + 2], 1, "duplex must be 1");
+        assert_eq!(wire[trailer + 3], 1, "method must be 1 (hook signalling)");
+
+        let BrewMessage::CallControl(cc) = parse(&wire).unwrap() else { panic!() };
+        assert_eq!(cc.call_state, CALL_CONNECT_REQUEST);
+        let CallPayload::CircularCall(c) = cc.payload else { panic!() };
+        assert_eq!(c.destination, 4013, "destination is the ISSI being told the call connected");
     }
 
     #[test]

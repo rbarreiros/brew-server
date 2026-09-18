@@ -36,6 +36,10 @@ use tracing::{info, warn};
 pub struct BrewCallLink {
     pub call_id: uuid::Uuid,
     pub client: ClientId,
+    /// The originating ISSI, used as the SIP From/Contact user part (`sip:
+    /// <issi>@host`) instead of a generic literal, so the far end sees a
+    /// real caller identity to route/display/dial back to.
+    pub source_issi: u32,
 }
 
 /// Enough of a SIP dialog to send a best-effort in-dialog BYE toward the
@@ -69,10 +73,14 @@ struct BridgedLeg {
     /// `None` for a SIP-originated leg, where that signalling instead flows
     /// through the private-call-control task spawned by `sip_to_brew_private`.
     subscriber: Option<ClientId>,
+    /// `subscriber`'s ISSI, needed as the `destination` field of the
+    /// `CALL_CONNECT_REQUEST` `on_sip_response` sends it on answer. Only
+    /// meaningful alongside `subscriber` (`Some` for the same leg kind).
+    subscriber_issi: u32,
     /// Whether CALL_ALERT has already been sent to `subscriber`, so a
     /// retransmitted SIP 180 doesn't re-trigger it.
     rang: AtomicBool,
-    /// Whether CALL_CONNECT_CONFIRM/ACK has already been sent/processed, so a
+    /// Whether CALL_CONNECT_REQUEST/ACK has already been sent/processed, so a
     /// retransmitted SIP 200 doesn't re-trigger it.
     connected: AtomicBool,
 }
@@ -186,11 +194,11 @@ impl BrewBridge {
     /// Brew side and cleans up. No-op for a call this bridge did not place as
     /// a Brew-originated leg (`subscriber` unset), e.g. a plain SIP-SIP relay.
     pub async fn on_sip_response(&self, call_id: &str, code: u16, to_header: Option<&str>, peer: SocketAddr) {
-        let (subscriber, brew_call_id, already_rang, already_connected, bye) = {
+        let (subscriber, subscriber_issi, brew_call_id, already_rang, already_connected, bye) = {
             let legs = self.legs.read().await;
             let Some(leg) = legs.get(call_id) else { return };
             let Some(subscriber) = leg.subscriber else { return };
-            (subscriber, leg.brew_call_id, leg.rang.load(Ordering::Relaxed), leg.connected.load(Ordering::Relaxed), leg.bye.clone())
+            (subscriber, leg.subscriber_issi, leg.brew_call_id, leg.rang.load(Ordering::Relaxed), leg.connected.load(Ordering::Relaxed), leg.bye.clone())
         };
         if already_connected { return; }
         let tx = {
@@ -209,12 +217,19 @@ impl BrewBridge {
             }
             200 => {
                 if let Some(leg) = self.legs.read().await.get(call_id) { leg.connected.store(true, Ordering::Relaxed); }
-                let _ = tx.send(protocol::build_call_connect_confirm(&brew_call_id, 0, 0));
+                // CALL_CONNECT_CONFIRM here would go silently ignored: real
+                // hardware (confirmed against FlowStation's cc_bs) only
+                // honours it for a call where Brew/PSTN is the *calling*
+                // party (calling_over_brew), i.e. an inbound SIP->Brew call.
+                // For this direction -- the MS itself originated the call --
+                // the message that actually drives the MS's own D-CONNECT
+                // and flips its UI out of "calling..." is CALL_CONNECT_REQUEST.
+                let _ = tx.send(protocol::build_circular_connect_request(&brew_call_id, 0, subscriber_issi, 0));
                 self.transport.state.answer_call(call_id).await;
                 if let Some(d) = bye {
                     self.send_ack(call_id, &d, to_header, peer).await;
                 }
-                info!(%call_id, "SIP peer answered (CALL_CONNECT_CONFIRM sent to ISSI)");
+                info!(%call_id, "SIP peer answered (CALL_CONNECT_REQUEST sent to ISSI)");
             }
             code if code >= 400 => {
                 if let Some(leg) = self.legs.read().await.get(call_id) { leg.connected.store(true, Ordering::Relaxed); }
@@ -365,7 +380,7 @@ impl BrewBridge {
         );
         self.legs.write().await.insert(call_id.to_string(), BridgedLeg {
             virtual_client, brew_call_id, group: None, task, bye,
-            subscriber: None, rang: AtomicBool::new(false), connected: AtomicBool::new(false),
+            subscriber: None, subscriber_issi: 0, rang: AtomicBool::new(false), connected: AtomicBool::new(false),
         });
 
         // Same instance as `self` (this is how `sip_to_brew_private` is
@@ -471,7 +486,7 @@ impl BrewBridge {
         let task = crate::transcode::task::spawn(leg, payload_type, brew_call_id, virtual_rx, target_txs, control_tx);
         self.legs.write().await.insert(call_id.to_string(), BridgedLeg {
             virtual_client, brew_call_id, group: Some(gssi), task, bye,
-            subscriber: None, rang: AtomicBool::new(false), connected: AtomicBool::new(false),
+            subscriber: None, subscriber_issi: 0, rang: AtomicBool::new(false), connected: AtomicBool::new(false),
         });
 
         self.transport.send_to(&ok, caller).await;
@@ -577,7 +592,14 @@ impl BrewBridge {
         }
 
         use crate::sip::message::Method;
-        let from_header = format!("<sip:brew@{}>;tag={}", self.transport.advertised_host, uuid::Uuid::new_v4().simple());
+        // Identify the call as the originating ISSI, not a generic "brew"
+        // literal, so the far end (Asterisk/PSTN) sees a real caller identity
+        // to display, route on, or dial back to. Falls back to "brew" only
+        // for the degenerate case of an unknown/zero ISSI (shouldn't happen
+        // for a real private call, since router::handle_private_setup always
+        // has a source_issi by the time it builds a BrewCallLink).
+        let caller_id = if link.source_issi != 0 { link.source_issi.to_string() } else { "brew".to_string() };
+        let from_header = format!("<sip:{caller_id}@{}>;tag={}", self.transport.advertised_host, uuid::Uuid::new_v4().simple());
         let to_header = format!("<{}>", extract_uri(&target_uri));
         let mut invite = SipMessage::new_request(Method::Invite, target_uri.clone());
         invite.push_header("Via", format!("SIP/2.0/UDP {};branch=z9hG4bK{}",
@@ -587,7 +609,7 @@ impl BrewBridge {
         invite.push_header("To", to_header.clone());
         invite.push_header("Call-ID", call_id.to_string());
         invite.push_header("CSeq", "1 INVITE");
-        invite.push_header("Contact", format!("<sip:brew@{}>", self.transport.advertised_host));
+        invite.push_header("Contact", format!("<sip:{caller_id}@{}>", self.transport.advertised_host));
         invite.push_header("Content-Type", "application/sdp");
         let offered_payloads = [0u8, 8, 101];
         invite.body = Sdp::build(&self.transport.advertised_host, leg.local_port, &offered_payloads);
@@ -617,7 +639,7 @@ impl BrewBridge {
         );
         self.legs.write().await.insert(call_id.to_string(), BridgedLeg {
             virtual_client, brew_call_id: link.call_id, group: None, task, bye,
-            subscriber: Some(link.client), rang: AtomicBool::new(false), connected: AtomicBool::new(false),
+            subscriber: Some(link.client), subscriber_issi: link.source_issi, rang: AtomicBool::new(false), connected: AtomicBool::new(false),
         });
 
         self.transport.send_to(&invite, target_addr).await;
