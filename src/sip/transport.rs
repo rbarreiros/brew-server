@@ -645,7 +645,7 @@ async fn handle_response(t: Arc<SipTransport>, peer: SocketAddr, resp: SipMessag
             let call_id = call_id.to_string();
             let to_header = resp.header("to").map(|s| s.to_string());
             if let Some(bridge) = t.bridge.read().await.clone() {
-                bridge.on_sip_response(&call_id, code, to_header.as_deref(), peer).await;
+                bridge.on_sip_response(&call_id, code, to_header.as_deref(), peer, &resp.body).await;
             }
         }
     }
