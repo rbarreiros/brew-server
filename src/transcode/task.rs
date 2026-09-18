@@ -56,7 +56,32 @@ pub fn spawn(
                 r = leg.recv(&mut rtp_buf) => {
                     let Ok(n) = r else { break };
                     if n <= 12 { continue; } // header-only/garbage datagram
-                    for &b in &rtp_buf[12..n] {
+                    // RTP header is 12 bytes plus an optional CSRC list (RFC 3550
+                    // 5.1) and an optional extension (X bit); skip both so we
+                    // don't decode header bytes as if they were G.711 payload.
+                    let cc = (rtp_buf[0] & 0x0f) as usize;
+                    let has_ext = rtp_buf[0] & 0x10 != 0;
+                    let pt = rtp_buf[1] & 0x7f;
+                    let mut offset = 12 + cc * 4;
+                    if has_ext {
+                        if offset + 4 > n {
+                            continue;
+                        }
+                        let ext_words = u16::from_be_bytes([rtp_buf[offset + 2], rtp_buf[offset + 3]]) as usize;
+                        offset += 4 + ext_words * 4;
+                    }
+                    if offset > n {
+                        continue;
+                    }
+                    // Only decode packets at the negotiated audio payload type.
+                    // Anything else sharing this port (comfort noise, RFC 2833
+                    // DTMF events, ...) is not G.711 and must not be fed to the
+                    // decoder, or it corrupts the PCM stream with garbage
+                    // samples -- heard on the ISSI side as garbled audio.
+                    if pt != payload_type {
+                        continue;
+                    }
+                    for &b in &rtp_buf[offset..n] {
                         pcm_from_sip.push_back(decode_sample(payload_type, b));
                     }
                     while pcm_from_sip.len() >= ACELP_PCM_SAMPLES {
