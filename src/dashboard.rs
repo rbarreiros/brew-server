@@ -40,6 +40,7 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/api/status", get(snapshot))
         .route("/api/live", get(live))
         .route("/api/telemetry", get(telemetry_snapshot))
+        .route("/api/rssi", get(brew_rssi_snapshot))
         .route("/api/registrations", get(registration_log))
         .route("/api/connections", get(connections_snapshot))
         .route("/api/positions", get(positions_snapshot))
@@ -478,6 +479,16 @@ pub async fn telemetry_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<
     Json(state.telemetry.read().await.snapshot())
 }
 
+/// Per-ISSI RSSI reported directly on the main Brew channel (`SERVICE_RSSI`),
+/// as `[issi, rssi_dbfs]` pairs -- separate from the per-Basestation
+/// `ms_rssi_out` in `/api/telemetry`, which comes from the Basestation
+/// Telemetry WebSocket instead. The dashboard merges both into one "MS RSSI"
+/// column.
+pub async fn brew_rssi_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<(u32, f32)>> {
+    let t = state.telemetry.read().await;
+    Json(t.brew_ms_rssi.iter().map(|(issi, dbfs)| (*issi, *dbfs)).collect())
+}
+
 pub async fn registration_log(State(state): State<Arc<AppState>>) -> Json<Vec<crate::telemetry::RegLogRow>> {
     Json(state.telemetry.read().await.registration_log())
 }
@@ -774,12 +785,13 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=
 <section class=panel><h2>Registered Subscribers <a class=backlink href="/registrations">(view registration log &rarr;)</a></h2><div class=bts-grid id=registrations></div></section>
 <section class=panel><h2>Basestation Control</h2><div class=bts-grid id=control-stations></div></section>
 </main><script>
-let snap=null;let tsnap=null;const $=id=>document.getElementById(id);const dt=x=>new Date(x).toLocaleTimeString();const dur=(a,b)=>Math.max(0,Math.floor(((b||Date.now())-a)/1000))+'s';const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+let snap=null;let tsnap=null;let brssi={};const $=id=>document.getElementById(id);const dt=x=>new Date(x).toLocaleTimeString();const dur=(a,b)=>Math.max(0,Math.floor(((b||Date.now())-a)/1000))+'s';const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 function render(s){snap=s;$('bs').textContent=s.connected_basestations;$('subs').textContent=s.subscribers;$('groups').textContent=s.groups;$('active').textContent=s.active_calls.length;$('calls').textContent=s.total_calls;$('sds').textContent=s.total_sds;
 // Build an ISSI -> RSSI (dBFS) lookup from the latest telemetry snapshot so each
 // live call can show its mobile station's received signal strength. RSSI is not
 // SNR; it is the real per-MS metric Basestation reports.
 const rssiByIssi={};(tsnap||[]).forEach(st=>(st.ms_rssi_out||[]).forEach(([issi,dbfs])=>{rssiByIssi[issi]=dbfs;}));
+Object.assign(rssiByIssi,brssi); // per-ISSI RSSI reported directly on the main Brew channel (SERVICE_RSSI)
 const rssiCell=issi=>rssiByIssi[issi]!=null?`${rssiByIssi[issi].toFixed(1)} dBFS`:'<span class=muted>&ndash;</span>';
 $('livecalls').innerHTML=s.active_calls.map(c=>`<tr><td><span class=pill>${c.kind}</span></td><td>${c.source}</td><td>${c.destination}</td><td>${c.priority}</td><td>${dur(c.started_at_ms)}</td><td>${c.voice_frames}</td><td>${rssiCell(c.source)}</td><td class=muted>${c.uuid.slice(0,8)}</td></tr>`).join('')||'<tr><td colspan=8 class=muted>No active calls</td></tr>';}
 async function refresh(){try{render(await(await fetch('/api/status')).json())}catch(e){$('status').textContent='Disconnected'}}
@@ -844,6 +856,7 @@ function renderTelemetry(stations){
   }).join(''):'<div class=muted>No Basestation telemetry connections</div>';
 }
 async function refreshTelemetry(){try{renderTelemetry(await(await fetch('/api/telemetry')).json())}catch(e){}}
+async function refreshBrewRssi(){try{const pairs=await(await fetch('/api/rssi')).json();brssi={};pairs.forEach(([issi,dbfs])=>{brssi[issi]=dbfs;});if(snap)render(snap);}catch(e){}}
 function ctlSafeId(id){return 'ctl_'+id.replace(/[^a-zA-Z0-9_-]/g,'_');}
 function jsq(s){return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'");}
 function ctlCardHtml(id){
@@ -899,7 +912,7 @@ function ctlClearLiveSds(id,s){ctlSend(id,{action:'ClearLiveSds'},s+'_result');}
 function ctlSendSds(id,s){const payload=hexToBytes($(s+'_raw_hex').value);ctlSend(id,{action:'SendSds',source_ssi:Number($(s+'_raw_src').value||0),dest_ssi:Number($(s+'_raw_dest').value||0),dest_is_group:$(s+'_raw_grp').checked,len_bits:Number($(s+'_raw_len').value||payload.length*8),payload},s+'_result');}
 function ctlRestart(id){if(confirm('Restart Basestation service on '+id+'? This disconnects it.'))ctlSend(id,{action:'RestartService'},null);}
 function ctlShutdown(id){if(confirm('Shutdown Basestation service on '+id+'? This stops the BTS process.'))ctlSend(id,{action:'ShutdownService'},null);}
-refresh();refreshTelemetry();refreshControl();setInterval(refresh,2000);setInterval(refreshTelemetry,2000);setInterval(refreshControl,3000);
+refresh();refreshTelemetry();refreshControl();refreshBrewRssi();setInterval(refresh,2000);setInterval(refreshTelemetry,2000);setInterval(refreshControl,3000);setInterval(refreshBrewRssi,5000);
 // Keep a live WebSocket for push updates, but never reload the page on drop:
 // a reload would wipe anything the operator is typing in the control panel.
 // Instead we reconnect in the background and fall back to the polling above.

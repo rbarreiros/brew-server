@@ -9,7 +9,15 @@ use crate::{
     state::{ActiveCall, AppState, CallKind, ClientId, SdsRoute, Subscriber},
 };
 use std::{collections::{HashMap, HashSet}, sync::Arc, time::Instant};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// Wire shape of a `SERVICE_RSSI` message's JSON payload.
+#[derive(serde::Deserialize)]
+struct RssiReport {
+    issi: u32,
+    rssi_dbfs: f32,
+}
 
 pub async fn handle_packet(state: Arc<AppState>, source: ClientId, raw: Vec<u8>) {
     state.purge_ephemeral().await;
@@ -78,6 +86,25 @@ pub async fn handle_packet(state: Arc<AppState>, source: ClientId, raw: Vec<u8>)
         }
         BrewMessage::Frame(frame) if frame.frame_type == FRAME_TRAFFIC_CHANNEL => {
             route_call_frame(&state, source, frame.identifier, raw).await;
+        }
+        BrewMessage::Frame(frame) if frame.frame_type == protocol::FRAME_DTMF => {
+            // Same header shape and same participant routing as a voice
+            // frame (see route_call_frame); not in this server's original
+            // protocol coverage, but sent by at least one real client
+            // (nexus-bs). Forwarding it exactly like a traffic frame reaches
+            // every other Brew-side participant, and reaches the SIP bridge's
+            // virtual client the same way audio does, where the transcoder
+            // turns it into an RFC 2833 telephone-event RTP packet (see
+            // transcode::task) instead of silently dropping it.
+            route_dtmf_frame(&state, source, frame.identifier, raw).await;
+        }
+        BrewMessage::Service(svc) if svc.service_type == protocol::SERVICE_RSSI => {
+            match serde_json::from_str::<RssiReport>(&svc.json_data) {
+                Ok(r) => {
+                    state.telemetry.write().await.record_brew_rssi(r.issi, r.rssi_dbfs);
+                }
+                Err(e) => warn!(%source, error = %e, json = %svc.json_data, "malformed RSSI service message"),
+            }
         }
         BrewMessage::Service(svc) => {
             debug!(%source, service_type = svc.service_type, json = %svc.json_data, "service message ignored");
@@ -328,7 +355,7 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
                 Some(h) => {
                     if let Some(bridge) = h.transport.bridge.read().await.clone() {
                         let origin = crate::sip::routing::CallOrigin::BrewPrivate(source_issi);
-                        let link = crate::sip::bridge::BrewCallLink { call_id: id, client: source };
+                        let link = crate::sip::bridge::BrewCallLink { call_id: id, client: source, source_issi };
                         bridge.brew_to_sip(origin, &dialled, link).await
                     } else { false }
                 }
@@ -366,18 +393,30 @@ async fn route_private_control(state: &Arc<AppState>, source: ClientId, id: uuid
 }
 
 async fn route_call_frame(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: Vec<u8>) {
+    let Some(txs) = call_frame_recipients(state, source, id, "voice").await else { return };
+    state.monitor.voice_frame(id).await;
+    for tx in txs { let _ = tx.send(raw.clone()); }
+}
+
+async fn route_dtmf_frame(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: Vec<u8>) {
+    let Some(txs) = call_frame_recipients(state, source, id, "DTMF").await else { return };
+    for tx in txs { let _ = tx.send(raw.clone()); }
+}
+
+/// Shared participant/permission check and recipient lookup for both call
+/// audio (`route_call_frame`) and DTMF (`route_dtmf_frame`): only the current
+/// group floor holder or a private call's two participants may inject a
+/// frame, and it fans out to every other participant.
+async fn call_frame_recipients(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, kind: &str) -> Option<Vec<mpsc::UnboundedSender<Vec<u8>>>> {
     let inner = state.inner.read().await;
-    let Some(call) = inner.calls.get(&id) else { debug!(uuid=%id, "voice frame for unknown call"); return; };
+    let Some(call) = inner.calls.get(&id) else { debug!(uuid=%id, "{kind} frame for unknown call"); return None; };
     let mut allowed = call.peers.contains(&source) || call.owner == source;
     if call.kind == CallKind::Group { allowed = call.owner == source; }
-    if !allowed { warn!(%source, uuid=%id, "voice frame from non-participant"); return; }
+    if !allowed { warn!(%source, uuid=%id, "{kind} frame from non-participant"); return None; }
     let mut recipients = call.peers.clone();
     if call.kind == CallKind::Private { recipients.insert(call.owner); }
     recipients.remove(&source);
-    let txs = recipients.iter().filter_map(|cid| inner.clients.get(cid).map(|c| c.tx.clone())).collect::<Vec<_>>();
-    drop(inner);
-    state.monitor.voice_frame(id).await;
-    for tx in txs { let _ = tx.send(raw.clone()); }
+    Some(recipients.iter().filter_map(|cid| inner.clients.get(cid).map(|c| c.tx.clone())).collect())
 }
 
 /// Periodically ends Brew calls (private or group -- a station call directly
@@ -452,6 +491,9 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
     // released (mirrors how position decoding logs via `state.telemetry`
     // outside of the `inner` lock elsewhere in this module).
     let mut ms_reg_event: Option<&'static str> = None;
+    // Captured before the match below (which may consume `msg.groups`), for
+    // the federation relay after it.
+    let relay_groups = msg.groups.clone();
     match msg.msg_type {
         SUB_REGISTER | SUB_REREGISTER => {
             let previous = inner.subscribers.get(&msg.issi).map(|s| (s.client_id, s.groups.clone()));
@@ -500,7 +542,28 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
         }
         _ => debug!(%source, msg_type=msg.msg_type, "unknown subscriber message"),
     }
+    // Federation: relay this registration/affiliation event to every *other*
+    // connected peer (split-horizon -- never echo it back out the peer link
+    // it arrived on). Works for a message that originated locally (source is
+    // a real client) and for one already relayed in from another peer (this
+    // server is then a transit hop, propagating it further out); either way
+    // this is what makes a remote ISSI/GSSI's registration reachable from
+    // this server, and from here on call/SDS routing needs no federation-
+    // specific code at all -- it already resolves via `inner.subscribers`/
+    // `inner.group_clients`, which now includes this entry.
+    let relay_targets: Vec<_> = if matches!(msg.msg_type, SUB_REGISTER | SUB_REREGISTER | SUB_DEREGISTER | SUB_AFFILIATE | SUB_DEAFFILIATE) {
+        inner.clients.iter()
+            .filter(|(cid, c)| c.mode == crate::state::ClientMode::Peer && **cid != source)
+            .map(|(_, c)| c.tx.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     drop(inner);
+    if !relay_targets.is_empty() {
+        let relay = protocol::build_subscriber_message(msg.msg_type, msg.issi, &relay_groups);
+        for tx in relay_targets { let _ = tx.send(relay.clone()); }
+    }
     // Log Terminal-mode (actual MS) registration lifecycle events to the same
     // dashboard registration log Basestation telemetry registrations use, so
     // an MS registering directly over the Brew protocol is visible there too.

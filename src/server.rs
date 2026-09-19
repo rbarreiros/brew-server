@@ -275,8 +275,16 @@ async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMod
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let connected_at_ms = crate::telemetry::now_ms();
-    state.inner.write().await.clients.insert(id, Client { tx, mode, version: seed_version, remote_addr: Some(remote_addr), connected_at_ms });
+    state.inner.write().await.clients.insert(id, Client { tx: tx.clone(), mode, version: seed_version, remote_addr: Some(remote_addr), connected_at_ms });
     info!(%id, mode=mode.as_str(), version=seed_version.as_u8(), %remote_addr, "Basestation connected");
+    if mode == ClientMode::Peer {
+        // Inbound federation peer link: `federation::run`'s outbound dial
+        // side syncs its own state to us once connected, but that is only
+        // half the story -- we need to tell *this* peer what we know too, or
+        // an inbound-only link (or one that reconnects from the far end)
+        // never learns about registrations that predate it.
+        crate::federation::sync_peer(&state, &tx).await;
+    }
 
     let writer = tokio::spawn(async move {
         while let Some(packet) = rx.recv().await {

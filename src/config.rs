@@ -26,6 +26,7 @@ pub struct Config {
     pub dashboard: DashboardConfig,
     pub storage: StorageConfig,
     pub sip: SipConfig,
+    pub federation: FederationConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -345,6 +346,72 @@ impl Default for VoiceRouteConfig {
     }
 }
 
+/// Server-to-server federation: connects this brew-server to other
+/// brew-server instances over the same Brew WebSocket protocol real
+/// Basestations use (a peer dials in/out exactly like a Basestation would,
+/// tagged `X-Brew-Mode: Peer`). Subscriber/group registrations propagate
+/// peer to peer (each server relays what it learns, from any source, to its
+/// *other* peers -- split-horizon, so it never echoes an advertisement back
+/// out the link it arrived on), and private/group calls and SDS route
+/// transparently hop to hop the same way they already route to any other
+/// connected client: call/SDS routing has no federation-specific code at all,
+/// it Just Works once a remote ISSI/GSSI's registration has propagated to
+/// this server. This is correct for a loop-free topology (a chain or a star,
+/// i.e. any tree of peer links); a topology with a cycle (e.g. a full mesh)
+/// is not safe with split-horizon alone and needs additional loop prevention
+/// (hop count / path vector) not implemented here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FederationConfig {
+    pub enabled: bool,
+    /// Peers this server dials out to. An inbound peer connection (another
+    /// server dialling in to us) needs no entry here: it just authenticates
+    /// like a Basestation would, with `X-Brew-Mode: Peer`.
+    pub peers: Vec<FederationPeerConfig>,
+}
+
+impl Default for FederationConfig {
+    fn default() -> Self {
+        Self { enabled: false, peers: Vec::new() }
+    }
+}
+
+/// One outbound federation peer link.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FederationPeerConfig {
+    /// Operator label, used in logs and the dashboard.
+    pub name: String,
+    /// `host:port` of the peer's Brew listener (the same port real
+    /// Basestations connect to).
+    pub remote_host: String,
+    /// Discovery path on the peer, matching its `websocket_path` (default
+    /// `/brew`).
+    pub path: String,
+    /// Brew digest username this server presents to the peer (numeric, max 7
+    /// digits, same rule as a Basestation's). Only needed if the peer has
+    /// `[auth]` enabled; ignored otherwise.
+    pub username: String,
+    pub password: String,
+    /// Seconds between reconnect attempts after a dropped/failed link.
+    pub reconnect_interval_seconds: u64,
+    pub enabled: bool,
+}
+
+impl Default for FederationPeerConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            remote_host: String::new(),
+            path: "/brew".into(),
+            username: String::new(),
+            password: String::new(),
+            reconnect_interval_seconds: 15,
+            enabled: true,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -364,6 +431,7 @@ impl Default for Config {
             dashboard: DashboardConfig::default(),
             storage: StorageConfig::default(),
             sip: SipConfig::default(),
+            federation: FederationConfig::default(),
         }
     }
 }

@@ -443,6 +443,14 @@ pub struct TelemetryState {
     recent_brew_regs: VecDeque<RegLogEntry>,
     /// Serialized view of `recent_brew_regs` for the dashboard.
     pub recent_brew_regs_out: Vec<RegLogEntry>,
+    /// Latest per-ISSI RSSI reported directly on the main Brew protocol
+    /// channel (`CLASS_SERVICE` type `0x10`, `{"issi":N,"rssi_dbfs":F}`) --
+    /// not part of this server's original protocol coverage, but sent by at
+    /// least one real client (nexus-bs). Distinct from `TelemetryBts::ms_rssi`
+    /// (which comes from the separate Basestation Telemetry WebSocket): this
+    /// is keyed only by ISSI, with no BTS-id concept on the wire, so it isn't
+    /// nested under a station the way that one is.
+    pub brew_ms_rssi: HashMap<u32, f32>,
     store: Option<Arc<crate::store::Store>>,
 }
 
@@ -533,6 +541,12 @@ impl TelemetryState {
             self.recent_brew_regs.pop_back();
         }
         self.recent_brew_regs_out = self.recent_brew_regs.iter().cloned().collect();
+    }
+
+    /// Records an RSSI report for `issi` seen directly on the main Brew
+    /// protocol channel (see `brew_ms_rssi`'s doc comment).
+    pub fn record_brew_rssi(&mut self, issi: u32, rssi_dbfs: f32) {
+        self.brew_ms_rssi.insert(issi, rssi_dbfs);
     }
 
     /// Flat, newest-first list of registration lifecycle events across every
@@ -932,6 +946,16 @@ mod registration_log_tests {
             t.record_brew_registration(i, "register");
         }
         assert_eq!(t.recent_brew_regs_out.len(), 50, "log capped at 50 entries");
+    }
+
+    #[test]
+    fn record_brew_rssi_keeps_latest_per_issi() {
+        let mut t = TelemetryState::default();
+        t.record_brew_rssi(4013, -12.5);
+        t.record_brew_rssi(4013, -8.0);
+        t.record_brew_rssi(5551, -20.0);
+        assert_eq!(t.brew_ms_rssi.get(&4013), Some(&-8.0));
+        assert_eq!(t.brew_ms_rssi.get(&5551), Some(&-20.0));
     }
 
     #[test]

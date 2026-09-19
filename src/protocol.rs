@@ -34,6 +34,18 @@ pub const CALL_SIMPLEX_IDLE: u8 = 13;
 pub const FRAME_TRAFFIC_CHANNEL: u8 = 0;
 pub const FRAME_SDS_TRANSFER: u8 = 1;
 pub const FRAME_SDS_REPORT: u8 = 2;
+/// In-call DTMF: one ASCII digit ('0'-'9', '*', '#', 'A'-'D') per frame,
+/// `length_bits = 8`, 1-byte payload. Not in the original Brew spec this
+/// server was built against, but sent by at least one real client (nexus-bs,
+/// a FlowStation-derived Basestation). The frame header shape is identical
+/// to `FRAME_TRAFFIC_CHANNEL`/`FRAME_SDS_*`, so no new parser is needed --
+/// only routing for this frame type.
+pub const FRAME_DTMF: u8 = 3;
+
+/// `CLASS_SERVICE` type carrying a per-ISSI RSSI report:
+/// `{"issi": N, "rssi_dbfs": F}`. Not in the original Brew spec this server
+/// was built against, but sent by at least one real client (nexus-bs).
+pub const SERVICE_RSSI: u8 = 0x10;
 
 #[derive(Debug, Clone)]
 pub enum BrewMessage {
@@ -493,6 +505,24 @@ pub fn build_call_connect_confirm(id: &Uuid, grant: u8, permission: u8) -> Vec<u
     out
 }
 
+/// Builds a `CLASS_SUBSCRIBER` message (`SUB_REGISTER`/`SUB_DEREGISTER`/
+/// `SUB_AFFILIATE`/`SUB_DEAFFILIATE`/...). `timestamp`/`fraction` are left
+/// zero: nothing in this server's own parsing or the federation full-sync
+/// that uses this builder reads them, only the LIP/position decoders on the
+/// SDS side care about a wire timestamp, and those never touch this class.
+pub fn build_subscriber_message(msg_type: u8, issi: u32, groups: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(18 + groups.len() * 4);
+    out.push(CLASS_SUBSCRIBER);
+    out.push(msg_type);
+    out.extend_from_slice(&issi.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+    out.extend_from_slice(&0u32.to_le_bytes()); // fraction
+    for g in groups {
+        out.extend_from_slice(&g.to_le_bytes());
+    }
+    out
+}
+
 pub fn raw_peer_pair(payload: &CallPayload) -> Option<(u32, u32)> {
     let CallPayload::Raw(raw) = payload else { return None };
     if raw.len() < 8 { return None; }
@@ -513,15 +543,43 @@ pub const ACELP_PCM_SAMPLES: usize = 240;
 /// fields are left zeroed: only source/destination/priority are meaningful
 /// for this bridge, and `CircularCall` parsing ignores the rest.
 pub fn build_circular_call_setup(id: &Uuid, source: u32, destination: u32, priority: u8) -> Vec<u8> {
+    build_circular_call(CALL_SETUP_REQUEST, id, source, destination, priority)
+}
+
+/// Builds a server-originated `CALL_CONNECT_REQUEST`: what this bridge sends
+/// to the originating ISSI of a Brew-originated (MS-calling-out) call once
+/// the SIP/PSTN side answers (see `sip::bridge::on_sip_response`'s `200`
+/// case). This is *not* `CALL_CONNECT_CONFIRM` -- confirmed against
+/// FlowStation's cc_bs: `CALL_CONNECT_CONFIRM` is explicitly ignored for a
+/// call where the MS is the calling party
+/// (`fsm_on_network_circuit_connect_confirm` checks `calling_over_brew` and
+/// returns early otherwise); `CALL_CONNECT_REQUEST` is what
+/// `fsm_on_network_circuit_connect_request` expects for exactly this
+/// direction, and is what actually builds and sends the over-the-air
+/// D-CONNECT that flips the MS's UI out of "calling...".
+pub fn build_circular_connect_request(id: &Uuid, source: u32, destination: u32, priority: u8) -> Vec<u8> {
+    build_circular_call(CALL_CONNECT_REQUEST, id, source, destination, priority)
+}
+
+/// Shared builder for the two server-originated `CircularCall`-payload
+/// messages above. `duplex`=1 and `method`=1 (full duplex, hook signalling)
+/// on both: real hardware (confirmed against FlowStation's cc_bs) presents
+/// `duplex=0`/`method=0` as a simplex PTT-style call with no real accept
+/// gesture or working duplex audio, not a normal phone call. `mode`=0 (TchS
+/// speech) and `communication`=0 (P2p -- the only individual-call variant
+/// TETRA CMCE defines; there is no separate "phone"/"PABX" type) are
+/// correctly zero.
+fn build_circular_call(call_state: u8, id: &Uuid, source: u32, destination: u32, priority: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + 16 + CIRCULAR_CALL_BASE_LEN);
     out.push(CLASS_CALL_CONTROL);
-    out.push(CALL_SETUP_REQUEST);
+    out.push(call_state);
     out.extend_from_slice(id.as_bytes());
     out.extend_from_slice(&source.to_le_bytes());
     out.extend_from_slice(&destination.to_le_bytes());
     out.extend_from_slice(&[0u8; 32]); // number[32]: unused for a SIP-originated call
     out.push(priority);
-    out.extend_from_slice(&[0u8; 10]); // service, mode, duplex, method, communication, grant, permission, timeout, ownership, queued
+    // service, mode, duplex, method, communication, grant, permission, timeout, ownership, queued
+    out.extend_from_slice(&[0, 0, 1, 1, 0, 0, 0, 0, 0, 0]);
     out
 }
 
@@ -548,6 +606,18 @@ pub fn build_traffic_frame(id: &Uuid, coded: &[u8; ACELP_CODED_FRAME_BYTES]) -> 
     out.extend_from_slice(id.as_bytes());
     out.extend_from_slice(&ACELP_CODED_FRAME_BITS.to_le_bytes());
     out.extend_from_slice(coded);
+    out
+}
+
+/// Builds a `FRAME_DTMF` carrying one digit (see `FRAME_DTMF`'s doc comment
+/// for the wire shape this mirrors).
+pub fn build_dtmf_frame(id: &Uuid, digit: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(21);
+    out.push(CLASS_FRAME);
+    out.push(FRAME_DTMF);
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&8u16.to_le_bytes());
+    out.push(digit);
     out
 }
 
@@ -578,6 +648,72 @@ mod tests {
         let wire = build_call_connect_confirm(&id, 1, 2);
         assert_eq!(wire.len(), 20, "18-byte header + 2-byte grant/permission");
         assert_eq!(&wire[18..20], &[1, 2]);
+    }
+
+    #[test]
+    fn build_subscriber_message_round_trips() {
+        let wire = build_subscriber_message(SUB_REGISTER, 4013, &[1001, 1002]);
+        let BrewMessage::Subscriber(msg) = parse(&wire).unwrap() else { panic!() };
+        assert_eq!(msg.msg_type, SUB_REGISTER);
+        assert_eq!(msg.issi, 4013);
+        assert_eq!(msg.groups, vec![1001, 1002]);
+    }
+
+    #[test]
+    fn build_dtmf_frame_round_trips() {
+        let id = Uuid::new_v4();
+        let wire = build_dtmf_frame(&id, b'5');
+        assert_eq!(wire.len(), 21);
+        let BrewMessage::Frame(frame) = parse(&wire).unwrap() else { panic!() };
+        assert_eq!(frame.frame_type, FRAME_DTMF);
+        assert_eq!(frame.identifier, id);
+        assert_eq!(frame.length_bits, 8);
+        assert_eq!(frame.data, vec![b'5']);
+    }
+
+    /// Pins the fix for a real-world bug: an inbound SIP-bridged call could
+    /// only be picked up via PTT, never the terminal's actual accept/green
+    /// button, and had no working duplex audio once "answered" that way.
+    /// Root cause (confirmed against FlowStation's cc_bs): `duplex=0`
+    /// presents the call as simplex with a PTT-style TransmissionGrant, and
+    /// `method=0` selects non-hook signalling. Both must be 1.
+    #[test]
+    fn build_circular_call_setup_sends_duplex_and_hook_signalling() {
+        let id = Uuid::new_v4();
+        let wire = build_circular_call_setup(&id, 1001, 4013, 0);
+        // Trailer starts right after header(18) + source(4) + destination(4)
+        // + number[32] + priority(1).
+        let trailer = 18 + 4 + 4 + 32 + 1;
+        assert_eq!(wire[trailer], 0, "service");
+        assert_eq!(wire[trailer + 1], 0, "mode (TchS speech)");
+        assert_eq!(wire[trailer + 2], 1, "duplex must be 1 (duplex, not simplex/PTT)");
+        assert_eq!(wire[trailer + 3], 1, "method must be 1 (hook signalling: requires explicit answer)");
+        assert_eq!(wire[trailer + 4], 0, "communication (P2p, the only individual-call variant TETRA defines)");
+
+        let BrewMessage::CallControl(cc) = parse(&wire).unwrap() else { panic!() };
+        let CallPayload::CircularCall(c) = cc.payload else { panic!() };
+        assert_eq!(c.source, 1001);
+        assert_eq!(c.destination, 4013);
+    }
+
+    /// Pins the fix for a real-world bug: an MS-originated call bridged out
+    /// to SIP stayed stuck in "calling..." even after the PSTN side answered.
+    /// Root cause (confirmed against FlowStation's cc_bs): CALL_CONNECT_CONFIRM
+    /// is explicitly ignored for a call where the MS is the calling party;
+    /// CALL_CONNECT_REQUEST is what actually drives the MS's D-CONNECT.
+    #[test]
+    fn build_circular_connect_request_has_correct_call_state_and_duplex() {
+        let id = Uuid::new_v4();
+        let wire = build_circular_connect_request(&id, 0, 4013, 0);
+        assert_eq!(wire[1], CALL_CONNECT_REQUEST, "must be CONNECT_REQUEST, not CONNECT_CONFIRM");
+        let trailer = 18 + 4 + 4 + 32 + 1;
+        assert_eq!(wire[trailer + 2], 1, "duplex must be 1");
+        assert_eq!(wire[trailer + 3], 1, "method must be 1 (hook signalling)");
+
+        let BrewMessage::CallControl(cc) = parse(&wire).unwrap() else { panic!() };
+        assert_eq!(cc.call_state, CALL_CONNECT_REQUEST);
+        let CallPayload::CircularCall(c) = cc.payload else { panic!() };
+        assert_eq!(c.destination, 4013, "destination is the ISSI being told the call connected");
     }
 
     #[test]

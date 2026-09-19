@@ -4,6 +4,37 @@ Experimental Rust Brew core for linking two or more MidnightBlue Basestation TET
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 1.1 adds:
+
+- **Server-to-server federation.** Multiple brew-server instances can now be
+  linked (chain or star topology) so calls, SDS and subscriber/group
+  registrations reach a remote site's Basestations and mobile stations. A
+  peer link connects and authenticates exactly like a Basestation does, over
+  the same Brew WebSocket protocol, tagged `X-Brew-Mode: Peer` (new
+  `[[federation.peers]]` config, dialled outbound with reconnect; an inbound
+  link needs no matching config, just Basestation-style auth). Registrations
+  propagate peer to peer automatically — each server relays what it learns to
+  its *other* peers (split-horizon, safe for any loop-free topology) — so
+  private/group call routing and SDS forwarding across servers need no
+  federation-specific routing code at all: they already resolve a
+  destination via the same `inner.subscribers`/`inner.group_clients` tables
+  used for local routing, which now include remote entries. A newly
+  (re)connected peer gets a full snapshot of everything this server currently
+  knows, in both directions, so it isn't blind to registrations that predate
+  the link.
+- **DTMF forwarding.** Some real clients (e.g. nexus-bs, a FlowStation-derived
+  Basestation) send in-call DTMF as a Brew `FRAME_DTMF` frame (one ASCII
+  digit per frame) — outside this server's original protocol coverage, and
+  previously silently dropped. It now routes like a voice frame to every
+  other Brew-side call participant, and for a SIP-bridged call the
+  transcoder converts it to RFC 4733 (formerly 2833) telephone-event RTP
+  instead of dropping it there too.
+- **Per-ISSI RSSI from the main Brew channel.** Some real clients also send
+  `CLASS_SERVICE` type `0x10` (`{"issi":N,"rssi_dbfs":F}`) — previously
+  parsed but unconditionally ignored. It's now stored and exposed at
+  `/api/rssi`, merged into the dashboard's existing "MS RSSI" column
+  alongside the Basestation Telemetry channel's own per-station RSSI.
+
 Version 1.0 adds:
 
 - **ACELP<->G.711 media transcoder for SIP<->Brew calls.** SIP legs are
@@ -331,6 +362,12 @@ The following Brew call states are recognized and routed by call UUID:
 
 If the destination ISSI is *not* a registered subscriber, the call is offered to the SIP subsystem (Brew -> SIP) instead of being rejected outright: `[[sip.routes]]` entries are matched against a dialled string, which is the `BrewCircularCall`'s ASCII `number` field when the caller set one, falling back to the destination ISSI rendered as decimal otherwise. This is how a mobile terminal dialling an outside-line-style number (e.g. "9" + a 10-digit PSTN number) reaches a SIP trunk: the terminal sends `destination = 0` with the dialled digits in `number` (this is how FlowStation encodes a PBX/phone call — see its `cc_bs/procedures/setup.rs`), a route like `match_pattern = "9*"` selects it, and an optional `strip_prefix = "9"` on the route removes the leading digit before it reaches an empty-`number` `sip_trunk` destination, so the trunk dials the bare 10 digits. See `[[sip.routes]]` in Configuration above.
 
+**Duplex vs. PTT.** `build_circular_call_setup` (the server-originated `SETUP_REQUEST` for a SIP->Brew private call) sets `duplex=1` and `method=1` in the `BrewCircularCall` payload. There is no separate "PBX"/"phone" call type in TETRA CMCE to select instead (`communication` only has `P2p`/`P2Mp`/`P2MpAcked`/`Broadcast`, and `P2p` — already what this server sends — is correct for an individual call whether it's a radio-to-radio call or a bridged PSTN call); what actually matters is `duplex`/`method`. With both left at `0`, FlowStation's `cc_bs` presents the call as simplex with a PTT-style `TransmissionGrant` and non-hook signalling — the mobile terminal can only be "answered" by pressing PTT, never the real accept/green button, and audio doesn't behave like a normal duplex phone call even once picked up that way. `duplex=1` (full duplex) + `method=1` (hook signalling, i.e. the call requires an explicit user answer) make the terminal present and handle it as a genuine duplex phone call.
+
+**Answering a Brew->SIP (MS-originated) call.** When a mobile terminal itself places the call and the SIP/PSTN side answers, the message that tells the MS "connected" is `CALL_CONNECT_REQUEST` (`build_circular_connect_request`, also with `duplex=1`/`method=1`) — *not* `CALL_CONNECT_CONFIRM`. FlowStation's `cc_bs` explicitly ignores `CALL_CONNECT_CONFIRM` for a call where the MS is the calling party (`fsm_on_network_circuit_connect_confirm` checks `calling_over_brew` and returns early otherwise); sending it left the terminal stuck showing "calling..." even after the far end had genuinely answered. `CALL_CONNECT_CONFIRM` remains correct for the opposite direction (SIP->Brew, in response to the ISSI's own `CALL_CONNECT_REQUEST`), where it's already what this server sends. The outbound `INVITE`'s `From`/`Contact` also now identify the call as `sip:<issi>@host` rather than a generic `sip:brew@host`, so the far end sees a real caller identity.
+
+**Codec for a Brew->SIP call.** The transcoder for a Brew-originated leg is *not* started when the `INVITE` is sent — it's started once the SIP peer's `200 OK` actually arrives, using whichever of PCMU/PCMA that answer's own SDP picked (`BrewBridge::start_pending_media`, called from `on_sip_response`'s `200` case), not a guess made before the peer had even answered. Starting the transcoder early at a fixed assumption produced garbled audio in one direction and effectively nothing intelligible in the other whenever the peer answered PCMA instead of PCMU — the same bug the earlier "optimistic answer" note used to describe. The `RtpLeg` for this call, its Brew-side receive channel, and its target list are held in `BridgedLeg::pending_media` until the answer arrives; the leg's remote RTP address is also set explicitly from the answer's SDP at that point (`c=`/`m=audio`), rather than relying only on symmetric-RTP latching from the first inbound packet — the latter still applies as a fallback/NAT-safety net, but no longer as the *only* way this leg learns where to send audio.
+
 Because current upstream Basestation does not yet expose a complete private-call Brew command path, this feature should be considered server-ready/experimental rather than end-to-end validated.
 
 ## Scope and security
@@ -528,13 +565,65 @@ endpoint, so it applies regardless of which `to` kind is used.
 
 **Media / codecs.** SIP legs are negotiated to G.711 (PCMU/PCMA) and relayed by
 a built-in symmetric-RTP forwarder that latches each peer's real source address
-(NAT-safe). SIP↔SIP trunking works end to end. For **SIP↔TETRA audio**, note
-that TETRA carries ACELP voice inside Brew traffic frames: the signalling bridge
-and the SIP-side RTP relay are fully implemented, and the code marks the exact
-points where an ACELP↔PCM transcoder attaches, but transcoding itself is not
-included in this server. SIP↔TETRA is therefore signalling-complete; end-to-end
-media additionally requires that transcoder (or a Brew-side gateway that already
-delivers a SIP-compatible codec).
+(NAT-safe). SIP↔SIP trunking works end to end. For **SIP↔TETRA audio**, TETRA
+carries ACELP voice inside Brew traffic frames; this server includes an
+ACELP↔G.711 transcoder (vendoring the ETSI EN 300 395-2 reference codec, see
+`third_party/tetra-codec/`) so a SIP↔TETRA call carries real audio in both
+directions, not just signalling.
+
+## Federation (server-to-server)
+
+Multiple brew-server instances can be linked together so calls, SDS and
+subscriber/group registrations reach a remote site's Basestations and mobile
+stations -- e.g. a chain (A-B-C) or a star (a hub with several spokes). A peer
+link connects and authenticates exactly like a Basestation does, over the same
+Brew WebSocket protocol, just tagged `X-Brew-Mode: Peer`. Enable it in
+`[federation]`:
+
+```toml
+[federation]
+enabled = true
+
+[[federation.peers]]
+name = "site-b"
+remote_host = "10.0.0.20:9000"   # the peer's Brew listener, same port a Basestation uses
+path = "/brew"
+username = "9000001"             # only needed if the peer has [auth] enabled
+password = "change-me-federation"
+reconnect_interval_seconds = 15
+enabled = true
+```
+
+Each `[[federation.peers]]` entry is one **outbound** link this server dials
+(with reconnect on failure/drop). The far end needs no matching peer entry to
+*accept* a connection -- an inbound link just authenticates like a Basestation
+would (HTTP Digest if `[auth]` is enabled there) and is recognized as a peer
+from the `X-Brew-Mode: Peer` header, same as any other Brew connection.
+
+**How routing works.** There is no separate federation routing table to
+configure (which ISSI/GSSI lives behind which peer): registrations propagate
+peer to peer automatically. When a subscriber registers or affiliates to a
+group anywhere in the topology, every server relays what it learns to its
+*other* peers (never back out the link it arrived on), so the whole tree
+converges on a shared picture of who is reachable where -- similar in spirit
+to distance-vector routing. A private/group call or SDS to a destination not
+registered locally then routes to whichever peer link that destination was
+learned through, the same way it already routes to any other connected
+client; there is no federation-specific call/SDS handling at all, hop to hop
+it just resolves the destination and forwards. A newly (re)connected peer is
+sent a full snapshot of everything this server currently knows so it isn't
+blind to registrations that predate the link.
+
+**Topology.** This propagation is correct for any loop-free topology -- a
+chain or a star, i.e. any tree of peer links. A topology with a cycle (e.g. a
+full mesh, or two independent paths between the same two servers) is **not**
+safe with the split-horizon relaying implemented here: it can loop
+indefinitely. Stick to a tree.
+
+**Scope.** This covers private/group call routing and SDS forwarding across
+peers. Basestation telemetry (RF/DSP health, per-station registration lists)
+is not relayed across federation links in this version -- each server's
+dashboard only shows telemetry for Basestations connected directly to it.
 
 ## Web monitoring dashboard
 
@@ -559,12 +648,14 @@ enabled = false
 - MS map (linked from the dashboard): `/map` — plots decoded MS positions;
   JSON at `/api/positions`
 - **Live connections** (linked from the dashboard): `/connections` — who is
-  connected/registered *right now*: Brew connections (Basestations and any
-  direct Terminal/mobile clients, with remote address and how long they've
-  been connected), registered mobile stations (Terminal-mode subscribers —
-  actual MS, cross-referenced to the Basestation they're on), and SIP
-  registrations/trunks. JSON at `/api/connections`. This is a live snapshot,
-  distinct from `/registrations` below, which is a historical event log.
+  connected/registered *right now*: Brew connections (Basestations, direct
+  Terminal/mobile clients, and federation peer links, with remote address and
+  how long they've been connected), registered subscribers (every ISSI in
+  `inner.subscribers` — whether registered by a Terminal-mode MS, on its
+  behalf by a Basestation, or reachable through a federation peer — tagged
+  with which of those it came via), and SIP registrations/trunks. JSON at
+  `/api/connections`. This is a live snapshot, distinct from `/registrations`
+  below, which is a historical event log.
 - Log pages (linked from the dashboard): `/calls` (recent calls, 10/page),
   `/sds` (recent SDS, 10/page), `/telemetry-sds` (telemetry SDS log, 5/page),
   `/registrations` (register/deregister/timeout event log)

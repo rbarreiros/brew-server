@@ -18,7 +18,7 @@
 //! between them.
 
 use crate::protocol::{self, ConnVersion};
-use crate::sip::media::{RtpRelay, Sdp};
+use crate::sip::media::{RtpLeg, RtpRelay, Sdp};
 use crate::sip::message::{extract_uri, uri_user, SipMessage};
 use crate::sip::state::SipCall;
 use crate::sip::transport::SipTransport;
@@ -36,6 +36,10 @@ use tracing::{info, warn};
 pub struct BrewCallLink {
     pub call_id: uuid::Uuid,
     pub client: ClientId,
+    /// The originating ISSI, used as the SIP From/Contact user part (`sip:
+    /// <issi>@host`) instead of a generic literal, so the far end sees a
+    /// real caller identity to route/display/dial back to.
+    pub source_issi: u32,
 }
 
 /// Enough of a SIP dialog to send a best-effort in-dialog BYE toward the
@@ -59,7 +63,12 @@ struct BridgedLeg {
     virtual_client: ClientId,
     brew_call_id: uuid::Uuid,
     group: Option<u32>,
-    task: tokio::task::JoinHandle<()>,
+    /// `None` while a Brew-originated (place_outbound) leg is still ringing:
+    /// the transcoder isn't started until the SIP peer answers and we know
+    /// which codec it actually picked (see `pending_media`). Always `Some`
+    /// immediately for a SIP-originated leg, where the codec is already
+    /// known from the caller's own offer.
+    task: Option<tokio::task::JoinHandle<()>>,
     /// Set when this bridge placed the outbound/inbound SIP dialog itself
     /// (i.e. every case here), so a Brew-initiated hangup can notify the SIP
     /// peer instead of leaving its dialog dangling.
@@ -69,12 +78,30 @@ struct BridgedLeg {
     /// `None` for a SIP-originated leg, where that signalling instead flows
     /// through the private-call-control task spawned by `sip_to_brew_private`.
     subscriber: Option<ClientId>,
+    /// `subscriber`'s ISSI, needed as the `destination` field of the
+    /// `CALL_CONNECT_REQUEST` `on_sip_response` sends it on answer. Only
+    /// meaningful alongside `subscriber` (`Some` for the same leg kind).
+    subscriber_issi: u32,
     /// Whether CALL_ALERT has already been sent to `subscriber`, so a
     /// retransmitted SIP 180 doesn't re-trigger it.
     rang: AtomicBool,
-    /// Whether CALL_CONNECT_CONFIRM/ACK has already been sent/processed, so a
+    /// Whether CALL_CONNECT_REQUEST/ACK has already been sent/processed, so a
     /// retransmitted SIP 200 doesn't re-trigger it.
     connected: AtomicBool,
+    /// For a Brew-originated leg only: the RTP leg and Brew-side channel
+    /// ends needed to start the transcoder, held here until `on_sip_response`
+    /// sees the SIP peer's actual 200 OK SDP answer and knows which of
+    /// PCMU/PCMA it picked -- rather than guessing PCMU upfront and getting
+    /// it wrong whenever the peer answers PCMA (garbled audio one way,
+    /// nothing intelligible the other, since encode/decode disagree with
+    /// what's actually on the wire).
+    pending_media: Option<PendingMedia>,
+}
+
+struct PendingMedia {
+    leg: RtpLeg,
+    virtual_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    brew_targets: Vec<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 /// Couples the SIP transport to the Brew core.
@@ -97,6 +124,31 @@ impl BrewBridge {
         payloads.iter().copied().find(|p| *p == 0 || *p == 8).unwrap_or(0)
     }
 
+    /// Starts the transcoder for a Brew-originated leg once its SIP peer has
+    /// actually answered, using the codec that answer's own SDP picked (not
+    /// a guess made before we could know). No-op if this leg has no
+    /// `pending_media` (already started, or a leg kind that starts
+    /// immediately) or the answer's SDP doesn't parse.
+    async fn start_pending_media(&self, call_id: &str, body: &[u8]) {
+        let Some(offer) = Sdp::parse(body) else {
+            warn!(%call_id, "SIP 200 OK had no parseable SDP; leaving media unstarted");
+            return;
+        };
+        let payload_type = Self::transcoder_payload_type(&offer.payload_types);
+        let mut legs = self.legs.write().await;
+        let Some(leg) = legs.get_mut(call_id) else { return };
+        let Some(pending) = leg.pending_media.take() else { return };
+        if let Ok(addr) = format!("{}:{}", offer.connection_addr, offer.audio_port).parse::<SocketAddr>() {
+            pending.leg.set_remote(addr).await;
+        }
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let task = crate::transcode::task::spawn(
+            pending.leg, payload_type, leg.brew_call_id, pending.virtual_rx, pending.brew_targets, control_tx,
+        );
+        leg.task = Some(task);
+        info!(%call_id, payload_type, "media started at the SIP peer's actual answered codec");
+    }
+
     /// Tears down a bridged call's virtual Brew participant: aborts the
     /// transcoder task, removes the virtual client from every place it was
     /// registered (connection table, active call, group affiliation), and
@@ -106,7 +158,7 @@ impl BrewBridge {
     /// for a call this bridge did not place (no-op).
     pub async fn teardown(&self, call_id: &str) {
         let Some(leg) = self.legs.write().await.remove(call_id) else { return };
-        leg.task.abort();
+        if let Some(task) = &leg.task { task.abort(); }
         let mut inner = self.app.inner.write().await;
         inner.clients.remove(&leg.virtual_client);
         let call = inner.calls.remove(&leg.brew_call_id);
@@ -185,12 +237,12 @@ impl BrewBridge {
     /// this dialog now needs to stay up), and a failure response releases the
     /// Brew side and cleans up. No-op for a call this bridge did not place as
     /// a Brew-originated leg (`subscriber` unset), e.g. a plain SIP-SIP relay.
-    pub async fn on_sip_response(&self, call_id: &str, code: u16, to_header: Option<&str>, peer: SocketAddr) {
-        let (subscriber, brew_call_id, already_rang, already_connected, bye) = {
+    pub async fn on_sip_response(&self, call_id: &str, code: u16, to_header: Option<&str>, peer: SocketAddr, body: &[u8]) {
+        let (subscriber, subscriber_issi, brew_call_id, already_rang, already_connected, bye) = {
             let legs = self.legs.read().await;
             let Some(leg) = legs.get(call_id) else { return };
             let Some(subscriber) = leg.subscriber else { return };
-            (subscriber, leg.brew_call_id, leg.rang.load(Ordering::Relaxed), leg.connected.load(Ordering::Relaxed), leg.bye.clone())
+            (subscriber, leg.subscriber_issi, leg.brew_call_id, leg.rang.load(Ordering::Relaxed), leg.connected.load(Ordering::Relaxed), leg.bye.clone())
         };
         if already_connected { return; }
         let tx = {
@@ -209,12 +261,20 @@ impl BrewBridge {
             }
             200 => {
                 if let Some(leg) = self.legs.read().await.get(call_id) { leg.connected.store(true, Ordering::Relaxed); }
-                let _ = tx.send(protocol::build_call_connect_confirm(&brew_call_id, 0, 0));
+                // CALL_CONNECT_CONFIRM here would go silently ignored: real
+                // hardware (confirmed against FlowStation's cc_bs) only
+                // honours it for a call where Brew/PSTN is the *calling*
+                // party (calling_over_brew), i.e. an inbound SIP->Brew call.
+                // For this direction -- the MS itself originated the call --
+                // the message that actually drives the MS's own D-CONNECT
+                // and flips its UI out of "calling..." is CALL_CONNECT_REQUEST.
+                let _ = tx.send(protocol::build_circular_connect_request(&brew_call_id, 0, subscriber_issi, 0));
                 self.transport.state.answer_call(call_id).await;
+                self.start_pending_media(call_id, body).await;
                 if let Some(d) = bye {
                     self.send_ack(call_id, &d, to_header, peer).await;
                 }
-                info!(%call_id, "SIP peer answered (CALL_CONNECT_CONFIRM sent to ISSI)");
+                info!(%call_id, "SIP peer answered (CALL_CONNECT_REQUEST sent to ISSI)");
             }
             code if code >= 400 => {
                 if let Some(leg) = self.legs.read().await.get(call_id) { leg.connected.store(true, Ordering::Relaxed); }
@@ -364,8 +424,9 @@ impl BrewBridge {
             target_tx.into_iter().collect(), control_tx,
         );
         self.legs.write().await.insert(call_id.to_string(), BridgedLeg {
-            virtual_client, brew_call_id, group: None, task, bye,
-            subscriber: None, rang: AtomicBool::new(false), connected: AtomicBool::new(false),
+            virtual_client, brew_call_id, group: None, task: Some(task), bye,
+            subscriber: None, subscriber_issi: 0, rang: AtomicBool::new(false), connected: AtomicBool::new(false),
+            pending_media: None,
         });
 
         // Same instance as `self` (this is how `sip_to_brew_private` is
@@ -470,8 +531,9 @@ impl BrewBridge {
         let (control_tx, _control_rx) = mpsc::unbounded_channel();
         let task = crate::transcode::task::spawn(leg, payload_type, brew_call_id, virtual_rx, target_txs, control_tx);
         self.legs.write().await.insert(call_id.to_string(), BridgedLeg {
-            virtual_client, brew_call_id, group: Some(gssi), task, bye,
-            subscriber: None, rang: AtomicBool::new(false), connected: AtomicBool::new(false),
+            virtual_client, brew_call_id, group: Some(gssi), task: Some(task), bye,
+            subscriber: None, subscriber_issi: 0, rang: AtomicBool::new(false), connected: AtomicBool::new(false),
+            pending_media: None,
         });
 
         self.transport.send_to(&ok, caller).await;
@@ -577,7 +639,14 @@ impl BrewBridge {
         }
 
         use crate::sip::message::Method;
-        let from_header = format!("<sip:brew@{}>;tag={}", self.transport.advertised_host, uuid::Uuid::new_v4().simple());
+        // Identify the call as the originating ISSI, not a generic "brew"
+        // literal, so the far end (Asterisk/PSTN) sees a real caller identity
+        // to display, route on, or dial back to. Falls back to "brew" only
+        // for the degenerate case of an unknown/zero ISSI (shouldn't happen
+        // for a real private call, since router::handle_private_setup always
+        // has a source_issi by the time it builds a BrewCallLink).
+        let caller_id = if link.source_issi != 0 { link.source_issi.to_string() } else { "brew".to_string() };
+        let from_header = format!("<sip:{caller_id}@{}>;tag={}", self.transport.advertised_host, uuid::Uuid::new_v4().simple());
         let to_header = format!("<{}>", extract_uri(&target_uri));
         let mut invite = SipMessage::new_request(Method::Invite, target_uri.clone());
         invite.push_header("Via", format!("SIP/2.0/UDP {};branch=z9hG4bK{}",
@@ -587,7 +656,7 @@ impl BrewBridge {
         invite.push_header("To", to_header.clone());
         invite.push_header("Call-ID", call_id.to_string());
         invite.push_header("CSeq", "1 INVITE");
-        invite.push_header("Contact", format!("<sip:brew@{}>", self.transport.advertised_host));
+        invite.push_header("Contact", format!("<sip:{caller_id}@{}>", self.transport.advertised_host));
         invite.push_header("Content-Type", "application/sdp");
         let offered_payloads = [0u8, 8, 101];
         invite.body = Sdp::build(&self.transport.advertised_host, leg.local_port, &offered_payloads);
@@ -601,23 +670,20 @@ impl BrewBridge {
             to: to_header,
         });
 
-        // We don't yet know which of PCMU/PCMA the far end will answer with
-        // (the 200 OK isn't correlated back into media setup here — see the
-        // "optimistic answer" note above), so run the transcoder at PCMU (0),
-        // the payload type we listed first and most gateways default to.
-        let payload_type = 0u8;
-        // Nothing meaningful arrives on this leg's control channel: the real
-        // subscriber is the *caller* here, so it won't send callee-side
-        // messages (SETUP_ACCEPT/ALERT/CONNECT_REQUEST); a CALL_RELEASE mid-
-        // ring is handled separately via router::end_call -> teardown_by_brew_call.
-        let (control_tx, _control_rx) = mpsc::unbounded_channel();
-        let task = crate::transcode::task::spawn(
-            leg, payload_type, link.call_id, virtual_rx,
-            brew_target_tx.into_iter().collect(), control_tx,
-        );
+        // Which of PCMU/PCMA to run the transcoder at isn't known yet -- that
+        // depends on what the SIP peer actually answers with, in its 200 OK's
+        // SDP, not what we offered. Starting the transcoder now at a guessed
+        // codec (this used to hardcode PCMU) means encode/decode silently
+        // disagree with the real wire format whenever the peer picks PCMA:
+        // garbled audio in one direction, unintelligible noise (heard as
+        // near-silence once ACELP-encoded from garbage PCM) in the other.
+        // So `leg`/`virtual_rx`/the target list are held in `pending_media`
+        // and the transcoder is only started once `on_sip_response` sees the
+        // real answer (its `200` case calls `start_pending_media`).
         self.legs.write().await.insert(call_id.to_string(), BridgedLeg {
-            virtual_client, brew_call_id: link.call_id, group: None, task, bye,
-            subscriber: Some(link.client), rang: AtomicBool::new(false), connected: AtomicBool::new(false),
+            virtual_client, brew_call_id: link.call_id, group: None, task: None, bye,
+            subscriber: Some(link.client), subscriber_issi: link.source_issi, rang: AtomicBool::new(false), connected: AtomicBool::new(false),
+            pending_media: Some(PendingMedia { leg, virtual_rx, brew_targets: brew_target_tx.into_iter().collect() }),
         });
 
         self.transport.send_to(&invite, target_addr).await;
@@ -692,3 +758,29 @@ fn now_ms() -> u64 {
 
 #[allow(unused_imports)]
 use RtpRelay as _RtpRelayInUse; // keep the media import meaningful across cfgs
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the fix for a real-world bug: a Brew-originated call always ran
+    /// its transcoder at PCMU, regardless of what the SIP peer actually
+    /// answered with, causing garbled/one-way audio whenever the peer picked
+    /// PCMA. `start_pending_media` must derive the codec from the real
+    /// answer's SDP (via this same selection function `sip_to_brew_private`
+    /// already uses on an inbound offer), not assume PCMU.
+    #[test]
+    fn transcoder_payload_type_honours_pcma_only_answer() {
+        assert_eq!(BrewBridge::transcoder_payload_type(&[8]), 8, "PCMA-only answer must select PCMA");
+        assert_eq!(BrewBridge::transcoder_payload_type(&[0]), 0, "PCMU-only answer must select PCMU");
+        assert_eq!(BrewBridge::transcoder_payload_type(&[8, 101]), 8, "PCMA with telephone-event must still pick PCMA");
+        assert_eq!(BrewBridge::transcoder_payload_type(&[]), 0, "no usable codec falls back to PCMU");
+    }
+
+    #[test]
+    fn sdp_answer_with_pcma_only_parses_and_selects_pcma() {
+        let sdp = b"v=0\r\no=- 1 1 IN IP4 10.0.0.5\r\ns=-\r\nc=IN IP4 10.0.0.5\r\nt=0 0\r\nm=audio 20000 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n";
+        let offer = Sdp::parse(sdp).expect("valid SDP");
+        assert_eq!(BrewBridge::transcoder_payload_type(&offer.payload_types), 8);
+    }
+}

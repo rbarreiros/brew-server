@@ -9,17 +9,25 @@ pub type ClientId = Uuid;
 /// Per the specification a `Terminal` does not need registration updates pushed
 /// from the server, whereas a `Basestation` does. Defaults to `Basestation`
 /// (the conservative choice) when the header is absent.
+///
+/// `Peer` is a third role, not part of the original Brew spec: another
+/// brew-server federated with this one (see `federation`), connected exactly
+/// like a Basestation but exchanging subscriber/group registrations and
+/// relaying calls/SDS between servers rather than representing a real radio
+/// site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClientMode {
     Terminal,
     #[default]
     Basestation,
+    Peer,
 }
 
 impl ClientMode {
     pub fn from_header(value: Option<&str>) -> Self {
         match value.map(|v| v.trim()) {
             Some(v) if v.eq_ignore_ascii_case("Terminal") => ClientMode::Terminal,
+            Some(v) if v.eq_ignore_ascii_case("Peer") => ClientMode::Peer,
             _ => ClientMode::Basestation,
         }
     }
@@ -28,13 +36,16 @@ impl ClientMode {
         match self {
             ClientMode::Terminal => "Terminal",
             ClientMode::Basestation => "Basestation",
+            ClientMode::Peer => "Peer",
         }
     }
 
     /// Whether the server should push subscriber-registration updates to this
-    /// client. Terminals opt out to save resources, per the spec.
+    /// client. Terminals opt out to save resources, per the spec; a
+    /// federation peer needs them for the same reason a Basestation does (it
+    /// relays them onward to its own other peers).
     pub fn wants_registration_updates(self) -> bool {
-        matches!(self, ClientMode::Basestation)
+        matches!(self, ClientMode::Basestation | ClientMode::Peer)
     }
 }
 
@@ -312,7 +323,7 @@ impl AppState {
 
         let removed_issis: Vec<u32> = inner.subscribers.iter()
             .filter_map(|(issi, sub)| (sub.client_id == id).then_some(*issi)).collect();
-        for issi in removed_issis { inner.subscribers.remove(&issi); }
+        for issi in &removed_issis { inner.subscribers.remove(issi); }
 
         for clients in inner.group_clients.values_mut() { clients.remove(&id); }
         inner.group_clients.retain(|_, clients| !clients.is_empty());
@@ -327,5 +338,24 @@ impl AppState {
             }
         }
         inner.sds_routes.retain(|_, route| route.source_client != id && !route.targets.contains(&id));
+
+        // Federation: the disconnected client's registrations just vanished
+        // above; tell every remaining peer so they don't keep routing to a
+        // now-dead ISSI (mirrors the relay in router::handle_subscriber, but
+        // there is no live source client left to split-horizon against here
+        // -- the one that just disconnected can't receive it anyway).
+        if !removed_issis.is_empty() {
+            let peer_txs: Vec<_> = inner.clients.values()
+                .filter(|c| c.mode == ClientMode::Peer)
+                .map(|c| c.tx.clone())
+                .collect();
+            drop(inner);
+            if !peer_txs.is_empty() {
+                for issi in removed_issis {
+                    let withdraw = crate::protocol::build_subscriber_message(crate::protocol::SUB_DEREGISTER, issi, &[]);
+                    for tx in &peer_txs { let _ = tx.send(withdraw.clone()); }
+                }
+            }
+        }
     }
 }
