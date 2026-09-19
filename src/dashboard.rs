@@ -549,17 +549,22 @@ pub struct BtsLocation {
 /// that Basestation is connected right now and from which address.
 pub async fn bts_locations_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<BtsLocation>> {
     let inner = state.inner.read().await;
-    let out = state.config.bts_locations.iter().map(|(username, loc)| {
-        let live = inner.clients.values().find(|c| c.username.as_deref() == Some(username.as_str()));
-        BtsLocation {
-            username: username.clone(),
-            name: loc.name.clone(),
-            lat: loc.lat,
-            lon: loc.lon,
-            ip: live.and_then(|c| c.remote_addr).map(|a| a.ip().to_string()),
-            connected: live.is_some(),
-        }
-    }).collect();
+    let out = state.config.bts_locations.iter()
+        // (0, 0) is an unconfigured/default entry (Null Island), not a real
+        // fix -- same convention the LIP decoder already uses for MS
+        // positions (see position.rs). Don't plot it.
+        .filter(|(_, loc)| loc.lat != 0.0 || loc.lon != 0.0)
+        .map(|(username, loc)| {
+            let live = inner.clients.values().find(|c| c.username.as_deref() == Some(username.as_str()));
+            BtsLocation {
+                username: username.clone(),
+                name: loc.name.clone(),
+                lat: loc.lat,
+                lon: loc.lon,
+                ip: live.and_then(|c| c.remote_addr).map(|a| a.ip().to_string()),
+                connected: live.is_some(),
+            }
+        }).collect();
     Json(out)
 }
 
@@ -1059,6 +1064,21 @@ mod tests {
     #[test]
     fn index_links_to_map() {
         assert!(INDEX_HTML.as_str().contains("href=\"/map\""), "dashboard links to /map");
+    }
+
+    #[tokio::test]
+    async fn bts_locations_snapshot_omits_unconfigured_zero_entries() {
+        let mut config = crate::config::Config::default();
+        config.bts_locations.insert("1000001".into(), crate::config::BtsLocationConfig {
+            name: "Athens HQ".into(), lat: 37.9917, lon: 23.7640,
+        });
+        config.bts_locations.insert("1000002".into(), crate::config::BtsLocationConfig {
+            name: "Unconfigured".into(), lat: 0.0, lon: 0.0,
+        });
+        let (state, _rx) = crate::state::AppState::new(config, std::path::PathBuf::from("test.toml"));
+        let Json(out) = bts_locations_snapshot(State(std::sync::Arc::new(state))).await;
+        assert_eq!(out.len(), 1, "the (0,0) entry must not be plotted");
+        assert_eq!(out[0].username, "1000001");
     }
 }
 
