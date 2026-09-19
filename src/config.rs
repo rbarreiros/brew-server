@@ -27,6 +27,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub sip: SipConfig,
     pub federation: FederationConfig,
+    pub aprs: AprsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,6 +433,59 @@ impl Default for Config {
             storage: StorageConfig::default(),
             sip: SipConfig::default(),
             federation: FederationConfig::default(),
+            aprs: AprsConfig::default(),
+        }
+    }
+}
+
+/// Settings for forwarding decoded mobile-station LIP positions to APRS-IS as
+/// APRS object reports, one object per ISSI, all sent under this server's own
+/// login -- the same technique real DMR/D-STAR-to-APRS gateways use to relay
+/// many radios' positions through a single APRS-IS connection, rather than
+/// needing a distinct callsign/passcode per mobile station.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AprsConfig {
+    pub enabled: bool,
+    /// APRS-IS server, `host:port` (e.g. `rotate.aprs2.net:14580`).
+    pub server: String,
+    /// This gateway's own APRS-IS login callsign (with SSID if desired, e.g.
+    /// `MYCALL-10`).
+    pub callsign: String,
+    /// This callsign's APRS-IS passcode. Not derivable here -- obtain it the
+    /// same way any APRS client does (it is tied to the callsign).
+    pub passcode: String,
+    /// APRS symbol table identifier and symbol code for reported objects.
+    /// Defaults to the primary table's jeep icon, a reasonable generic mobile
+    /// marker; override to taste (e.g. `/>` for a car).
+    pub symbol_table: char,
+    pub symbol_code: char,
+    /// Free-text appended to every object report (e.g. "TETRA MS").
+    pub comment: String,
+    /// Prefix used to build each object's 9-character APRS object name from
+    /// its ISSI (`"{prefix}{issi}"`, truncated/padded to 9 chars). Keep short
+    /// so the ISSI digits still fit.
+    pub object_name_prefix: String,
+    /// Minimum seconds between two object reports for the same ISSI, so a
+    /// noisy beacon source cannot flood APRS-IS. 0 disables rate limiting.
+    pub min_report_interval_seconds: u64,
+    /// Seconds between reconnect attempts after a dropped/failed APRS-IS link.
+    pub reconnect_interval_seconds: u64,
+}
+
+impl Default for AprsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server: "rotate.aprs2.net:14580".into(),
+            callsign: String::new(),
+            passcode: String::new(),
+            symbol_table: '/',
+            symbol_code: 'j',
+            comment: "TETRA MS via brew-server".into(),
+            object_name_prefix: "MS".into(),
+            min_report_interval_seconds: 60,
+            reconnect_interval_seconds: 15,
         }
     }
 }

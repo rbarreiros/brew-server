@@ -220,6 +220,11 @@ pub struct AppState {
     /// `None` until then (and when SIP is disabled) so the dashboard can render
     /// an appropriate "disabled" state without panicking.
     pub sip: RwLock<Option<SipHandles>>,
+    /// Feeds decoded MS positions to the APRS-IS forwarder (`aprs::run`),
+    /// decoupled via a channel so a slow/down APRS-IS link never blocks call
+    /// or SDS routing. Sends are safely dropped if `aprs::run` was never
+    /// started or has exited.
+    pub aprs_tx: mpsc::UnboundedSender<crate::aprs::PositionReport>,
 }
 
 /// Runtime handles for the SIP subsystem, shared with the dashboard.
@@ -230,7 +235,9 @@ pub struct SipHandles {
 }
 
 impl AppState {
-    pub fn new(config: Config, config_path: std::path::PathBuf) -> Self {
+    /// Returns the new state plus the receiving half of `aprs_tx`, which the
+    /// caller must hand to `aprs::run` (the only consumer) exactly once.
+    pub fn new(config: Config, config_path: std::path::PathBuf) -> (Self, mpsc::UnboundedReceiver<crate::aprs::PositionReport>) {
         let store = if config.storage.enabled {
             match crate::store::Store::open(&config.storage.path) {
                 Ok(store) => Some(std::sync::Arc::new(store)),
@@ -250,15 +257,20 @@ impl AppState {
             Some(store) => TelemetryState::with_store(store.clone()),
             None => TelemetryState::default(),
         };
-        Self {
-            config,
-            config_path,
-            inner: RwLock::new(Inner::default()),
-            monitor,
-            telemetry: RwLock::new(telemetry),
-            control: RwLock::new(ControlState::default()),
-            sip: RwLock::new(None),
-        }
+        let (aprs_tx, aprs_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                config,
+                config_path,
+                inner: RwLock::new(Inner::default()),
+                monitor,
+                telemetry: RwLock::new(telemetry),
+                control: RwLock::new(ControlState::default()),
+                sip: RwLock::new(None),
+                aprs_tx,
+            },
+            aprs_rx,
+        )
     }
 
     /// Registers the SIP runtime handles once the SIP listener has bound. Called

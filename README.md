@@ -4,6 +4,32 @@ Experimental Rust Brew core for linking two or more MidnightBlue Basestation TET
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 1.2 adds:
+
+- **APRS forwarding for mobile-station LIP positions.** New `[aprs]` config
+  (`enabled`, `server` — an APRS-IS host:port, `callsign`/`passcode` — this
+  server's own APRS-IS login, `symbol_table`/`symbol_code`, `comment`,
+  `object_name_prefix`, `min_report_interval_seconds` rate limit,
+  `reconnect_interval_seconds`). When enabled, every LIP fix decoded from
+  Brew SDS traffic (`router::handle_sds_header`/`handle_sds_transfer`, the
+  same decode path that already feeds the dashboard's MS map) is also queued
+  to a new `aprs` module, which maintains a reconnecting TCP link to
+  APRS-IS and reports each ISSI as its own APRS *object*
+  (`;OBJECTNAME*DDHHMMz...`) under this server's single login — the same
+  technique real DMR/D-STAR-to-APRS gateways use, so no per-radio APRS
+  callsign/passcode is needed. Position queuing is decoupled via a channel so
+  a slow or unreachable APRS-IS server never blocks call/SDS routing.
+- **Fixed garbled SIP->ISSI audio caused by unfiltered RTP.** The
+  transcoder's RTP receive loop decoded every incoming UDP datagram's bytes
+  after a fixed 12-byte header as G.711 audio, regardless of the packet's
+  actual payload type and without accounting for an optional CSRC list or
+  header extension. Anything else sharing the port — comfort noise, RFC 2833
+  DTMF events, or a packet with CSRC/extension data — got its bytes decoded
+  as if they were audio samples, corrupting the PCM handed to the ACELP
+  encoder. Now the payload offset is computed from the real CSRC
+  count/extension bit, and any packet whose payload type doesn't match the
+  negotiated codec is dropped instead of decoded.
+
 Version 1.1 adds:
 
 - **Server-to-server federation.** Multiple brew-server instances can now be
@@ -624,6 +650,37 @@ indefinitely. Stick to a tree.
 peers. Basestation telemetry (RF/DSP health, per-station registration lists)
 is not relayed across federation links in this version -- each server's
 dashboard only shows telemetry for Basestations connected directly to it.
+
+## APRS
+
+Decoded mobile-station LIP positions (the same fixes plotted on the
+dashboard's `/map`) can also be forwarded to APRS-IS. Configure `[aprs]`:
+
+```toml
+[aprs]
+enabled = true
+server = "rotate.aprs2.net:14580"
+callsign = "MYCALL-10"
+passcode = "12345"
+symbol_table = "/"
+symbol_code = "j"
+comment = "TETRA MS via brew-server"
+object_name_prefix = "MS"
+min_report_interval_seconds = 60
+reconnect_interval_seconds = 15
+```
+
+`callsign`/`passcode` are this server's *own* APRS-IS login -- not a
+per-mobile-station credential. Every reporting ISSI is sent as an APRS object
+(`;MS90      *...`, named from `object_name_prefix` + the ISSI, padded/
+truncated to APRS's fixed 9-character object name) under that one login, the
+same approach real DMR/D-STAR-to-APRS gateways use. `passcode` is not derived
+here; obtain it the same way any APRS client does, tied to `callsign`.
+`min_report_interval_seconds` rate-limits how often any single ISSI's object
+is re-sent, so a noisy beacon source cannot flood APRS-IS.
+
+Can be toggled/edited live from the dashboard's `/settings` raw-TOML editor,
+like any other setting.
 
 ## Web monitoring dashboard
 

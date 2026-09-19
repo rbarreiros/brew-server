@@ -372,6 +372,29 @@ fn subsquare_letter(c: char) -> Option<u8> {
     }
 }
 
+/// Formats decimal-degrees latitude as APRS's uncompressed `DDMM.mmN`/`DDMM.mmS`
+/// (the inverse of `aprs_lat_at`). Clamped to +/-90 first so a bad fix cannot
+/// produce a malformed token.
+pub fn format_aprs_lat(lat: f64) -> String {
+    let lat = lat.clamp(-90.0, 90.0);
+    let hemi = if lat < 0.0 { 'S' } else { 'N' };
+    let abs = lat.abs();
+    let deg = abs.floor() as u32;
+    let min = (abs - deg as f64) * 60.0;
+    format!("{deg:02}{min:05.2}{hemi}")
+}
+
+/// Formats decimal-degrees longitude as APRS's uncompressed `DDDMM.mmE`/`DDDMM.mmW`
+/// (the inverse of `aprs_lon_at`).
+pub fn format_aprs_lon(lon: f64) -> String {
+    let lon = lon.clamp(-180.0, 180.0);
+    let hemi = if lon < 0.0 { 'W' } else { 'E' };
+    let abs = lon.abs();
+    let deg = abs.floor() as u32;
+    let min = (abs - deg as f64) * 60.0;
+    format!("{deg:03}{min:05.2}{hemi}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,5 +525,28 @@ mod tests {
         assert!(parse_position("").is_none());
         assert!(parse_position("hello world").is_none());
         assert!(parse_position("status: OK").is_none());
+    }
+
+    #[test]
+    fn format_aprs_lat_matches_known_value() {
+        // 37.9917N (Athens) -> 37 deg + 0.9917*60 = 59.50 min
+        assert_eq!(format_aprs_lat(37.9917), "3759.50N");
+        assert_eq!(format_aprs_lat(-37.9917), "3759.50S");
+    }
+
+    #[test]
+    fn format_aprs_lon_matches_known_value() {
+        assert_eq!(format_aprs_lon(23.7640), "02345.84E");
+        assert_eq!(format_aprs_lon(-23.7640), "02345.84W");
+    }
+
+    #[test]
+    fn format_aprs_lat_lon_round_trips_through_the_parser() {
+        let lat = 37.9917_f64;
+        let lon = 23.7640_f64;
+        let text = format!("!{}/{}>", format_aprs_lat(lat), format_aprs_lon(lon));
+        let parsed = parse_aprs(&text).expect("should parse back");
+        assert!(approx(parsed.lat, lat));
+        assert!(approx(parsed.lon, lon));
     }
 }
