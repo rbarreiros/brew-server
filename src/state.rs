@@ -64,6 +64,11 @@ pub struct Client {
     /// When this connection was accepted, for the dashboard's live
     /// connections page.
     pub connected_at_ms: u64,
+    /// The Brew digest username this connection authenticated as, when
+    /// `[auth]` is enabled (`None` otherwise, or for the SIP bridge's virtual
+    /// clients). Used to match a live connection to its `[bts_locations]`
+    /// entry on the dashboard map.
+    pub username: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,7 +120,7 @@ pub struct Inner {
     pub group_floor: HashMap<u32, Uuid>,
     pub sds_routes: HashMap<Uuid, SdsRoute>,
     pub digest_nonces: HashMap<String, Instant>,
-    pub auth_sessions: HashMap<String, (Instant, ClientMode, ConnVersion)>,
+    pub auth_sessions: HashMap<String, (Instant, ClientMode, ConnVersion, Option<String>)>,
 }
 
 impl Inner {
@@ -175,7 +180,7 @@ mod basestation_count_tests {
 
     fn client(mode: ClientMode) -> Client {
         let (tx, _rx) = mpsc::unbounded_channel();
-        Client { tx, mode, version: ConnVersion::default(), remote_addr: None, connected_at_ms: 0 }
+        Client { tx, mode, version: ConnVersion::default(), remote_addr: None, connected_at_ms: 0, username: None }
     }
 
     #[test]
@@ -220,6 +225,11 @@ pub struct AppState {
     /// `None` until then (and when SIP is disabled) so the dashboard can render
     /// an appropriate "disabled" state without panicking.
     pub sip: RwLock<Option<SipHandles>>,
+    /// Feeds decoded MS positions to the APRS-IS forwarder (`aprs::run`),
+    /// decoupled via a channel so a slow/down APRS-IS link never blocks call
+    /// or SDS routing. Sends are safely dropped if `aprs::run` was never
+    /// started or has exited.
+    pub aprs_tx: mpsc::UnboundedSender<crate::aprs::PositionReport>,
 }
 
 /// Runtime handles for the SIP subsystem, shared with the dashboard.
@@ -230,7 +240,9 @@ pub struct SipHandles {
 }
 
 impl AppState {
-    pub fn new(config: Config, config_path: std::path::PathBuf) -> Self {
+    /// Returns the new state plus the receiving half of `aprs_tx`, which the
+    /// caller must hand to `aprs::run` (the only consumer) exactly once.
+    pub fn new(config: Config, config_path: std::path::PathBuf) -> (Self, mpsc::UnboundedReceiver<crate::aprs::PositionReport>) {
         let store = if config.storage.enabled {
             match crate::store::Store::open(&config.storage.path) {
                 Ok(store) => Some(std::sync::Arc::new(store)),
@@ -250,15 +262,20 @@ impl AppState {
             Some(store) => TelemetryState::with_store(store.clone()),
             None => TelemetryState::default(),
         };
-        Self {
-            config,
-            config_path,
-            inner: RwLock::new(Inner::default()),
-            monitor,
-            telemetry: RwLock::new(telemetry),
-            control: RwLock::new(ControlState::default()),
-            sip: RwLock::new(None),
-        }
+        let (aprs_tx, aprs_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                config,
+                config_path,
+                inner: RwLock::new(Inner::default()),
+                monitor,
+                telemetry: RwLock::new(telemetry),
+                control: RwLock::new(ControlState::default()),
+                sip: RwLock::new(None),
+                aprs_tx,
+            },
+            aprs_rx,
+        )
     }
 
     /// Registers the SIP runtime handles once the SIP listener has bound. Called
@@ -313,7 +330,7 @@ impl AppState {
         let session_ttl = Duration::from_secs(self.config.auth.session_ttl_seconds.max(1));
         let mut inner = self.inner.write().await;
         inner.digest_nonces.retain(|_, at| now.duration_since(*at) < Duration::from_secs(120));
-        inner.auth_sessions.retain(|_, (at, _, _)| now.duration_since(*at) < session_ttl);
+        inner.auth_sessions.retain(|_, (at, _, _, _)| now.duration_since(*at) < session_ttl);
         inner.sds_routes.retain(|_, route| now.duration_since(route.created_at) < Duration::from_secs(60));
     }
 

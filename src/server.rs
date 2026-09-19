@@ -124,15 +124,15 @@ async fn brew_discovery(
 
     // Direct WS mode remains available only when Digest is disabled.
     if is_upgrade && !state.config.auth.enabled {
-        return upgrade_from_parts(state, &mut parts, mode, seed_version, remote_addr).await;
+        return upgrade_from_parts(state, &mut parts, mode, seed_version, remote_addr, None).await;
     }
 
     if state.config.auth.enabled {
-        if !verify_digest(&state, &parts.headers, "GET", &request_uri).await {
+        let Some(username) = verify_digest(&state, &parts.headers, "GET", &request_uri).await else {
             return digest_challenge(&state).await;
-        }
+        };
         let token = Uuid::new_v4().simple().to_string();
-        state.inner.write().await.auth_sessions.insert(token.clone(), (Instant::now(), mode, seed_version));
+        state.inner.write().await.auth_sessions.insert(token.clone(), (Instant::now(), mode, seed_version, Some(username)));
         let path = format!("{}/session/{}", normalized_path(&state.config.websocket_path), token);
         return (
             StatusCode::OK,
@@ -180,22 +180,22 @@ async fn brew_session_endpoint(
     if !is_upgrade { return StatusCode::BAD_REQUEST.into_response(); }
 
     // Session URLs are single-use. The established WebSocket is the authenticated
-    // session. Recover the mode and seed version captured during the
-    // authenticated discovery GET; the WebSocket handshake itself carries
-    // neither the X-Brew-Mode nor X-Brew-Version header.
-    let (mode, seed_version) = state.inner.write().await.auth_sessions.remove(&token)
-        .map(|(_, mode, ver)| (mode, ver))
+    // session. Recover the mode, seed version and authenticated username
+    // captured during the discovery GET; the WebSocket handshake itself
+    // carries neither the X-Brew-Mode/X-Brew-Version headers nor Authorization.
+    let (mode, seed_version, username) = state.inner.write().await.auth_sessions.remove(&token)
+        .map(|(_, mode, ver, user)| (mode, ver, user))
         .unwrap_or_default();
-    upgrade_from_parts(state, &mut parts, mode, seed_version, remote_addr).await
+    upgrade_from_parts(state, &mut parts, mode, seed_version, remote_addr, username).await
 }
 
-async fn upgrade_from_parts(state: Arc<AppState>, parts: &mut axum::http::request::Parts, mode: ClientMode, seed_version: ConnVersion, remote_addr: SocketAddr) -> Response {
+async fn upgrade_from_parts(state: Arc<AppState>, parts: &mut axum::http::request::Parts, mode: ClientMode, seed_version: ConnVersion, remote_addr: SocketAddr, username: Option<String>) -> Response {
     match WebSocketUpgrade::from_request_parts(parts, &state).await {
         Ok(ws) => {
             let requested = parts.headers.get(header::SEC_WEBSOCKET_PROTOCOL).and_then(|v| v.to_str().ok()).unwrap_or_default();
             debug!(requested_subprotocol=requested, mode=mode.as_str(), seed_version=seed_version.as_u8(), "WebSocket upgrade request");
             let protocol = state.config.websocket_subprotocol.clone();
-            ws.protocols([protocol]).on_upgrade(move |socket| client_session(state, socket, mode, seed_version, remote_addr)).into_response()
+            ws.protocols([protocol]).on_upgrade(move |socket| client_session(state, socket, mode, seed_version, remote_addr, username)).into_response()
         }
         Err(rejection) => rejection.into_response(),
     }
@@ -238,23 +238,26 @@ fn is_valid_brew_username(username: &str) -> bool {
         && username.bytes().all(|b| b.is_ascii_digit())
 }
 
-async fn verify_digest(state: &Arc<AppState>, headers: &HeaderMap, method: &str, expected_uri: &str) -> bool {
-    let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else { return false; };
-    if !value.starts_with("Digest ") { return false; }
+/// Verifies a Digest `Authorization` header and, on success, returns the
+/// authenticated Brew username -- the caller threads it through so the
+/// connection's `Client.username` can be matched against `[bts_locations]`.
+async fn verify_digest(state: &Arc<AppState>, headers: &HeaderMap, method: &str, expected_uri: &str) -> Option<String> {
+    let value = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())?;
+    if !value.starts_with("Digest ") { return None; }
     let p = parse_digest(value);
-    let Some(username) = p.get("username") else { return false; };
+    let username = p.get("username")?;
     if !is_valid_brew_username(username) {
         warn!(username = %username, "rejecting Brew auth: username must be 1-7 digits");
-        return false;
+        return None;
     }
-    let Some(password) = state.config.auth.users.get(username) else { return false; };
-    let Some(nonce) = p.get("nonce") else { return false; };
-    if !state.inner.read().await.digest_nonces.contains_key(nonce) { return false; }
+    let password = state.config.auth.users.get(username)?;
+    let nonce = p.get("nonce")?;
+    if !state.inner.read().await.digest_nonces.contains_key(nonce) { return None; }
     let realm = p.get("realm").map(String::as_str).unwrap_or("");
-    if realm != state.config.auth.realm { return false; }
+    if realm != state.config.auth.realm { return None; }
     let uri = p.get("uri").map(String::as_str).unwrap_or("");
-    if uri != expected_uri { return false; }
-    let Some(received) = p.get("response") else { return false; };
+    if uri != expected_uri { return None; }
+    let received = p.get("response")?;
 
     let ha1 = md5_hex(&format!("{}:{}:{}", username, realm, password));
     let ha2 = md5_hex(&format!("{}:{}", method, uri));
@@ -266,17 +269,18 @@ async fn verify_digest(state: &Arc<AppState>, headers: &HeaderMap, method: &str,
         md5_hex(&format!("{}:{}:{}", ha1, nonce, ha2))
     };
     let ok = expected.eq_ignore_ascii_case(received);
-    if ok { state.inner.write().await.digest_nonces.remove(nonce); }
-    ok
+    if !ok { return None; }
+    state.inner.write().await.digest_nonces.remove(nonce);
+    Some(username.clone())
 }
 
-async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMode, seed_version: ConnVersion, remote_addr: SocketAddr) {
+async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMode, seed_version: ConnVersion, remote_addr: SocketAddr, username: Option<String>) {
     let id = Uuid::new_v4();
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let connected_at_ms = crate::telemetry::now_ms();
-    state.inner.write().await.clients.insert(id, Client { tx: tx.clone(), mode, version: seed_version, remote_addr: Some(remote_addr), connected_at_ms });
-    info!(%id, mode=mode.as_str(), version=seed_version.as_u8(), %remote_addr, "Basestation connected");
+    state.inner.write().await.clients.insert(id, Client { tx: tx.clone(), mode, version: seed_version, remote_addr: Some(remote_addr), connected_at_ms, username: username.clone() });
+    info!(%id, mode=mode.as_str(), version=seed_version.as_u8(), %remote_addr, username=username.as_deref().unwrap_or(""), "Basestation connected");
     if mode == ClientMode::Peer {
         // Inbound federation peer link: `federation::run`'s outbound dial
         // side syncs its own state to us once connected, but that is only

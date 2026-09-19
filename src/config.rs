@@ -27,6 +27,30 @@ pub struct Config {
     pub storage: StorageConfig,
     pub sip: SipConfig,
     pub federation: FederationConfig,
+    pub aprs: AprsConfig,
+    /// Fixed geographic locations for Basestations, keyed by the same numeric
+    /// Brew username each one authenticates with under `[auth.users]` -- so a
+    /// location entry automatically matches whichever connection actually
+    /// logs in as that Basestation, no separate ID scheme needed. Purely
+    /// informational (dashboard map markers); has no effect on routing.
+    pub bts_locations: HashMap<String, BtsLocationConfig>,
+}
+
+/// One Basestation's fixed location, for the dashboard MS map. Keyed by Brew
+/// username (see `Config::bts_locations`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BtsLocationConfig {
+    /// Operator-facing label shown on the map marker/popup.
+    pub name: String,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+impl Default for BtsLocationConfig {
+    fn default() -> Self {
+        Self { name: String::new(), lat: 0.0, lon: 0.0 }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,6 +456,60 @@ impl Default for Config {
             storage: StorageConfig::default(),
             sip: SipConfig::default(),
             federation: FederationConfig::default(),
+            aprs: AprsConfig::default(),
+            bts_locations: HashMap::new(),
+        }
+    }
+}
+
+/// Settings for forwarding decoded mobile-station LIP positions to APRS-IS as
+/// APRS object reports, one object per ISSI, all sent under this server's own
+/// login -- the same technique real DMR/D-STAR-to-APRS gateways use to relay
+/// many radios' positions through a single APRS-IS connection, rather than
+/// needing a distinct callsign/passcode per mobile station.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AprsConfig {
+    pub enabled: bool,
+    /// APRS-IS server, `host:port` (e.g. `rotate.aprs2.net:14580`).
+    pub server: String,
+    /// This gateway's own APRS-IS login callsign (with SSID if desired, e.g.
+    /// `MYCALL-10`).
+    pub callsign: String,
+    /// This callsign's APRS-IS passcode. Not derivable here -- obtain it the
+    /// same way any APRS client does (it is tied to the callsign).
+    pub passcode: String,
+    /// APRS symbol table identifier and symbol code for reported objects.
+    /// Defaults to the primary table's jeep icon, a reasonable generic mobile
+    /// marker; override to taste (e.g. `/>` for a car).
+    pub symbol_table: char,
+    pub symbol_code: char,
+    /// Free-text appended to every object report (e.g. "TETRA MS").
+    pub comment: String,
+    /// Prefix used to build each object's 9-character APRS object name from
+    /// its ISSI (`"{prefix}{issi}"`, truncated/padded to 9 chars). Keep short
+    /// so the ISSI digits still fit.
+    pub object_name_prefix: String,
+    /// Minimum seconds between two object reports for the same ISSI, so a
+    /// noisy beacon source cannot flood APRS-IS. 0 disables rate limiting.
+    pub min_report_interval_seconds: u64,
+    /// Seconds between reconnect attempts after a dropped/failed APRS-IS link.
+    pub reconnect_interval_seconds: u64,
+}
+
+impl Default for AprsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server: "rotate.aprs2.net:14580".into(),
+            callsign: String::new(),
+            passcode: String::new(),
+            symbol_table: '/',
+            symbol_code: 'j',
+            comment: "TETRA MS via brew-server".into(),
+            object_name_prefix: "MS".into(),
+            min_report_interval_seconds: 60,
+            reconnect_interval_seconds: 15,
         }
     }
 }
@@ -518,9 +596,18 @@ mod tests {
             from: Some(RouteEndpoint::BrewPrivate { issi: 42 }),
             enabled: true,
         });
+        cfg.bts_locations.insert("1000001".into(), BtsLocationConfig {
+            name: "Athens BTS".into(),
+            lat: 37.9917,
+            lon: 23.7640,
+        });
 
         let text = cfg.to_toml_pretty().expect("serialize");
         let parsed = Config::parse(&text).expect("re-parse");
+        let athens = &parsed.bts_locations["1000001"];
+        assert_eq!(athens.name, "Athens BTS");
+        assert!((athens.lat - 37.9917).abs() < 1e-9);
+        assert!((athens.lon - 23.7640).abs() < 1e-9);
 
         assert_eq!(parsed.sip.enabled, true);
         assert_eq!(parsed.sip.extensions["1001"].issi, 42);
