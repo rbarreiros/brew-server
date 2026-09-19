@@ -4,6 +4,22 @@ Experimental Rust Brew core for linking two or more MidnightBlue Basestation TET
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 1.3 adds:
+
+- **Basestation locations on the MS map.** New `[bts_locations]` config,
+  keyed by the same numeric Brew username each Basestation authenticates
+  with under `[auth.users]` -- so an entry automatically matches whichever
+  live connection logs in as that identity, with no separate ID scheme.
+  Each entry (`name`, `lat`, `lon`) is editable from the `/settings`
+  dashboard page (or the raw-TOML editor) and shown as its own marker on
+  `/map` (new `/api/bts-locations`, merging the fixed config location with
+  live connection state), with a popup showing the Basestation's name,
+  coordinates, live IP address and connect status. Threading the
+  authenticated username through to the connection required carrying it from
+  Digest verification (`server::verify_digest`) through the auth-session
+  handshake to `Client.username`, which previously only tracked the
+  connection's mode/version/remote address.
+
 Version 1.2 adds:
 
 - **APRS forwarding for mobile-station LIP positions.** New `[aprs]` config
@@ -650,6 +666,27 @@ indefinitely. Stick to a tree.
 peers. Basestation telemetry (RF/DSP health, per-station registration lists)
 is not relayed across federation links in this version -- each server's
 dashboard only shows telemetry for Basestations connected directly to it.
+
+## Basestation locations
+
+`[bts_locations]` gives each Basestation a fixed marker on the `/map`
+dashboard page, distinct from the mobile-station position markers that come
+from decoded LIP beacons:
+
+```toml
+[bts_locations."1000001"]
+name = "Athens HQ"
+lat = 37.9917
+lon = 23.7640
+```
+
+The table key is the numeric Brew username that Basestation authenticates
+with under `[auth.users]` (same 1-7 digit rule) -- whichever live connection
+logs in as that identity is matched automatically, no separate station ID
+needed. `/api/bts-locations` merges the fixed `name`/`lat`/`lon` with live
+connection state (IP address, connected/offline), and the map popup shows
+all of it. Manage entries from the `/settings` page's "Basestation
+Locations" panel, or directly in the raw TOML.
 
 ## APRS
 

@@ -204,3 +204,12 @@ comment = "TETRA MS via brew-server"
 object_name_prefix = "MS"
 min_report_interval_seconds = 60
 reconnect_interval_seconds = 15
+
+# Basestation locations shown as their own markers on the /map dashboard page.
+# Keyed by the same numeric Brew username the Basestation authenticates with
+# above under [auth.users] -- whichever live connection logs in as that
+# identity is matched automatically. See README.md "Basestation locations".
+[bts_locations."1000001"]
+name = "Athens HQ"
+lat = 37.9917
+lon = 23.7640

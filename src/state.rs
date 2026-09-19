@@ -64,6 +64,11 @@ pub struct Client {
     /// When this connection was accepted, for the dashboard's live
     /// connections page.
     pub connected_at_ms: u64,
+    /// The Brew digest username this connection authenticated as, when
+    /// `[auth]` is enabled (`None` otherwise, or for the SIP bridge's virtual
+    /// clients). Used to match a live connection to its `[bts_locations]`
+    /// entry on the dashboard map.
+    pub username: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,7 +120,7 @@ pub struct Inner {
     pub group_floor: HashMap<u32, Uuid>,
     pub sds_routes: HashMap<Uuid, SdsRoute>,
     pub digest_nonces: HashMap<String, Instant>,
-    pub auth_sessions: HashMap<String, (Instant, ClientMode, ConnVersion)>,
+    pub auth_sessions: HashMap<String, (Instant, ClientMode, ConnVersion, Option<String>)>,
 }
 
 impl Inner {
@@ -175,7 +180,7 @@ mod basestation_count_tests {
 
     fn client(mode: ClientMode) -> Client {
         let (tx, _rx) = mpsc::unbounded_channel();
-        Client { tx, mode, version: ConnVersion::default(), remote_addr: None, connected_at_ms: 0 }
+        Client { tx, mode, version: ConnVersion::default(), remote_addr: None, connected_at_ms: 0, username: None }
     }
 
     #[test]
@@ -325,7 +330,7 @@ impl AppState {
         let session_ttl = Duration::from_secs(self.config.auth.session_ttl_seconds.max(1));
         let mut inner = self.inner.write().await;
         inner.digest_nonces.retain(|_, at| now.duration_since(*at) < Duration::from_secs(120));
-        inner.auth_sessions.retain(|_, (at, _, _)| now.duration_since(*at) < session_ttl);
+        inner.auth_sessions.retain(|_, (at, _, _, _)| now.duration_since(*at) < session_ttl);
         inner.sds_routes.retain(|_, route| now.duration_since(route.created_at) < Duration::from_secs(60));
     }
 

@@ -28,6 +28,29 @@ pub struct Config {
     pub sip: SipConfig,
     pub federation: FederationConfig,
     pub aprs: AprsConfig,
+    /// Fixed geographic locations for Basestations, keyed by the same numeric
+    /// Brew username each one authenticates with under `[auth.users]` -- so a
+    /// location entry automatically matches whichever connection actually
+    /// logs in as that Basestation, no separate ID scheme needed. Purely
+    /// informational (dashboard map markers); has no effect on routing.
+    pub bts_locations: HashMap<String, BtsLocationConfig>,
+}
+
+/// One Basestation's fixed location, for the dashboard MS map. Keyed by Brew
+/// username (see `Config::bts_locations`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BtsLocationConfig {
+    /// Operator-facing label shown on the map marker/popup.
+    pub name: String,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+impl Default for BtsLocationConfig {
+    fn default() -> Self {
+        Self { name: String::new(), lat: 0.0, lon: 0.0 }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -434,6 +457,7 @@ impl Default for Config {
             sip: SipConfig::default(),
             federation: FederationConfig::default(),
             aprs: AprsConfig::default(),
+            bts_locations: HashMap::new(),
         }
     }
 }
@@ -572,9 +596,18 @@ mod tests {
             from: Some(RouteEndpoint::BrewPrivate { issi: 42 }),
             enabled: true,
         });
+        cfg.bts_locations.insert("1000001".into(), BtsLocationConfig {
+            name: "Athens BTS".into(),
+            lat: 37.9917,
+            lon: 23.7640,
+        });
 
         let text = cfg.to_toml_pretty().expect("serialize");
         let parsed = Config::parse(&text).expect("re-parse");
+        let athens = &parsed.bts_locations["1000001"];
+        assert_eq!(athens.name, "Athens BTS");
+        assert!((athens.lat - 37.9917).abs() < 1e-9);
+        assert!((athens.lon - 23.7640).abs() < 1e-9);
 
         assert_eq!(parsed.sip.enabled, true);
         assert_eq!(parsed.sip.extensions["1001"].issi, 42);
