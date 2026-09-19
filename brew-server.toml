@@ -188,3 +188,19 @@ username = "9000001"
 password = "change-me-federation"
 reconnect_interval_seconds = 15
 enabled = true
+
+# APRS: forwards decoded mobile-station LIP positions (the same fixes plotted
+# on the dashboard's /map) to APRS-IS. Off by default -- set callsign/passcode
+# (this server's own APRS-IS login, not a per-radio credential) before
+# enabling. See README.md "APRS".
+[aprs]
+enabled = false
+server = "rotate.aprs2.net:14580"
+callsign = ""
+passcode = ""
+symbol_table = "/"
+symbol_code = "j"
+comment = "TETRA MS via brew-server"
+object_name_prefix = "MS"
+min_report_interval_seconds = 60
+reconnect_interval_seconds = 15
