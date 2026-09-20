@@ -1,6 +1,6 @@
 # brew-server
 
-Experimental Rust Brew core for linking two or more MidnightBlue Basestation TETRA base stations.
+Experimental Rust Brew core for linking two or more MidnightBlue Basestation or Flowstation TETRA base stations.
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
