@@ -5,7 +5,7 @@ Experimental Rust Brew core for linking two or more MidnightBlue Basestation TET
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
 - **What's new:** see [CHANGELOG.md](CHANGELOG.md)
-- **Configuration and feature docs:** see the [wiki](docs/wiki/Home.md)
+- **Configuration and feature docs:** see the [wiki](https://github.com/ysamouhos/brew-server/wiki)
 
 ## Run directly
 
