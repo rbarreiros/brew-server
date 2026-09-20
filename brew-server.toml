@@ -27,7 +27,7 @@ session_ttl_seconds = 300
 "1000002" = "change-me-bs2"
 
 # Optional: Basestation's outbound Telemetry channel (BTS -> this server).
-# Off by default. See README.md "Basestation Telemetry" for details.
+# Off by default. See docs/wiki/Basestation-Telemetry.md for details.
 [telemetry]
 enabled = true
 listen = "0.0.0.0:9001"
@@ -42,8 +42,8 @@ cert_path = "/etc/ssl/brew/server.crt"
 key_path = "/etc/ssl/brew/server.key"
 
 # Optional: Basestation's inbound Control channel (BTS -> this server, commands
-# pushed back down the same connection). Off by default. See README.md
-# "Basestation Control" for details.
+# pushed back down the same connection). Off by default. See
+# docs/wiki/Basestation-Control.md for details.
 [control]
 enabled = true
 listen = "0.0.0.0:9002"
@@ -59,7 +59,7 @@ key_path = "/etc/ssl/brew/server.key"
 
 # Monitoring dashboard. Now on its OWN listener/port, separate from the Brew
 # API. Enabled by default. Set [dashboard.users] to require HTTP Basic auth
-# (empty = open). See README.md "Web monitoring dashboard".
+# (empty = open). See docs/wiki/Dashboard.md.
 [dashboard]
 enabled = true
 listen = "0.0.0.0:9003"
@@ -84,7 +84,7 @@ path = "brew-history.bin"
 # SIP / VoIP subsystem. Off by default. When enabled it binds a UDP SIP
 # listener that terminates SIP extensions (user/pass registrations) and SIP
 # trunks (peer gateways such as Asterisk), and bridges calls to the Brew/TETRA
-# side via the voice routes below. See README.md "SIP / VoIP".
+# side via the voice routes below. See docs/wiki/SIP-VoIP.md.
 [sip]
 enabled = false
 listen = "0.0.0.0:5060"
@@ -192,7 +192,7 @@ enabled = true
 # APRS: forwards decoded mobile-station LIP positions (the same fixes plotted
 # on the dashboard's /map) to APRS-IS. Off by default -- set callsign/passcode
 # (this server's own APRS-IS login, not a per-radio credential) before
-# enabling. See README.md "APRS".
+# enabling. See docs/wiki/APRS.md.
 [aprs]
 enabled = false
 server = "rotate.aprs2.net:14580"
@@ -208,7 +208,7 @@ reconnect_interval_seconds = 15
 # Basestation locations shown as their own markers on the /map dashboard page.
 # Keyed by the same numeric Brew username the Basestation authenticates with
 # above under [auth.users] -- whichever live connection logs in as that
-# identity is matched automatically. See README.md "Basestation locations".
+# identity is matched automatically. See docs/wiki/Basestation-Locations.md.
 [bts_locations."1000001"]
 name = "Athens HQ"
 lat = 37.9917

@@ -1,0 +1,3 @@
+# Important compatibility note
+
+The current Basestation source defines private/simplex state constants, but its Brew parser keeps most of those payloads as raw bytes and its worker currently exposes group voice/SDS commands rather than private-call commands. As of v0.6 this server parses private `SETUP_REQUEST`/`CONNECT_REQUEST` payloads into a structured `BrewCircularCall` (source ISSI, destination ISSI, dialled number, priority, and the v1 `mnemonic`), and routes subsequent control/traffic packets by UUID. For any peer whose payload cannot be fully structured it falls back to the earlier conservative behaviour: the first two little-endian `u32` values are interpreted as source and destination ISSI. Validate this against captures/specification before production use.
