@@ -4,6 +4,100 @@ Experimental Rust Brew core for linking two or more MidnightBlue Basestation TET
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 1.7 adds:
+
+- **Fixed the actual root cause of garbled/choppy/silent SIP<->Brew audio:
+  wrong `FRAME_TRAFFIC_CHANNEL` wire format.** This server always sent (and
+  parsed) one raw 18-byte ACELP subframe per Brew voice message, no header.
+  A real Basestation doesn't speak that: confirmed against FlowStation's
+  `net_brew::entity::handle_voice_frame`/`handle_ul_voice`, every
+  `FRAME_TRAFFIC_CHANNEL` payload is 36 bytes -- 1 "STE" header byte (`0x00`
+  = normal speech) followed by 35 bytes packing *two* 137-bit ACELP
+  subframes (60ms) back-to-back, MSB-first, with a single 6-bit pad at the
+  very end (not two independently 7-bit-padded subframes concatenated). A
+  real Basestation silently discards anything shorter
+  (`data.len() < 36 -> drop with a warning, never reaching the radio`),
+  which is exactly why PSTN->ISSI audio counted as sent by this server's own
+  metrics (added in the diagnostics below) but was never heard: every frame
+  was rejected on arrival. In the other direction, a real Basestation's
+  genuine 36-byte STE frames were misread as one corrupt 18-byte subframe
+  each (missing the header-byte offset and losing more than half the real
+  bits) -- garbled audio, and undercounted at exactly half the true 33.3
+  frames/sec speech rate, matching the "choppy" symptom precisely. New
+  `protocol::pack_ste_voice_payload`/`unpack_ste_voice_payload` do the exact
+  bit-level (re)packing FlowStation's own encoder/decoder use;
+  `build_traffic_frame` now takes two subframes and produces a real 36-byte
+  STE payload; `transcode::task`'s ACELP-side ticker moved from 30ms/1
+  subframe to 60ms/2 subframes to match.
+- **Transcoder diagnostics.** `transcode::task` now logs a per-call summary
+  every 5 seconds at the default log level: `rtp_in`/`rtp_out` (the SIP/PSTN
+  leg), `acelp_in`/`acelp_out` (the Brew/ISSI leg), an `*_underflow` count
+  for each (a paced tick that fired with too little buffered audio to emit --
+  starvation, not corruption), and the current buffered-sample depth on each
+  side. This is what surfaced the wire-format bug above: PSTN->ISSI counters
+  looked perfectly healthy (frames generated and queued continuously, zero
+  underflow) even though the user heard nothing, proving the fault was past
+  this task's own output, not within it -- and the ISSI->PSTN counters
+  showing exactly half the expected frame rate pointed straight at a framing
+  mismatch rather than packet loss.
+
+Version 1.6 adds:
+
+- **Transcoder diagnostics.** `transcode::task` now logs a per-call summary
+  every 5 seconds at the default log level: `rtp_in`/`rtp_out` (the SIP/PSTN
+  leg), `acelp_in`/`acelp_out` (the Brew/ISSI leg), an `*_underflow` count
+  for each (a paced tick that fired with too little buffered audio to emit --
+  starvation, not corruption), and the current buffered-sample depth on each
+  side. The 1.5 pacing fix resolved a confirmed RTP-timing bug, but garbled/
+  choppy/silent audio reports persisted after it -- these counters exist to
+  tell the next report apart at a glance: packet loss upstream (`*_in` stops
+  incrementing), this task's own buffer starving (rising `*_underflow` with
+  low buffered-sample counts), or a healthy transcoder feeding into a problem
+  further down the pipeline (both directions' counts look normal).
+
+Version 1.5 adds:
+
+- **Fixed bursty/unpaced transcoder output: the real cause of garbled and
+  missing SIP<->Brew audio.** Diagnosed from a live production `tcpdump`
+  capture: outbound RTP packets frequently went out in ~60us-apart pairs
+  instead of a steady 20ms cadence, even though inbound audio arrived cleanly
+  paced. Root cause: `transcode::task::spawn`'s pump decoded and immediately
+  emitted output the instant a buffer crossed a full frame's worth of
+  samples, draining it to completion in a `while` loop with no real-time
+  gap between iterations. ACELP's 240-sample/30ms frame and RTP's
+  160-sample/20ms packet share no common multiple shorter than 480 samples,
+  so roughly every third RTP packet (or every other ACELP frame) completed
+  *two* output units back-to-back. G.711/SIP jitter buffers mostly tolerate
+  that; a real TETRA Basestation's downlink traffic channel is locked to a
+  rigid TDMA slot schedule and does not -- frames delivered off that cadence
+  are dropped or garbled on the radio side. Decoding (on arrival, still
+  event-driven/bursty as the network delivers it) is now fully decoupled
+  from emission (on two dedicated tickers, a 20ms one for RTP and a 30ms one
+  for ACELP, each emitting at most one unit per tick regardless of how much
+  piled up in between) via the existing sample buffers acting as a proper
+  jitter absorber between the two paced clocks.
+
+Version 1.4 adds:
+
+- **Fixed the persistent SIP<->Brew one-way/garbled audio: advertised host
+  was literally "0.0.0.0".** With the common default config
+  (`sip.listen = "0.0.0.0:PORT"`, `sip.advertised_host` unset), the fallback
+  used `local.ip()` from the bound socket's own address -- which for a
+  wildcard bind is literally the string `"0.0.0.0"`, not a real interface
+  address. Every SDP body this server generated (both its own outbound
+  INVITE offers and its answers to inbound INVITEs) therefore advertised
+  `c=IN IP4 0.0.0.0`/`o=... IN IP4 0.0.0.0`: unroutable, and some SIP stacks
+  read `c=0.0.0.0` as RFC 3264 5.1's "this stream is on hold" and never send
+  media there at all -- explaining reports of one whole call direction
+  (PSTN->ISSI) being totally silent while the other (ISSI->PSTN) limped
+  along on symmetric-RTP latching alone. `sip::transport::run` now detects a
+  real outbound-facing local IP (via a UDP "connect" to a public address --
+  no packet is sent, it just asks the OS routing table which local
+  interface/IP would be used) whenever the bind address is unspecified,
+  instead of ever advertising the wildcard. Set `sip.advertised_host`
+  explicitly (still the most reliable option, especially behind NAT) to skip
+  this detection entirely.
+
 Version 1.3 adds:
 
 - **Basestation locations on the MS map.** New `[bts_locations]` config,

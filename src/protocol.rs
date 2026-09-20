@@ -530,12 +530,98 @@ pub fn raw_peer_pair(payload: &CallPayload) -> Option<(u32, u32)> {
 }
 
 /// Bit count of one ACELP-coded TETRA speech frame (30ms @ 8kHz), per
-/// ETSI EN 300 395-2. Packed big-endian-bit into `ACELP_CODED_FRAME_BYTES`.
+/// ETSI EN 300 395-2. This is the codec's own native unit (what
+/// `transcode::acelp` encodes/decodes one call at a time), packed
+/// big-endian-bit into `ACELP_CODED_FRAME_BYTES` with trailing zero padding
+/// -- NOT the on-wire `FRAME_TRAFFIC_CHANNEL` unit, see
+/// `build_traffic_frame`.
 pub const ACELP_CODED_FRAME_BITS: u16 = 137;
 /// `ceil(ACELP_CODED_FRAME_BITS / 8)`.
 pub const ACELP_CODED_FRAME_BYTES: usize = 18;
 /// PCM samples per ACELP frame (30ms @ 8kHz).
 pub const ACELP_PCM_SAMPLES: usize = 240;
+
+/// One `FRAME_TRAFFIC_CHANNEL` payload carries TWO ACELP-coded subframes
+/// (60ms of speech), not one: TETRA's TCH/S burst structure interleaves a
+/// pair of 137-bit coded frames per over-the-air delivery, and every real
+/// Basestation (confirmed against FlowStation's `net_brew::entity`
+/// `handle_voice_frame`/`handle_ul_voice`, which calls this the "STE"
+/// format) sends and expects that same pairing on the Brew wire: 1 header
+/// byte (0x00 = normal speech) followed by 35 bytes packing the two
+/// subframes' 274 bits back-to-back, MSB-first, with the packed *pair*
+/// treated as one unit -- not two independently-padded 18-byte codec
+/// blocks concatenated (which would leave 7 wasted padding bits after each
+/// subframe instead of 6 at the very end). Sending single-subframe
+/// 18-byte-payload frames (this server's original, wrong assumption) gets
+/// silently discarded by a real Basestation (`data.len() < 36` -> dropped
+/// with a warning, never reaching the radio) and receiving them the same
+/// way misreads a real Basestation's paired frames as one corrupt subframe
+/// per message -- garbled audio at exactly half the real frame rate.
+pub const STE_VOICE_PAYLOAD_BYTES: usize = 36;
+const STE_VOICE_PACKED_BYTES: usize = STE_VOICE_PAYLOAD_BYTES - 1; // 35: the two subframes' 274 bits
+const STE_VOICE_TOTAL_BITS: usize = 2 * ACELP_CODED_FRAME_BITS as usize; // 274
+
+/// Unpacks the first `n_bits` MSB-first bits of `packed` into one bit (0/1)
+/// per output byte -- the inverse of `pack_bits_msb`.
+fn unpack_bits_msb(packed: &[u8], n_bits: usize) -> Vec<u8> {
+    (0..n_bits).map(|i| (packed[i / 8] >> (7 - i % 8)) & 1).collect()
+}
+
+/// Packs `bits` (one bit, 0 or nonzero, per input byte) MSB-first into
+/// bytes, zero-padding the trailing partial byte -- the inverse of
+/// `unpack_bits_msb`.
+fn pack_bits_msb(bits: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; bits.len().div_ceil(8)];
+    for (i, &b) in bits.iter().enumerate() {
+        if b != 0 {
+            out[i / 8] |= 1 << (7 - i % 8);
+        }
+    }
+    out
+}
+
+/// Packs two codec-native 18-byte ACELP subframes into one 36-byte STE Brew
+/// voice-frame payload (see `STE_VOICE_PAYLOAD_BYTES`): strips each
+/// subframe's own 7 trailing pad bits, concatenates the two 137-bit
+/// payloads back-to-back, and repacks that combined 274-bit stream with a
+/// single 6-bit pad at the very end, prefixed by the STE header byte
+/// (`0x00`, "normal speech frame" -- the only value FlowStation's own
+/// encoder ever sends).
+pub fn pack_ste_voice_payload(
+    sub1: &[u8; ACELP_CODED_FRAME_BYTES],
+    sub2: &[u8; ACELP_CODED_FRAME_BYTES],
+) -> [u8; STE_VOICE_PAYLOAD_BYTES] {
+    let bits_per_subframe = ACELP_CODED_FRAME_BITS as usize;
+    let mut bits = Vec::with_capacity(STE_VOICE_TOTAL_BITS);
+    bits.extend_from_slice(&unpack_bits_msb(sub1, bits_per_subframe));
+    bits.extend_from_slice(&unpack_bits_msb(sub2, bits_per_subframe));
+    let packed = pack_bits_msb(&bits);
+    let mut out = [0u8; STE_VOICE_PAYLOAD_BYTES];
+    out[0] = 0x00; // STE header: normal speech frame
+    out[1..].copy_from_slice(&packed);
+    out
+}
+
+/// Inverse of `pack_ste_voice_payload`: unpacks a 36-byte STE payload back
+/// into the two subframes in the codec's own native (individually
+/// 7-bit-padded) 18-byte representation, ready for `AcelpDecoder::decode`.
+/// The STE header byte (`payload[0]`) is not inspected here -- this server
+/// has no use for the (vendor-specific) control bits it might carry beyond
+/// "normal speech frame", the only value ever observed on real traffic.
+pub fn unpack_ste_voice_payload(
+    payload: &[u8; STE_VOICE_PAYLOAD_BYTES],
+) -> ([u8; ACELP_CODED_FRAME_BYTES], [u8; ACELP_CODED_FRAME_BYTES]) {
+    let bits_per_subframe = ACELP_CODED_FRAME_BITS as usize;
+    let packed: &[u8; STE_VOICE_PACKED_BYTES] = payload[1..].try_into().expect("payload is STE_VOICE_PAYLOAD_BYTES");
+    let bits = unpack_bits_msb(packed, STE_VOICE_TOTAL_BITS);
+    let sub1 = pack_bits_msb(&bits[..bits_per_subframe]);
+    let sub2 = pack_bits_msb(&bits[bits_per_subframe..]);
+    let mut out1 = [0u8; ACELP_CODED_FRAME_BYTES];
+    let mut out2 = [0u8; ACELP_CODED_FRAME_BYTES];
+    out1[..sub1.len()].copy_from_slice(&sub1);
+    out2[..sub2.len()].copy_from_slice(&sub2);
+    (out1, out2)
+}
 
 /// Builds a server-originated `CALL_SETUP_REQUEST` toward a registered Brew
 /// subscriber, used to originate a call from the SIP side (there is no Brew
@@ -598,14 +684,26 @@ pub fn build_group_tx(id: &Uuid, source: u32, destination: u32, priority: u8) ->
     out
 }
 
-/// Builds a `FRAME_TRAFFIC_CHANNEL` carrying one ACELP-coded speech frame.
-pub fn build_traffic_frame(id: &Uuid, coded: &[u8; ACELP_CODED_FRAME_BYTES]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(20 + ACELP_CODED_FRAME_BYTES);
+/// Builds a `FRAME_TRAFFIC_CHANNEL` carrying two ACELP-coded speech
+/// subframes (60ms), STE-packed exactly as a real Basestation sends/expects
+/// -- see `STE_VOICE_PAYLOAD_BYTES`'s doc comment for why this is two
+/// subframes and not one.
+pub fn build_traffic_frame(
+    id: &Uuid,
+    sub1: &[u8; ACELP_CODED_FRAME_BYTES],
+    sub2: &[u8; ACELP_CODED_FRAME_BYTES],
+) -> Vec<u8> {
+    let payload = pack_ste_voice_payload(sub1, sub2);
+    let mut out = Vec::with_capacity(20 + STE_VOICE_PAYLOAD_BYTES);
     out.push(CLASS_FRAME);
     out.push(FRAME_TRAFFIC_CHANNEL);
     out.extend_from_slice(id.as_bytes());
-    out.extend_from_slice(&ACELP_CODED_FRAME_BITS.to_le_bytes());
-    out.extend_from_slice(coded);
+    // Matches FlowStation's own convention (`length_bits: ste_data.len() * 8`):
+    // the STE payload's total bit length including its header byte, not the
+    // 274 bits of actual codec content within it. Receivers (including this
+    // server's own) don't currently act on this field either way.
+    out.extend_from_slice(&((STE_VOICE_PAYLOAD_BYTES * 8) as u16).to_le_bytes());
+    out.extend_from_slice(&payload);
     out
 }
 
@@ -909,5 +1007,70 @@ mod tests {
         let CallPayload::CircularCall(c) = cc.payload else { panic!() };
         assert_eq!(c.source, 5001);
         assert_eq!(c.mnemonic, None);
+    }
+
+    /// Pins the real production bug: this server used to send/expect a
+    /// FRAME_TRAFFIC_CHANNEL payload of one raw 18-byte ACELP subframe, no
+    /// STE header. A real Basestation (confirmed against FlowStation's
+    /// `net_brew::entity::handle_voice_frame`) requires 36 bytes -- 1 STE
+    /// header byte + 35 bytes packing TWO subframes' 274 bits back-to-back
+    /// -- and silently discards anything shorter. `build_traffic_frame` must
+    /// produce exactly that shape.
+    #[test]
+    fn build_traffic_frame_produces_36_byte_ste_payload() {
+        let id = Uuid::new_v4();
+        let sub1 = [0xFFu8; ACELP_CODED_FRAME_BYTES];
+        let sub2 = [0x00u8; ACELP_CODED_FRAME_BYTES];
+        let wire = build_traffic_frame(&id, &sub1, &sub2);
+        assert_eq!(wire.len(), 20 + STE_VOICE_PAYLOAD_BYTES, "20-byte header + 36-byte STE payload");
+        assert_eq!(wire[0], CLASS_FRAME);
+        assert_eq!(wire[1], FRAME_TRAFFIC_CHANNEL);
+        assert_eq!(&wire[2..18], id.as_bytes());
+        let length_bits = u16::from_le_bytes([wire[18], wire[19]]);
+        assert_eq!(length_bits, (STE_VOICE_PAYLOAD_BYTES * 8) as u16, "matches FlowStation's own convention (total STE bytes * 8)");
+        assert_eq!(wire[20], 0x00, "STE header byte: normal speech frame");
+    }
+
+    /// Bit-exact cross-check against FlowStation's own packing
+    /// (`handle_ul_voice`'s "Pack 274 bits (1-per-byte) into 35 bytes ...
+    /// MSB first" branch): two subframes, all-ones then all-zeros, must
+    /// leave the first ~17 wire bytes solid 0xFF, a bit boundary in the
+    /// middle byte, then solid 0x00 -- not two independently 7-bit-padded
+    /// 18-byte blocks concatenated (which would show a 0-bit gap after byte
+    /// 16's 5 low bits instead of a clean split exactly at bit 137).
+    #[test]
+    fn pack_ste_voice_payload_has_no_gap_between_subframes() {
+        let sub1 = [0xFFu8; ACELP_CODED_FRAME_BYTES]; // 144 bits, all 1
+        let sub2 = [0x00u8; ACELP_CODED_FRAME_BYTES]; // 144 bits, all 0
+        let payload = pack_ste_voice_payload(&sub1, &sub2);
+        // Bits 0..137 are subframe 1's 137 real bits (all 1): bytes 1..=17
+        // (payload indices, i.e. wire bytes 1..18) are solid 0xFF, and byte
+        // 18 holds bits 136 (subframe 1's last real bit) down through the
+        // start of subframe 2 (all 0) -- so only its top bit is set.
+        for b in &payload[1..18] {
+            assert_eq!(*b, 0xFF, "subframe 1's 136 whole bits, no padding gap yet");
+        }
+        assert_eq!(payload[18], 0b1000_0000, "bit 136 (subframe1's last bit) then subframe 2's zeros begin immediately, no gap");
+        for b in &payload[19..36] {
+            assert_eq!(*b, 0x00, "subframe 2's zeros, and the final 6-bit pad");
+        }
+    }
+
+    #[test]
+    fn ste_voice_payload_round_trips_arbitrary_subframes() {
+        let mut sub1 = [0u8; ACELP_CODED_FRAME_BYTES];
+        let mut sub2 = [0u8; ACELP_CODED_FRAME_BYTES];
+        for (i, b) in sub1.iter_mut().enumerate() { *b = (i as u8).wrapping_mul(37).wrapping_add(11); }
+        for (i, b) in sub2.iter_mut().enumerate() { *b = (i as u8).wrapping_mul(53).wrapping_add(3); }
+        // Clear each subframe's 7 don't-care padding bits (last byte's low 7
+        // bits) so round-tripping is exact -- pack/unpack only guarantee the
+        // 137 real bits survive, not arbitrary padding content.
+        sub1[17] &= 0x80;
+        sub2[17] &= 0x80;
+
+        let payload = pack_ste_voice_payload(&sub1, &sub2);
+        let (out1, out2) = unpack_ste_voice_payload(&payload);
+        assert_eq!(out1, sub1);
+        assert_eq!(out2, sub2);
     }
 }
