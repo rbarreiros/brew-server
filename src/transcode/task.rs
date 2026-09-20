@@ -1,7 +1,7 @@
 //! The bidirectional ACELP<->G.711 transcoder task itself: the "codec shim"
 //! that `sip::bridge` documents as its attachment point.
 
-use crate::protocol::{self, ACELP_CODED_FRAME_BYTES, ACELP_PCM_SAMPLES, CLASS_FRAME, FRAME_TRAFFIC_CHANNEL};
+use crate::protocol::{self, ACELP_PCM_SAMPLES, CLASS_FRAME, FRAME_TRAFFIC_CHANNEL, STE_VOICE_PAYLOAD_BYTES};
 use crate::sip::media::RtpLeg;
 use crate::transcode::acelp::{AcelpDecoder, AcelpEncoder};
 use crate::transcode::g711;
@@ -16,7 +16,10 @@ use uuid::Uuid;
 /// different frame sizes and are bridged through sample buffers below.
 const RTP_SAMPLES_PER_PACKET: usize = 160;
 const RTP_INTERVAL: Duration = Duration::from_millis(20);
-const ACELP_INTERVAL: Duration = Duration::from_millis(30);
+/// One `FRAME_TRAFFIC_CHANNEL` message carries two 30ms ACELP subframes (see
+/// `protocol::STE_VOICE_PAYLOAD_BYTES`), so it is emitted every 60ms, not
+/// 30ms -- two PCM samples worth of `ACELP_PCM_SAMPLES` (480 total) per tick.
+const ACELP_INTERVAL: Duration = Duration::from_millis(60);
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Running counts for the periodic stats log below -- the only way to tell,
@@ -40,12 +43,13 @@ struct Stats {
 /// teardown, tracked the same way as a plain SIP-SIP relay).
 ///
 /// - RTP arriving on `leg` (G.711, `payload_type` 0=PCMU/8=PCMA) is decoded to
-///   PCM and buffered; a 30ms ticker (see below) drains it into ACELP frames.
+///   PCM and buffered; a 60ms ticker (see below) drains it into STE-packed
+///   2-subframe ACELP traffic frames (`protocol::STE_VOICE_PAYLOAD_BYTES`).
 /// - Brew traffic frames for this call arriving on `brew_rx` (fed by a
 ///   registered virtual client that stands in for the SIP leg as a call
 ///   participant, so the router delivers voice frames to it like any other
-///   peer) are ACELP-decoded and buffered; a 20ms ticker drains it into RTP
-///   packets sent out on `leg`.
+///   peer) are ACELP-decoded (both subframes of each STE payload) and
+///   buffered; a 20ms ticker drains it into RTP packets sent out on `leg`.
 /// - Anything else arriving on `brew_rx` (call-control messages: SETUP_ACCEPT,
 ///   ALERT, CONNECT_REQUEST, CONNECT_CONFIRM, RELEASE, ...) is not audio this
 ///   task understands, but it is not noise either -- it is routed to the same
@@ -54,16 +58,16 @@ struct Stats {
 ///   machine to act on, rather than silently dropped.
 ///
 /// Emission is deliberately decoupled from arrival via two `interval` tickers
-/// (one 20ms RTP tick, one 30ms ACELP tick) rather than draining each buffer
-/// to completion the instant enough samples land. `leg`/`brew_rx` are both
-/// bursty: ACELP's 240-sample frame and RTP's 160-sample packet don't share a
-/// common multiple shorter than 480 samples, so on a naive drain-on-arrival
-/// loop roughly every third RTP packet (or every other ACELP frame) completes
-/// *two* output units at once, both emitted back-to-back with no real-time
-/// gap between them -- confirmed live via a production tcpdump capture, which
-/// showed this bridge's outbound RTP frequently going out in ~60us-apart
-/// pairs instead of a steady 20ms cadence. G.711/SIP jitter buffers mostly
-/// tolerate that; a real TETRA Basestation's downlink traffic channel is
+/// (one 20ms RTP tick, one 60ms ACELP/STE tick) rather than draining each
+/// buffer to completion the instant enough samples land. `leg`/`brew_rx` are
+/// both bursty: a 60ms STE unit (480 samples) and RTP's 160-sample packet
+/// don't share a common multiple shorter than 480 samples, so on a naive
+/// drain-on-arrival loop some output units would complete back-to-back with
+/// no real-time gap between them -- confirmed live via a production tcpdump
+/// capture, which showed this bridge's outbound RTP frequently going out in
+/// ~60us-apart pairs instead of a steady 20ms cadence. G.711/SIP jitter
+/// buffers mostly tolerate that; a real TETRA Basestation's downlink traffic
+/// channel is
 /// locked to a rigid TDMA slot schedule and does not -- frames delivered off
 /// that cadence are exactly the kind of thing that shows up as garbled or
 /// entirely dropped audio on the radio side.
@@ -135,7 +139,7 @@ pub fn spawn(
                         }
                         continue;
                     }
-                    if raw.len() < 20 + ACELP_CODED_FRAME_BYTES
+                    if raw.len() < 20 + STE_VOICE_PAYLOAD_BYTES
                         || raw[0] != CLASS_FRAME
                         || raw[1] != FRAME_TRAFFIC_CHANNEL
                     {
@@ -143,22 +147,25 @@ pub fn spawn(
                         continue;
                     }
                     stats.acelp_in += 1;
-                    let mut coded = [0u8; ACELP_CODED_FRAME_BYTES];
-                    coded.copy_from_slice(&raw[20..20 + ACELP_CODED_FRAME_BYTES]);
-                    let pcm = decoder.decode(&coded, false);
-                    pcm_from_brew.extend(pcm);
+                    let payload: &[u8; STE_VOICE_PAYLOAD_BYTES] = raw[20..20 + STE_VOICE_PAYLOAD_BYTES]
+                        .try_into().expect("checked len");
+                    let (sub1, sub2) = protocol::unpack_ste_voice_payload(payload);
+                    pcm_from_brew.extend(decoder.decode(&sub1, false));
+                    pcm_from_brew.extend(decoder.decode(&sub2, false));
                 }
-                // Paced ACELP emission: one frame every 30ms, matching TETRA's
-                // rigid TDMA traffic-channel cadence -- never more than one per
-                // tick, however many samples piled up between ticks.
+                // Paced ACELP emission: one 2-subframe (60ms) STE message per
+                // tick, matching TETRA's rigid TDMA traffic-channel cadence --
+                // never more than one per tick, however many samples piled up
+                // between ticks.
                 _ = acelp_ticker.tick() => {
-                    if pcm_from_sip.len() >= ACELP_PCM_SAMPLES {
-                        let mut frame = [0i16; ACELP_PCM_SAMPLES];
-                        for slot in frame.iter_mut() {
-                            *slot = pcm_from_sip.pop_front().expect("checked len");
-                        }
-                        let coded = encoder.encode(&frame);
-                        let packet = protocol::build_traffic_frame(&call_id, &coded);
+                    if pcm_from_sip.len() >= 2 * ACELP_PCM_SAMPLES {
+                        let mut frame1 = [0i16; ACELP_PCM_SAMPLES];
+                        let mut frame2 = [0i16; ACELP_PCM_SAMPLES];
+                        for slot in frame1.iter_mut() { *slot = pcm_from_sip.pop_front().expect("checked len"); }
+                        for slot in frame2.iter_mut() { *slot = pcm_from_sip.pop_front().expect("checked len"); }
+                        let sub1 = encoder.encode(&frame1);
+                        let sub2 = encoder.encode(&frame2);
+                        let packet = protocol::build_traffic_frame(&call_id, &sub1, &sub2);
                         for tx in &brew_targets {
                             let _ = tx.send(packet.clone());
                         }
@@ -287,15 +294,17 @@ mod tests {
         let call_id = Uuid::new_v4();
         let handle = spawn(leg, 0 /* PCMU */, call_id, brew_rx, Vec::new(), control_tx);
 
-        // Encode 4 real ACELP frames (960 samples = enough for 6 RTP packets)
-        // and post all 4 Brew traffic frames in one burst, back-to-back, with
-        // no delay between them -- simulating exactly the arrival pattern a
-        // WebSocket receive loop produces when frames queue up.
+        // Encode 2 STE messages (2 subframes/480 samples each = 960 samples
+        // total, enough for 6 RTP packets) and post both Brew traffic frames
+        // in one burst, back-to-back, with no delay between them -- simulating
+        // exactly the arrival pattern a WebSocket receive loop produces when
+        // frames queue up.
         let mut encoder = AcelpEncoder::new();
-        for _ in 0..4 {
+        for _ in 0..2 {
             let pcm = [0i16; ACELP_PCM_SAMPLES];
-            let coded = encoder.encode(&pcm);
-            let packet = protocol::build_traffic_frame(&call_id, &coded);
+            let sub1 = encoder.encode(&pcm);
+            let sub2 = encoder.encode(&pcm);
+            let packet = protocol::build_traffic_frame(&call_id, &sub1, &sub2);
             brew_tx.send(packet).unwrap();
         }
 

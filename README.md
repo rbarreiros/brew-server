@@ -4,6 +4,43 @@ Experimental Rust Brew core for linking two or more MidnightBlue Basestation TET
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 1.7 adds:
+
+- **Fixed the actual root cause of garbled/choppy/silent SIP<->Brew audio:
+  wrong `FRAME_TRAFFIC_CHANNEL` wire format.** This server always sent (and
+  parsed) one raw 18-byte ACELP subframe per Brew voice message, no header.
+  A real Basestation doesn't speak that: confirmed against FlowStation's
+  `net_brew::entity::handle_voice_frame`/`handle_ul_voice`, every
+  `FRAME_TRAFFIC_CHANNEL` payload is 36 bytes -- 1 "STE" header byte (`0x00`
+  = normal speech) followed by 35 bytes packing *two* 137-bit ACELP
+  subframes (60ms) back-to-back, MSB-first, with a single 6-bit pad at the
+  very end (not two independently 7-bit-padded subframes concatenated). A
+  real Basestation silently discards anything shorter
+  (`data.len() < 36 -> drop with a warning, never reaching the radio`),
+  which is exactly why PSTN->ISSI audio counted as sent by this server's own
+  metrics (added in the diagnostics below) but was never heard: every frame
+  was rejected on arrival. In the other direction, a real Basestation's
+  genuine 36-byte STE frames were misread as one corrupt 18-byte subframe
+  each (missing the header-byte offset and losing more than half the real
+  bits) -- garbled audio, and undercounted at exactly half the true 33.3
+  frames/sec speech rate, matching the "choppy" symptom precisely. New
+  `protocol::pack_ste_voice_payload`/`unpack_ste_voice_payload` do the exact
+  bit-level (re)packing FlowStation's own encoder/decoder use;
+  `build_traffic_frame` now takes two subframes and produces a real 36-byte
+  STE payload; `transcode::task`'s ACELP-side ticker moved from 30ms/1
+  subframe to 60ms/2 subframes to match.
+- **Transcoder diagnostics.** `transcode::task` now logs a per-call summary
+  every 5 seconds at the default log level: `rtp_in`/`rtp_out` (the SIP/PSTN
+  leg), `acelp_in`/`acelp_out` (the Brew/ISSI leg), an `*_underflow` count
+  for each (a paced tick that fired with too little buffered audio to emit --
+  starvation, not corruption), and the current buffered-sample depth on each
+  side. This is what surfaced the wire-format bug above: PSTN->ISSI counters
+  looked perfectly healthy (frames generated and queued continuously, zero
+  underflow) even though the user heard nothing, proving the fault was past
+  this task's own output, not within it -- and the ISSI->PSTN counters
+  showing exactly half the expected frame rate pointed straight at a framing
+  mismatch rather than packet loss.
+
 Version 1.6 adds:
 
 - **Transcoder diagnostics.** `transcode::task` now logs a per-call summary
