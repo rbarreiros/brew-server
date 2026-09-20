@@ -4,6 +4,27 @@ Experimental Rust Brew core for linking two or more MidnightBlue Basestation TET
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 1.4 adds:
+
+- **Fixed the persistent SIP<->Brew one-way/garbled audio: advertised host
+  was literally "0.0.0.0".** With the common default config
+  (`sip.listen = "0.0.0.0:PORT"`, `sip.advertised_host` unset), the fallback
+  used `local.ip()` from the bound socket's own address -- which for a
+  wildcard bind is literally the string `"0.0.0.0"`, not a real interface
+  address. Every SDP body this server generated (both its own outbound
+  INVITE offers and its answers to inbound INVITEs) therefore advertised
+  `c=IN IP4 0.0.0.0`/`o=... IN IP4 0.0.0.0`: unroutable, and some SIP stacks
+  read `c=0.0.0.0` as RFC 3264 5.1's "this stream is on hold" and never send
+  media there at all -- explaining reports of one whole call direction
+  (PSTN->ISSI) being totally silent while the other (ISSI->PSTN) limped
+  along on symmetric-RTP latching alone. `sip::transport::run` now detects a
+  real outbound-facing local IP (via a UDP "connect" to a public address --
+  no packet is sent, it just asks the OS routing table which local
+  interface/IP would be used) whenever the bind address is unspecified,
+  instead of ever advertising the wildcard. Set `sip.advertised_host`
+  explicitly (still the most reliable option, especially behind NAT) to skip
+  this detection entirely.
+
 Version 1.3 adds:
 
 - **Basestation locations on the MS map.** New `[bts_locations]` config,

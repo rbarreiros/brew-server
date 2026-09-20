@@ -47,6 +47,26 @@ fn rand_hex(n: usize) -> String {
 /// `netsock2.c` logs "Port disallowed in host:port" when asked to parse one
 /// as a bare host). If the configured value parses as `host:port`, strip the
 /// port and warn instead of silently emitting broken SDP.
+/// Best-effort local IP detection for when `sip.listen`/`sip.advertised_host`
+/// leave us with a wildcard bind address (`0.0.0.0`/`::`, the default: most
+/// deployments listen on all interfaces). Opens a UDP "connection" to a
+/// public address -- no packet is actually sent, this just asks the OS routing
+/// table which local interface/IP would be used -- and reads back that local
+/// address. Falls back to the wildcard string (with a loud warning) if this
+/// fails, e.g. no route at all (offline host, sandboxed/isolated network).
+fn detect_outbound_local_ip(wildcard: &str) -> String {
+    match std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| {
+        s.connect("8.8.8.8:80")?;
+        s.local_addr()
+    }) {
+        Ok(addr) => addr.ip().to_string(),
+        Err(e) => {
+            warn!(error = %e, "sip: could not detect an outbound-facing local IP; falling back to the wildcard bind address, which is NOT valid in SDP (peers cannot route RTP to it) -- set sip.advertised_host explicitly");
+            wildcard.to_string()
+        }
+    }
+}
+
 fn sanitize_advertised_host(configured: &str) -> String {
     if let Some((host, port)) = configured.rsplit_once(':') {
         // Only strip a trailing :port, not an IPv6 literal (which has more
@@ -138,7 +158,19 @@ pub async fn run(app: Arc<crate::state::AppState>) -> anyhow::Result<()> {
     let sock = Arc::new(UdpSocket::bind(cfg.listen).await?);
     let local = sock.local_addr()?;
     let advertised_host = if cfg.advertised_host.is_empty() {
-        local.ip().to_string()
+        if local.ip().is_unspecified() {
+            // `sip.listen = 0.0.0.0:PORT` (the default): local.ip() is
+            // literally "0.0.0.0", which is unroutable and not a valid SDP
+            // c=/o= address -- some UAs even read c=0.0.0.0 as "this stream
+            // is on hold" (RFC 3264 5.1) and never send media at all. That
+            // silently broke one whole direction of every SIP<->Brew call
+            // (whichever leg's SDP we generate: our own outbound INVITE
+            // offer, or our answer to an inbound one) until a real routable
+            // address was detected here instead.
+            detect_outbound_local_ip(&local.ip().to_string())
+        } else {
+            local.ip().to_string()
+        }
     } else {
         sanitize_advertised_host(&cfg.advertised_host)
     };
@@ -778,6 +810,19 @@ mod tests {
         // Not a valid value for this field either (the SDP builder is IP4-only),
         // but it must not be misparsed as host:port and truncated.
         assert_eq!(sanitize_advertised_host("::1"), "::1");
+    }
+
+    #[test]
+    fn detect_outbound_local_ip_never_returns_the_wildcard_when_a_route_exists() {
+        // Reproduces the real-world bug: sip.listen = 0.0.0.0:PORT (the
+        // default) with sip.advertised_host unset previously advertised the
+        // literal string "0.0.0.0" in every SDP c=/o= line -- unroutable, and
+        // read by some UAs as "this stream is on hold" (RFC 3264 5.1), which
+        // silently broke one whole direction of every SIP<->Brew call. Any
+        // sandboxed CI host still has *a* default route (even if just to a
+        // link-local/private gateway), so this must never come back "0.0.0.0".
+        let detected = detect_outbound_local_ip("0.0.0.0");
+        assert_ne!(detected, "0.0.0.0", "must not advertise the unroutable wildcard address");
     }
 
     #[tokio::test]
