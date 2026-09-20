@@ -8,6 +8,7 @@ use crate::transcode::g711;
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tracing::info;
 use uuid::Uuid;
 
 /// RTP packetization interval for G.711: 20ms @ 8kHz, the near-universal SIP
@@ -16,6 +17,23 @@ use uuid::Uuid;
 const RTP_SAMPLES_PER_PACKET: usize = 160;
 const RTP_INTERVAL: Duration = Duration::from_millis(20);
 const ACELP_INTERVAL: Duration = Duration::from_millis(30);
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Running counts for the periodic stats log below -- the only way to tell,
+/// from a real deployment's logs alone, whether a "garbled"/"choppy"/"silent"
+/// report is packet loss upstream (rtp_in/acelp_in stop incrementing),
+/// pipeline starvation (ticks fire but the buffer is short, undercounting
+/// *_out relative to *_in), or something past this task entirely (both
+/// directions' counts look healthy, so the bug is elsewhere in the bridge).
+#[derive(Default)]
+struct Stats {
+    rtp_in: u32,
+    rtp_out: u32,
+    rtp_underflow: u32,
+    acelp_in: u32,
+    acelp_out: u32,
+    acelp_underflow: u32,
+}
 
 /// Spawns the transcoder for one bridged call. Runs until either side closes
 /// (RTP socket error, or `brew_rx` dropped) or the task is aborted (call
@@ -70,6 +88,8 @@ pub fn spawn(
         rtp_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut acelp_ticker = tokio::time::interval(ACELP_INTERVAL);
         acelp_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut stats_ticker = tokio::time::interval(STATS_INTERVAL);
+        let mut stats = Stats::default();
 
         loop {
             tokio::select! {
@@ -101,6 +121,7 @@ pub fn spawn(
                     if pt != payload_type {
                         continue;
                     }
+                    stats.rtp_in += 1;
                     for &b in &rtp_buf[offset..n] {
                         pcm_from_sip.push_back(decode_sample(payload_type, b));
                     }
@@ -121,6 +142,7 @@ pub fn spawn(
                         let _ = control_tx.send(raw);
                         continue;
                     }
+                    stats.acelp_in += 1;
                     let mut coded = [0u8; ACELP_CODED_FRAME_BYTES];
                     coded.copy_from_slice(&raw[20..20 + ACELP_CODED_FRAME_BYTES]);
                     let pcm = decoder.decode(&coded, false);
@@ -140,6 +162,9 @@ pub fn spawn(
                         for tx in &brew_targets {
                             let _ = tx.send(packet.clone());
                         }
+                        stats.acelp_out += 1;
+                    } else {
+                        stats.acelp_underflow += 1;
                     }
                 }
                 // Paced RTP emission: one packet every 20ms, matching G.711's
@@ -158,8 +183,21 @@ pub fn spawn(
                         }
                         seq = seq.wrapping_add(1);
                         timestamp = timestamp.wrapping_add(RTP_SAMPLES_PER_PACKET as u32);
+                        stats.rtp_out += 1;
                         let _ = leg.send(&rtp).await;
+                    } else {
+                        stats.rtp_underflow += 1;
                     }
+                }
+                _ = stats_ticker.tick() => {
+                    info!(
+                        %call_id,
+                        rtp_in = stats.rtp_in, rtp_out = stats.rtp_out, rtp_underflow = stats.rtp_underflow,
+                        acelp_in = stats.acelp_in, acelp_out = stats.acelp_out, acelp_underflow = stats.acelp_underflow,
+                        pcm_from_sip_buffered = pcm_from_sip.len(), pcm_from_brew_buffered = pcm_from_brew.len(),
+                        "transcoder stats (last {STATS_INTERVAL:?}): rtp_in/out are the SIP/PSTN<->us leg, acelp_in/out are the Brew/ISSI<->us leg; *_underflow counts a tick that fired with too little buffered audio to emit (starvation, not corruption)",
+                    );
+                    stats = Stats::default();
                 }
             }
         }

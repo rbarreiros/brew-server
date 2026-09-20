@@ -4,6 +4,20 @@ Experimental Rust Brew core for linking two or more MidnightBlue Basestation TET
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 1.6 adds:
+
+- **Transcoder diagnostics.** `transcode::task` now logs a per-call summary
+  every 5 seconds at the default log level: `rtp_in`/`rtp_out` (the SIP/PSTN
+  leg), `acelp_in`/`acelp_out` (the Brew/ISSI leg), an `*_underflow` count
+  for each (a paced tick that fired with too little buffered audio to emit --
+  starvation, not corruption), and the current buffered-sample depth on each
+  side. The 1.5 pacing fix resolved a confirmed RTP-timing bug, but garbled/
+  choppy/silent audio reports persisted after it -- these counters exist to
+  tell the next report apart at a glance: packet loss upstream (`*_in` stops
+  incrementing), this task's own buffer starving (rising `*_underflow` with
+  low buffered-sample counts), or a healthy transcoder feeding into a problem
+  further down the pipeline (both directions' counts look normal).
+
 Version 1.5 adds:
 
 - **Fixed bursty/unpaced transcoder output: the real cause of garbled and
