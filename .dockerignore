@@ -1,0 +1,8 @@
+target
+third_party/tetra-codec/build
+.git
+brew-history.bin
+tls
+*.pem
+*.crt
+*.key

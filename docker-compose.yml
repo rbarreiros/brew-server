@@ -3,10 +3,28 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "9000:9000"
+      - "9000:9000"       # Brew (Basestation/Terminal/federation-peer WebSocket)
+      - "9001:9001"       # Basestation Telemetry (optional, [telemetry] enabled)
+      - "9002:9002"       # Basestation Control (optional, [control] enabled)
+      - "9003:9003"       # Monitoring dashboard
+      - "5060:5060/udp"   # SIP signalling (optional, [sip] enabled)
+      - "16000-17000:16000-17000/udp" # SIP RTP media (must match [sip] rtp_port_min/max)
     volumes:
       - ./brew-server.toml:/etc/brew-server.toml:ro
-      # Mount TLS cert/key when [tls] enabled = true (paths must match brew-server.toml)
-      - ./tls:/etc/brew-server/tls:ro
+      # Mount TLS cert/key when [tls]/[telemetry.tls]/[control.tls] enabled =
+      # true (paths must match brew-server.toml; the shipped example uses
+      # absolute /etc/ssl/brew/... paths for these three). [dashboard.tls] in
+      # the shipped example uses relative paths ("tls/dashboard-cert.pem")
+      # instead -- those resolve under the container's WORKDIR
+      # (/var/lib/brew-server, the brew-server-data volume below), so either
+      # bind-mount your dashboard certs there too or switch dashboard.tls to
+      # absolute /etc/ssl/brew/... paths like the others.
+      - ./tls:/etc/ssl/brew:ro
+      # Persists brew-history.bin (completed calls/SDS log, [storage] enabled)
+      # and any SIP registration/dialog state across container restarts.
+      - brew-server-data:/var/lib/brew-server
     environment:
       RUST_LOG: brew_server=info
+
+volumes:
+  brew-server-data:
