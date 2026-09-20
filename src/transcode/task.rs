@@ -6,6 +6,7 @@ use crate::sip::media::RtpLeg;
 use crate::transcode::acelp::{AcelpDecoder, AcelpEncoder};
 use crate::transcode::g711;
 use std::collections::VecDeque;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -13,26 +14,41 @@ use uuid::Uuid;
 /// default (vs. ACELP's 30ms/240-sample frame), so the two sides free-run at
 /// different frame sizes and are bridged through sample buffers below.
 const RTP_SAMPLES_PER_PACKET: usize = 160;
+const RTP_INTERVAL: Duration = Duration::from_millis(20);
+const ACELP_INTERVAL: Duration = Duration::from_millis(30);
 
 /// Spawns the transcoder for one bridged call. Runs until either side closes
 /// (RTP socket error, or `brew_rx` dropped) or the task is aborted (call
 /// teardown, tracked the same way as a plain SIP-SIP relay).
 ///
 /// - RTP arriving on `leg` (G.711, `payload_type` 0=PCMU/8=PCMA) is decoded to
-///   PCM, buffered into 240-sample ACELP frames, and pushed to every
-///   `brew_targets` sender as a `FRAME_TRAFFIC_CHANNEL` Brew packet addressed
-///   to `call_id`.
+///   PCM and buffered; a 30ms ticker (see below) drains it into ACELP frames.
 /// - Brew traffic frames for this call arriving on `brew_rx` (fed by a
 ///   registered virtual client that stands in for the SIP leg as a call
 ///   participant, so the router delivers voice frames to it like any other
-///   peer) are ACELP-decoded, buffered into 160-sample RTP packets, and sent
-///   out on `leg`.
+///   peer) are ACELP-decoded and buffered; a 20ms ticker drains it into RTP
+///   packets sent out on `leg`.
 /// - Anything else arriving on `brew_rx` (call-control messages: SETUP_ACCEPT,
 ///   ALERT, CONNECT_REQUEST, CONNECT_CONFIRM, RELEASE, ...) is not audio this
 ///   task understands, but it is not noise either -- it is routed to the same
 ///   virtual client for a reason (accept/ring/answer handshake, hangup). It is
 ///   forwarded verbatim to `control_tx` for the bridge's call-control state
 ///   machine to act on, rather than silently dropped.
+///
+/// Emission is deliberately decoupled from arrival via two `interval` tickers
+/// (one 20ms RTP tick, one 30ms ACELP tick) rather than draining each buffer
+/// to completion the instant enough samples land. `leg`/`brew_rx` are both
+/// bursty: ACELP's 240-sample frame and RTP's 160-sample packet don't share a
+/// common multiple shorter than 480 samples, so on a naive drain-on-arrival
+/// loop roughly every third RTP packet (or every other ACELP frame) completes
+/// *two* output units at once, both emitted back-to-back with no real-time
+/// gap between them -- confirmed live via a production tcpdump capture, which
+/// showed this bridge's outbound RTP frequently going out in ~60us-apart
+/// pairs instead of a steady 20ms cadence. G.711/SIP jitter buffers mostly
+/// tolerate that; a real TETRA Basestation's downlink traffic channel is
+/// locked to a rigid TDMA slot schedule and does not -- frames delivered off
+/// that cadence are exactly the kind of thing that shows up as garbled or
+/// entirely dropped audio on the radio side.
 pub fn spawn(
     leg: RtpLeg,
     payload_type: u8,
@@ -50,6 +66,10 @@ pub fn spawn(
         let mut timestamp: u32 = 0;
         let ssrc: u32 = call_id.as_u128() as u32;
         let mut rtp_buf = [0u8; 2048];
+        let mut rtp_ticker = tokio::time::interval(RTP_INTERVAL);
+        rtp_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut acelp_ticker = tokio::time::interval(ACELP_INTERVAL);
+        acelp_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -84,17 +104,6 @@ pub fn spawn(
                     for &b in &rtp_buf[offset..n] {
                         pcm_from_sip.push_back(decode_sample(payload_type, b));
                     }
-                    while pcm_from_sip.len() >= ACELP_PCM_SAMPLES {
-                        let mut frame = [0i16; ACELP_PCM_SAMPLES];
-                        for slot in frame.iter_mut() {
-                            *slot = pcm_from_sip.pop_front().expect("checked len");
-                        }
-                        let coded = encoder.encode(&frame);
-                        let packet = protocol::build_traffic_frame(&call_id, &coded);
-                        for tx in &brew_targets {
-                            let _ = tx.send(packet.clone());
-                        }
-                    }
                 }
                 msg = brew_rx.recv() => {
                     let Some(raw) = msg else { break };
@@ -116,7 +125,27 @@ pub fn spawn(
                     coded.copy_from_slice(&raw[20..20 + ACELP_CODED_FRAME_BYTES]);
                     let pcm = decoder.decode(&coded, false);
                     pcm_from_brew.extend(pcm);
-                    while pcm_from_brew.len() >= RTP_SAMPLES_PER_PACKET {
+                }
+                // Paced ACELP emission: one frame every 30ms, matching TETRA's
+                // rigid TDMA traffic-channel cadence -- never more than one per
+                // tick, however many samples piled up between ticks.
+                _ = acelp_ticker.tick() => {
+                    if pcm_from_sip.len() >= ACELP_PCM_SAMPLES {
+                        let mut frame = [0i16; ACELP_PCM_SAMPLES];
+                        for slot in frame.iter_mut() {
+                            *slot = pcm_from_sip.pop_front().expect("checked len");
+                        }
+                        let coded = encoder.encode(&frame);
+                        let packet = protocol::build_traffic_frame(&call_id, &coded);
+                        for tx in &brew_targets {
+                            let _ = tx.send(packet.clone());
+                        }
+                    }
+                }
+                // Paced RTP emission: one packet every 20ms, matching G.711's
+                // standard SIP ptime -- never more than one per tick.
+                _ = rtp_ticker.tick() => {
+                    if pcm_from_brew.len() >= RTP_SAMPLES_PER_PACKET {
                         let mut rtp = Vec::with_capacity(12 + RTP_SAMPLES_PER_PACKET);
                         rtp.push(0x80); // V=2, no padding/extension/CSRC
                         rtp.push(payload_type & 0x7F);
@@ -200,6 +229,55 @@ async fn send_dtmf_event(leg: &RtpLeg, event: u8, start_seq: u16, ts: u32, ssrc:
 mod tests {
     use super::*;
     use crate::sip::media::RtpRelay;
+
+    /// Reproduces the production symptom this pacing rewrite fixes: feed the
+    /// transcoder several Brew ACELP frames all at once (as they'd actually
+    /// arrive after any network burst/scheduling jitter) and confirm the
+    /// resulting RTP packets go out roughly 20ms apart, never back-to-back --
+    /// a live tcpdump capture had previously shown ~60us gaps between pairs of
+    /// outbound RTP packets instead of a steady cadence, which is fatal to a
+    /// real TETRA Basestation's rigid TDMA-scheduled downlink.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rtp_output_is_paced_even_when_acelp_frames_arrive_in_a_burst() {
+        let relay = RtpRelay::new("127.0.0.1", 44000, 44020);
+        let leg = relay.alloc_leg().await.unwrap();
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        leg.set_remote(listener.local_addr().unwrap()).await;
+
+        let (brew_tx, brew_rx) = mpsc::unbounded_channel();
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let call_id = Uuid::new_v4();
+        let handle = spawn(leg, 0 /* PCMU */, call_id, brew_rx, Vec::new(), control_tx);
+
+        // Encode 4 real ACELP frames (960 samples = enough for 6 RTP packets)
+        // and post all 4 Brew traffic frames in one burst, back-to-back, with
+        // no delay between them -- simulating exactly the arrival pattern a
+        // WebSocket receive loop produces when frames queue up.
+        let mut encoder = AcelpEncoder::new();
+        for _ in 0..4 {
+            let pcm = [0i16; ACELP_PCM_SAMPLES];
+            let coded = encoder.encode(&pcm);
+            let packet = protocol::build_traffic_frame(&call_id, &coded);
+            brew_tx.send(packet).unwrap();
+        }
+
+        let mut arrivals = Vec::new();
+        let mut buf = [0u8; 2048];
+        for _ in 0..6 {
+            let (_, _) = tokio::time::timeout(std::time::Duration::from_secs(2), listener.recv_from(&mut buf))
+                .await.expect("timed out waiting for a paced RTP packet").unwrap();
+            arrivals.push(tokio::time::Instant::now());
+        }
+        handle.abort();
+
+        for w in arrivals.windows(2) {
+            let gap = w[1] - w[0];
+            assert!(
+                gap >= Duration::from_millis(10),
+                "RTP packets must be paced ~20ms apart, not emitted back-to-back; got a {gap:?} gap"
+            );
+        }
+    }
 
     #[test]
     fn dtmf_ascii_maps_to_rfc4733_events() {

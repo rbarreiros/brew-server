@@ -4,6 +4,28 @@ Experimental Rust Brew core for linking two or more MidnightBlue Basestation TET
 
 Reference spec from https://wiki.tetrapack.online/tetra/specifications/brew/
 
+Version 1.5 adds:
+
+- **Fixed bursty/unpaced transcoder output: the real cause of garbled and
+  missing SIP<->Brew audio.** Diagnosed from a live production `tcpdump`
+  capture: outbound RTP packets frequently went out in ~60us-apart pairs
+  instead of a steady 20ms cadence, even though inbound audio arrived cleanly
+  paced. Root cause: `transcode::task::spawn`'s pump decoded and immediately
+  emitted output the instant a buffer crossed a full frame's worth of
+  samples, draining it to completion in a `while` loop with no real-time
+  gap between iterations. ACELP's 240-sample/30ms frame and RTP's
+  160-sample/20ms packet share no common multiple shorter than 480 samples,
+  so roughly every third RTP packet (or every other ACELP frame) completed
+  *two* output units back-to-back. G.711/SIP jitter buffers mostly tolerate
+  that; a real TETRA Basestation's downlink traffic channel is locked to a
+  rigid TDMA slot schedule and does not -- frames delivered off that cadence
+  are dropped or garbled on the radio side. Decoding (on arrival, still
+  event-driven/bursty as the network delivers it) is now fully decoupled
+  from emission (on two dedicated tickers, a 20ms one for RTP and a 30ms one
+  for ACELP, each emitting at most one unit per tick regardless of how much
+  piled up in between) via the existing sample buffers acting as a proper
+  jitter absorber between the two paced clocks.
+
 Version 1.4 adds:
 
 - **Fixed the persistent SIP<->Brew one-way/garbled audio: advertised host
