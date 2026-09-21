@@ -2,6 +2,34 @@
 
 All notable changes to brew-server, newest first.
 
+Version 1.9 adds:
+
+- **Logged-in username and a logout control on every dashboard page.**
+  Next to the "Live" status indicator, the header now shows the
+  authenticated dashboard user's name (via `/api/whoami`, already added for
+  the privileged-users feature) and a Logout button. HTTP Basic auth has no
+  real server-side session to end, so "logout" is the standard best-effort
+  trick: navigating to the current page with bogus embedded credentials
+  (`//logout:<timestamp>@host/path`) so the browser discards its cached
+  valid ones and re-prompts on the next request. Both elements stay hidden
+  when no credential is present (auth disabled, or not yet logged in).
+
+Version 1.8 adds:
+
+- **Privileged dashboard users.** New `[dashboard].admins` config: a list of
+  usernames (a subset of `[dashboard.users]`'s keys) allowed to view or edit
+  `/settings` and its `/api/config/*` endpoints. Every other authenticated
+  dashboard user keeps full read access to the rest of the dashboard, just
+  not that page (a real `403`, not a blank/hidden page) or its APIs. Leaving
+  `admins` empty keeps the previous all-or-nothing behavior. Implemented as
+  a second `require_admin` middleware layer wrapping just the settings
+  sub-router, applied inside the existing `require_basic` layer so it only
+  ever runs after a request is already authenticated. New `/api/whoami`
+  endpoint lets the dashboard's own JS hide the Settings nav link for
+  non-admins (a UI convenience only; the real enforcement is server-side).
+  Note this does *not* cover the Control panel (kick/DGNA/restart/stop),
+  which is unaffected and stays available to every authenticated user.
+
 Version 1.7 adds:
 
 - **Fixed the actual root cause of garbled/choppy/silent SIP<->Brew audio:
