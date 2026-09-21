@@ -2,6 +2,22 @@
 
 All notable changes to brew-server, newest first.
 
+Version 1.8 adds:
+
+- **Privileged dashboard users.** New `[dashboard].admins` config: a list of
+  usernames (a subset of `[dashboard.users]`'s keys) allowed to view or edit
+  `/settings` and its `/api/config/*` endpoints. Every other authenticated
+  dashboard user keeps full read access to the rest of the dashboard, just
+  not that page (a real `403`, not a blank/hidden page) or its APIs. Leaving
+  `admins` empty keeps the previous all-or-nothing behavior. Implemented as
+  a second `require_admin` middleware layer wrapping just the settings
+  sub-router, applied inside the existing `require_basic` layer so it only
+  ever runs after a request is already authenticated. New `/api/whoami`
+  endpoint lets the dashboard's own JS hide the Settings nav link for
+  non-admins (a UI convenience only; the real enforcement is server-side).
+  Note this does *not* cover the Control panel (kick/DGNA/restart/stop),
+  which is unaffected and stays available to every authenticated user.
+
 Version 1.7 adds:
 
 - **Fixed the actual root cause of garbled/choppy/silent SIP<->Brew audio:

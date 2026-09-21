@@ -29,6 +29,22 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Settings (viewing and editing server config) is split into its own
+    // sub-router with an extra require_admin layer, merged into the rest of
+    // the dashboard. require_basic below applies to the merged whole and
+    // runs first (authenticate), then require_admin runs for just these
+    // routes (authorize) -- see both functions' docs.
+    let settings_routes = Router::new()
+        .route("/settings", get(settings_page))
+        .route("/api/config/raw", get(config_raw_get).put(config_raw_put))
+        .route("/api/config/sip/full", get(sip_config_full))
+        .route("/api/config/sip/extensions/{user}", axum::routing::post(upsert_sip_extension).delete(delete_sip_extension))
+        .route("/api/config/sip/trunks/{name}", axum::routing::post(upsert_sip_trunk).delete(delete_sip_trunk))
+        .route("/api/config/sip/routes", axum::routing::post(upsert_sip_route))
+        .route("/api/config/sip/routes/{name}", axum::routing::delete(delete_sip_route))
+        .route("/api/config/bts-locations/{username}", axum::routing::post(upsert_bts_location).delete(delete_bts_location))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
+
     let app = Router::new()
         .route("/", get(index))
         .route("/calls", get(calls_page))
@@ -51,14 +67,8 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/sip-config", get(sip_config_page))
         .route("/api/sip", get(sip_snapshot))
         .route("/api/sip/config", get(sip_config))
-        .route("/settings", get(settings_page))
-        .route("/api/config/raw", get(config_raw_get).put(config_raw_put))
-        .route("/api/config/sip/full", get(sip_config_full))
-        .route("/api/config/sip/extensions/{user}", axum::routing::post(upsert_sip_extension).delete(delete_sip_extension))
-        .route("/api/config/sip/trunks/{name}", axum::routing::post(upsert_sip_trunk).delete(delete_sip_trunk))
-        .route("/api/config/sip/routes", axum::routing::post(upsert_sip_route))
-        .route("/api/config/sip/routes/{name}", axum::routing::delete(delete_sip_route))
-        .route("/api/config/bts-locations/{username}", axum::routing::post(upsert_bts_location).delete(delete_bts_location))
+        .route("/api/whoami", get(whoami))
+        .merge(settings_routes)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_basic))
         .with_state(state.clone());
 
@@ -92,19 +102,61 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
 /// header on the handshake). No configured users means auth is disabled.
 async fn require_basic(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
     let users = &state.config.dashboard.users;
-    if users.is_empty() || basic_ok(users, request.headers()) {
+    if users.is_empty() || basic_username(users, request.headers()).is_some() {
         return next.run(request).await;
     }
     basic_challenge(&state.config.dashboard.realm)
 }
 
-fn basic_ok(users: &HashMap<String, String>, headers: &HeaderMap) -> bool {
-    let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else { return false };
-    let Some(b64) = value.strip_prefix("Basic ") else { return false };
-    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64) else { return false };
-    let Ok(text) = String::from_utf8(decoded) else { return false };
-    let Some((user, pass)) = text.split_once(':') else { return false };
-    users.get(user).map(|p| p == pass).unwrap_or(false)
+/// Guards the settings sub-router (see `run`): only usernames listed in
+/// `[dashboard].admins` may view or change server config. Runs *after*
+/// `require_basic` (which already rejected a bad/missing credential), so
+/// this only needs to decide authorization, not authentication -- an empty
+/// `admins` list means "every dashboard user", matching this feature's
+/// pre-existing all-or-nothing behavior for anyone who doesn't need the
+/// split. A denied request gets a real `403` with a short explanation, not
+/// a bare/blank page, since the settings *page itself* is gated here (not
+/// just its data), so a non-admin following the Settings link needs to
+/// understand why nothing loaded.
+async fn require_admin(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
+    let cfg = &state.config.dashboard;
+    if cfg.users.is_empty() || cfg.admins.is_empty() {
+        return next.run(request).await;
+    }
+    match basic_username(&cfg.users, request.headers()) {
+        Some(user) if cfg.admins.iter().any(|a| a == &user) => next.run(request).await,
+        _ => (StatusCode::FORBIDDEN, "Forbidden: this dashboard user is not listed in [dashboard].admins\n").into_response(),
+    }
+}
+
+/// Returns the authenticated username for `/api/whoami` -- lets the
+/// dashboard's own JS decide whether to show the Settings nav link, without
+/// duplicating the admin check client-side (the real enforcement is
+/// `require_admin`; this is purely a UI convenience).
+async fn whoami(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let cfg = &state.config.dashboard;
+    let username = basic_username(&cfg.users, &headers);
+    let admin = match &username {
+        _ if cfg.users.is_empty() => true, // auth disabled: everyone is effectively admin
+        Some(user) => cfg.admins.is_empty() || cfg.admins.iter().any(|a| a == user),
+        None => false,
+    };
+    Json(serde_json::json!({ "username": username, "admin": admin }))
+}
+
+/// Validates the request's HTTP Basic credentials against `users` and
+/// returns the authenticated username, or `None` if missing/invalid.
+fn basic_username(users: &HashMap<String, String>, headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())?;
+    let b64 = value.strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    let (user, pass) = text.split_once(':')?;
+    if users.get(user).map(|p| p == pass).unwrap_or(false) {
+        Some(user.to_string())
+    } else {
+        None
+    }
 }
 
 fn basic_challenge(realm: &str) -> Response {
@@ -314,7 +366,7 @@ static SIP_CONFIG_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|
 <p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/sip">SIP live panel &rarr;</a></p>
 <div class=banner id=disabled-banner>SIP subsystem is disabled. Set <code>enabled = true</code> under <code>[sip]</code>.</div>
 <section class=panel><h2>General</h2><table><tbody id=general></tbody></table>
-<p class=map-note style="color:#8fa2b8;font-size:12px">This screen is read-only. Edit extensions, trunks and routes on the <a class=backlink href="/settings">Settings</a> page, or directly in the server's TOML config file (the running process watches the file and restarts to apply changes). Passwords are never shown here.</p>
+<p class=map-note style="color:#8fa2b8;font-size:12px">This screen is read-only. Edit extensions, trunks and routes on the <a class=backlink id=settings-link href="/settings">Settings</a> page, or directly in the server's TOML config file (the running process watches the file and restarts to apply changes). Passwords are never shown here.</p>
 </section>
 <section class=panel><h2>Extensions</h2><table><thead><tr><th>User</th><th>Display name</th><th>ISSI</th><th>Outbound</th><th>Password</th></tr></thead><tbody id=exts></tbody></table></section>
 <section class=panel><h2>Trunks</h2><table><thead><tr><th>Name</th><th>Direction</th><th>Remote host</th><th>Username</th><th>Realm</th><th>Reg interval</th><th>Enabled</th><th>Password</th></tr></thead><tbody id=trunks></tbody></table></section>
@@ -346,6 +398,7 @@ async function load(){{
   }}catch(e){{$('status').textContent='Disconnected';}}
 }}
 load();setInterval(load,5000);
+fetch('/api/whoami').then(r=>r.json()).then(w=>{{if(!w.admin)$('settings-link').style.display='none';}}).catch(()=>{{}});
 </script></body></html>"#, style = STYLE, ver = VERSION));
 
 /// Live "who's connected now" page: Brew connections, registered mobile
@@ -863,7 +916,7 @@ h2 .backlink{text-transform:none;letter-spacing:normal;margin-left:8px}
 
 const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><header><h1>TETRA NETWORK MONITOR</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=ver>v__VERSION__</div></div></header><main class=wrap>
 <div class=banner id=emergency-banner></div>
-<section class=cards><div class=card><div class=muted>Basestations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Menu</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-Basestation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/connections">Live Connections<span class=sub>Who's connected now: Brew, MS &amp; SIP</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a><a class=navlink href="/settings">Settings<span class=sub>Edit &amp; save server configuration</span></a></div></section>
+<section class=cards><div class=card><div class=muted>Basestations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Menu</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-Basestation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/connections">Live Connections<span class=sub>Who's connected now: Brew, MS &amp; SIP</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a><a class=navlink id=settings-link href="/settings">Settings<span class=sub>Edit &amp; save server configuration</span></a></div></section>
 <section class=panel><h2>Basestation Telemetry</h2><div class=bts-grid id=telemetry-stations></div></section>
 <section class=panel><h2>Registered Subscribers <a class=backlink href="/registrations">(view registration log &rarr;)</a></h2><div class=bts-grid id=registrations></div></section>
 <section class=panel><h2>Basestation Control</h2><div class=bts-grid id=control-stations></div></section>
@@ -1007,6 +1060,7 @@ function connectLive(){
   ws.onerror=()=>{try{ws.close();}catch(e){}};
 }
 connectLive();
+fetch('/api/whoami').then(r=>r.json()).then(w=>{if(!w.admin)$('settings-link').style.display='none';}).catch(()=>{});
 </script></body></html>"#;
 
 #[cfg(test)]
@@ -1079,6 +1133,68 @@ mod tests {
         let Json(out) = bts_locations_snapshot(State(std::sync::Arc::new(state))).await;
         assert_eq!(out.len(), 1, "the (0,0) entry must not be plotted");
         assert_eq!(out[0].username, "1000001");
+    }
+
+    fn basic_auth_header(user: &str, pass: &str) -> HeaderMap {
+        let creds = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Basic {creds}")).unwrap());
+        headers
+    }
+
+    #[test]
+    fn basic_username_accepts_matching_credentials() {
+        let mut users = HashMap::new();
+        users.insert("alice".to_string(), "secret".to_string());
+        let headers = basic_auth_header("alice", "secret");
+        assert_eq!(basic_username(&users, &headers), Some("alice".to_string()));
+    }
+
+    #[test]
+    fn basic_username_rejects_wrong_password() {
+        let mut users = HashMap::new();
+        users.insert("alice".to_string(), "secret".to_string());
+        let headers = basic_auth_header("alice", "wrong");
+        assert_eq!(basic_username(&users, &headers), None);
+    }
+
+    #[test]
+    fn basic_username_rejects_missing_header() {
+        let users: HashMap<String, String> = HashMap::new();
+        assert_eq!(basic_username(&users, &HeaderMap::new()), None);
+    }
+
+    /// Pins the privileged-user feature this test module's name suggests:
+    /// a user authenticated but not listed in [dashboard].admins must not
+    /// be treated as an admin by /api/whoami, while a listed one must.
+    #[tokio::test]
+    async fn whoami_reports_admin_only_for_listed_users() {
+        let mut config = crate::config::Config::default();
+        config.dashboard.users.insert("alice".into(), "secret".into());
+        config.dashboard.users.insert("bob".into(), "secret2".into());
+        config.dashboard.admins = vec!["alice".into()];
+        let (state, _rx) = crate::state::AppState::new(config, std::path::PathBuf::from("test.toml"));
+        let state = std::sync::Arc::new(state);
+
+        let Json(alice) = whoami(State(state.clone()), basic_auth_header("alice", "secret")).await;
+        assert_eq!(alice["admin"], serde_json::json!(true));
+        assert_eq!(alice["username"], serde_json::json!("alice"));
+
+        let Json(bob) = whoami(State(state.clone()), basic_auth_header("bob", "secret2")).await;
+        assert_eq!(bob["admin"], serde_json::json!(false));
+
+        let Json(nobody) = whoami(State(state), HeaderMap::new()).await;
+        assert_eq!(nobody["admin"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn whoami_treats_empty_admins_list_as_everyone_admin() {
+        let mut config = crate::config::Config::default();
+        config.dashboard.users.insert("alice".into(), "secret".into());
+        // admins left empty: pre-existing all-or-nothing behavior.
+        let (state, _rx) = crate::state::AppState::new(config, std::path::PathBuf::from("test.toml"));
+        let Json(alice) = whoami(State(std::sync::Arc::new(state)), basic_auth_header("alice", "secret")).await;
+        assert_eq!(alice["admin"], serde_json::json!(true));
     }
 }
 

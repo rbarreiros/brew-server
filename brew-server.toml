@@ -59,14 +59,20 @@ key_path = "/etc/ssl/brew/server.key"
 
 # Monitoring dashboard. Now on its OWN listener/port, separate from the Brew
 # API. Enabled by default. Set [dashboard.users] to require HTTP Basic auth
-# (empty = open). See https://github.com/ysamouhos/brew-server/wiki/Dashboard.
+# (empty = open). `admins` lists which of those usernames may view/edit
+# /settings; every other authenticated user can still read the rest of the
+# dashboard, just not that page or its /api/config/* endpoints. Leave
+# `admins` empty to let every dashboard user access settings (no split).
+# See https://github.com/ysamouhos/brew-server/wiki/Dashboard.
 [dashboard]
 enabled = true
 listen = "0.0.0.0:9003"
 realm = "brew-server-dashboard"
+admins = ["admin"]
 
 [dashboard.users]
-"user" = "pass"
+"admin" = "change-me-admin"
+"viewer" = "change-me-viewer"
 
 [dashboard.tls]
 enabled = true

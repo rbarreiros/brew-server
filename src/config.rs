@@ -159,6 +159,15 @@ pub struct DashboardConfig {
     pub listen: SocketAddr,
     /// HTTP Basic Auth username -> password. Empty means no auth required.
     pub users: HashMap<String, String>,
+    /// Usernames (must be keys of `users`) allowed to view/edit `/settings`
+    /// and its `/api/config/*` endpoints -- every other authenticated user
+    /// can still read the rest of the dashboard, just not that page or its
+    /// APIs (a plain `403` either way, not a hidden/blank page). Empty means
+    /// every authenticated user may access settings, the same
+    /// all-or-nothing behavior this had before privileged users existed;
+    /// set this once you want to split "can view" from "can change config".
+    /// Has no effect when `users` itself is empty (auth disabled entirely).
+    pub admins: Vec<String>,
     pub realm: String,
     pub tls: TlsConfig,
 }
@@ -169,6 +178,7 @@ impl Default for DashboardConfig {
             enabled: true,
             listen: "0.0.0.0:9003".parse().unwrap(),
             users: HashMap::new(),
+            admins: Vec::new(),
             realm: "brew-server-dashboard".into(),
             tls: TlsConfig::default(),
         }
@@ -601,6 +611,9 @@ mod tests {
             lat: 37.9917,
             lon: 23.7640,
         });
+        cfg.dashboard.users.insert("alice".into(), "secret".into());
+        cfg.dashboard.users.insert("bob".into(), "secret2".into());
+        cfg.dashboard.admins = vec!["alice".into()];
 
         let text = cfg.to_toml_pretty().expect("serialize");
         let parsed = Config::parse(&text).expect("re-parse");
@@ -608,6 +621,7 @@ mod tests {
         assert_eq!(athens.name, "Athens BTS");
         assert!((athens.lat - 37.9917).abs() < 1e-9);
         assert!((athens.lon - 23.7640).abs() < 1e-9);
+        assert_eq!(parsed.dashboard.admins, vec!["alice".to_string()]);
 
         assert_eq!(parsed.sip.enabled, true);
         assert_eq!(parsed.sip.extensions["1001"].issi, 42);
