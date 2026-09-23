@@ -347,9 +347,9 @@ impl AppState {
 
         let removed_calls: Vec<Uuid> = inner.calls.iter()
             .filter_map(|(uuid, call)| (call.owner == id || call.peers.contains(&id)).then_some(*uuid)).collect();
-        for uuid in removed_calls {
-            if let Some(call) = inner.calls.remove(&uuid) {
-                if call.kind == CallKind::Group && inner.group_floor.get(&call.destination) == Some(&uuid) {
+        for uuid in &removed_calls {
+            if let Some(call) = inner.calls.remove(uuid) {
+                if call.kind == CallKind::Group && inner.group_floor.get(&call.destination) == Some(uuid) {
                     inner.group_floor.remove(&call.destination);
                 }
             }
@@ -361,18 +361,28 @@ impl AppState {
         // now-dead ISSI (mirrors the relay in router::handle_subscriber, but
         // there is no live source client left to split-horizon against here
         // -- the one that just disconnected can't receive it anyway).
-        if !removed_issis.is_empty() {
-            let peer_txs: Vec<_> = inner.clients.values()
+        let peer_txs: Vec<_> = if removed_issis.is_empty() { Vec::new() } else {
+            inner.clients.values()
                 .filter(|c| c.mode == ClientMode::Peer)
                 .map(|c| c.tx.clone())
-                .collect();
-            drop(inner);
-            if !peer_txs.is_empty() {
-                for issi in removed_issis {
-                    let withdraw = crate::protocol::build_subscriber_message(crate::protocol::SUB_DEREGISTER, issi, &[]);
-                    for tx in &peer_txs { let _ = tx.send(withdraw.clone()); }
-                }
-            }
+                .collect()
+        };
+        drop(inner);
+        for issi in removed_issis {
+            let withdraw = crate::protocol::build_subscriber_message(crate::protocol::SUB_DEREGISTER, issi, &[]);
+            for tx in &peer_txs { let _ = tx.send(withdraw.clone()); }
+        }
+
+        // The calls this client took part in are gone: end them on the
+        // dashboard too, and hang up any SIP leg bridged to one, otherwise
+        // both UIs keep showing a call that no longer exists.
+        let bridge = match self.sip.read().await.as_ref() {
+            Some(h) => h.transport.bridge.read().await.clone(),
+            None => None,
+        };
+        for uuid in removed_calls {
+            self.monitor.call_ended(uuid).await;
+            if let Some(bridge) = &bridge { bridge.teardown_by_brew_call(uuid).await; }
         }
     }
 }

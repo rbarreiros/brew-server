@@ -119,6 +119,7 @@ pub async fn handle_packet(state: Arc<AppState>, source: ClientId, raw: Vec<u8>)
 async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, payload: CallPayload, raw: Vec<u8>) {
     let CallPayload::GroupTransmission(gt) = payload else { return };
     let mut inner = state.inner.write().await;
+    let mut preempted = None;
 
     if !state.config.allow_multiple_calls_per_group {
         if let Some(existing_id) = inner.group_floor.get(&gt.destination).copied() {
@@ -141,6 +142,7 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
                     let txs = notify.iter().filter_map(|cid| inner.clients.get(cid).map(|c| c.tx.clone())).collect::<Vec<_>>();
                     for tx in txs { let _ = tx.send(release.clone()); }
                     inner.calls.remove(&existing_id);
+                    preempted = Some(existing_id);
                     info!(old_uuid=%existing_id, new_uuid=%id, gssi=gt.destination,
                         old_priority=existing.priority, new_priority=gt.priority, "pre-empted group call");
                 }
@@ -186,6 +188,14 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
     let txs = targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| c.tx.clone())).collect::<Vec<_>>();
     drop(inner);
     for tx in txs { let _ = tx.send(raw.clone()); }
+    if let Some(old) = preempted {
+        state.monitor.call_ended(old).await;
+        if let Some(h) = state.sip.read().await.as_ref() {
+            if let Some(bridge) = h.transport.bridge.read().await.clone() {
+                bridge.teardown_by_brew_call(old).await;
+            }
+        }
+    }
     state.monitor.call_started(id, "group", gt.source, gt.destination, gt.priority).await;
     info!(%source, uuid=%id, src_issi=gt.source, gssi=gt.destination, priority=gt.priority,
         target_count=targets.len(), "routed GROUP_TX");
@@ -383,6 +393,12 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
 }
 
 async fn route_private_control(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: Vec<u8>) {
+    // A rejected setup is the end of the call: route it like a release so the
+    // call is removed (and the dashboard updated) instead of lingering.
+    if raw.get(1) == Some(&CALL_SETUP_REJECT) {
+        end_call(state, source, id, raw).await;
+        return;
+    }
     let inner = state.inner.read().await;
     let Some(call) = inner.calls.get(&id) else { debug!(uuid=%id, "private control for unknown call"); return; };
     if call.kind != CallKind::Private { return; }

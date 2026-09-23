@@ -183,6 +183,7 @@ impl BrewBridge {
         if let Some((msg, txs)) = notify {
             for tx in txs { let _ = tx.send(msg.clone()); }
         }
+        self.app.monitor.call_ended(leg.brew_call_id).await;
     }
 
     /// Called when the Brew core ends a call (CALL_RELEASE/CALL_GROUP_IDLE)
@@ -202,6 +203,7 @@ impl BrewBridge {
         // before calling us), so this only aborts the task and cleans the
         // virtual-client bookkeeping; it will not re-notify Brew.
         self.teardown(&call_id).await;
+        self.transport.state.end_call(&call_id).await;
     }
 
     /// Force-ends a call this bridge placed, in either direction, regardless
